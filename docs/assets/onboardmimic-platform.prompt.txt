@@ -1,0 +1,7 @@
+Mode: built-in imagegen image edit.
+Source: the project’s bilingual controller-platform cartoon.
+Output: onboardmimic-platform-bilingual.png
+
+Keep the original cartoon, layout, English title and all other labels.
+English title: BRING GREAT CONTROLLERS ONBOARD.
+Chinese subtitle, smaller and centered below the English: 板载优秀的控制器，让它更好用

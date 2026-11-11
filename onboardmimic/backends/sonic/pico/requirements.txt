@@ -1,0 +1,2 @@
+# Optional CPU pose mapping; compatible with CPython 3.8 / JetPack 5.
+scipy==1.10.1

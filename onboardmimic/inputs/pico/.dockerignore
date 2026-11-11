@@ -1,0 +1,12 @@
+*
+!Dockerfile
+!dependencies.json
+!fetch_dependencies.py
+!patch_sdk.py
+!receiver.py
+!preflight.py
+!container_capture.sh
+!vendor/
+vendor/*
+!vendor/XRoboToolkit-PC-Service-headless_1.0.0.0_arm64.deb
+!vendor/xrt-python-8941e1d.tar.gz

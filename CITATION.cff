@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "Cite OnboardMimic for deployment tooling; cite the backend authors for their controller and models."
+title: "OnboardMimic: an onboard S0 platform for humanoid robots"
+type: software
+authors:
+  - name: "Yiming Jiang"
+    website: "https://iridescentjiang.github.io/"
+  - name: "Yilun Chen"
+    website: "https://yilunchen.com/about/"
+  - name: "codex"
+    website: "https://openai.com/codex/"
+repository-code: "https://github.com/LambdaHumanoid/OnboardMimic"
+license: Apache-2.0

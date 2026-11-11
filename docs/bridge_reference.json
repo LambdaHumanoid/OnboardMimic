@@ -1,0 +1,45 @@
+{
+  "scope": "Native bridge and fresh feedback only; no business features or experimental blind hold",
+  "files": {
+    "native_bridge/core.hpp": {
+      "reference_sha256": "ea2bbe8911be8ec0183991905f469e9c80bb14e28feb2a1bc2581d8361ed23cd",
+      "source": "installed-read-only-snapshot"
+    },
+    "native_bridge/support.hpp": {
+      "reference_sha256": "85c247fb7b5dd608812163ff051ddba9627b710ea89a0fcdaffd679ea4b8a798",
+      "source": "installed-read-only-snapshot"
+    },
+    "native_bridge/sonic_command_bridge.cpp": {
+      "reference_sha256": "abbc11d1702235f7f7c6be087a0a47868651ce3df782e2bdab9cd6c7e73ed09c",
+      "source": "installed-read-only-snapshot"
+    },
+    "native_bridge/sonic_state_reader.cpp": {
+      "reference_sha256": "e0d52d903c9bd579dce4f6950aa8b935da8f7cdc4b77c819c0a1c86822939300",
+      "source": "installed-read-only-snapshot"
+    },
+    "native_bridge/core_test.cpp": {
+      "reference_sha256": "3593a2f2a81b0d440020fc6fcf3163aef23dff0e1cf98abb604cbd714d3de273",
+      "source": "local-tested-reference"
+    },
+    "native_bridge/differential_test.py": {
+      "reference_sha256": "1e1e55a57160e9b0f5f9ff3e58248c9bcc76b369e4cf6dd5233ef88795dc067e",
+      "source": "local-tested-reference"
+    },
+    "native_bridge/analyze_logs.py": {
+      "reference_sha256": "f6dddcaa338ed86dd25e7ba24ec7fe4a91e290576d3aa3be36588c51af7c4620",
+      "source": "local-tested-reference"
+    },
+    "continuity/state_mux.py": {
+      "reference_sha256": "868e22938ad5c05b725d0996ecffe2c3d89c1e6d6a2ee31e9837d92d8533d4dd"
+    },
+    "continuity/relay.py": {
+      "reference_sha256": "8762261ad3c108a79a3ccb370166b2f9b986a20d7a15df037d03ab0dfda29d18"
+    },
+    "continuity/runtime_guard.py": {
+      "reference_sha256": "782d79f58975a1c5b0ab93eb30480e111f2e1e75b5cedec5ab7bc2a2878d59fa"
+    },
+    "continuity/check_feedback.py": {
+      "reference_sha256": "db55aebc1b428229bbab674c5c3dd4a9c9b60cba67d52a08fd50b050406570a2"
+    }
+  }
+}

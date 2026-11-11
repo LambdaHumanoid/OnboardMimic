@@ -1,0 +1,2 @@
+# Default supported deployment profile: Unitree G1 + SONIC.
+-r onboardmimic/backends/sonic/requirements.txt

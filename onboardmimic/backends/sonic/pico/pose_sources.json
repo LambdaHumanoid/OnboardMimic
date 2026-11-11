@@ -1,0 +1,10 @@
+{
+  "source": "Imported G1-WBC deployment snapshot; original upstream merge base unknown",
+  "files": {
+    "gear_sonic/scripts/pico_manager_thread_server.py": "2599c88dd9849909f47b6352ac0d067fb6f81051d19c53d2209bf85904783010",
+    "scripts/human_data/processing/body_transforms.py": "bbb86ad96fb81bd3edde9f5581a4b6be18f15b8256421ec094bfceab5168da0f",
+    "scripts/human_data/processing/wrist_contract.py": "d8586ac5da3191881419964bcae181d28a303fbaa8be1526b82fa999b81039bf",
+    "gear_sonic/data/human/human_joints_info.pkl": "4de0bae69caf31e8829a2d3e8adecd887f29115af60a0b8d59237dfbfea1c975"
+  },
+  "mapping": "SMPL body FK + canonical wrist contract; NumPy CPU port"
+}

@@ -1,0 +1,184 @@
+{
+  "source": "earlier deployment working-tree snapshot",
+  "base_commit": "f596935ade76d16396eb8445b4fd5627046eb0fa",
+  "note": "Historical input hashes before portable adaptation and subsequent scope simplification; some imported features have since been removed. Not a current-file inventory or hardware-validation report.",
+  "files": {
+    "real_robot/onboard/native_lifecycle.py": {
+      "destination": "gear_sonic_deploy/onboard/native_lifecycle.py",
+      "sha256": "bf7aab6051fa8862a2b6143b4f733df68c1d0a5824b266937dbdefb86310b31a"
+    },
+    "real_robot/onboard/native_runtime.py": {
+      "destination": "gear_sonic_deploy/onboard/native_runtime.py",
+      "sha256": "1a036a0b8bd8a06c92085d79145c17de50f2fa00bf3d1ed9c228be2999641ed6"
+    },
+    "real_robot/onboard/navigation_guard.py": {
+      "destination": "gear_sonic_deploy/onboard/navigation_guard.py",
+      "sha256": "ae7b97ca249ff8d9e7257dcbc05dd181f250ac8c8f97be6894632c918dc83ad7"
+    },
+    "real_robot/onboard/test_native_lifecycle.py": {
+      "destination": "gear_sonic_deploy/onboard/test_native_lifecycle.py",
+      "sha256": "b49b6860248e13f16ca1bd201fd82d81467d795881346009583cd6f2ae59a4e8"
+    },
+    "real_robot/onboard/test_navigation_guard.py": {
+      "destination": "gear_sonic_deploy/onboard/test_navigation_guard.py",
+      "sha256": "05257e0a1b86228b13ac3cbd6f5303d2dbf9ce87c0034d729c4e1119e0551a43"
+    },
+    "planner_web/real_control.py": {
+      "destination": "gear_sonic_deploy/onboard/shared/real_control.py",
+      "sha256": "b26d30e80bef5270155aeb502b3ab8f3a973541464e20e0074d29b89d4f95151"
+    },
+    "planner_web/real_gestures.py": {
+      "destination": "gear_sonic_deploy/onboard/shared/real_gestures.py",
+      "sha256": "994ca857c5d3063b0609807e4325a5af55044736cdc93bab518e740e02e1c7fa"
+    },
+    "planner_web/onboard_client.py": {
+      "destination": "gear_sonic_deploy/onboard/shared/onboard_client.py",
+      "sha256": "c2432a9930fc480ede10620464396daa073a5bca1f9b1d6531746f3dac6d1e17"
+    },
+    "real_robot/pico/pose_reader.py": {
+      "destination": "gear_sonic_deploy/onboard/pico/pose_reader.py",
+      "sha256": "21ddd38348a4d85a2413b5c052141aa5dd4ebc3b1ed8f0016d274be5102d3ea1"
+    },
+    "real_robot/pico/pose_mapping.py": {
+      "destination": "gear_sonic_deploy/onboard/pico/pose_mapping.py",
+      "sha256": "0c9fc0945410f5c70f6597aded03e91ccfa1a596c9dc2e29da28899a7795188f"
+    },
+    "real_robot/pico/pose_wire.py": {
+      "destination": "gear_sonic_deploy/onboard/pico/pose_wire.py",
+      "sha256": "d07486e5f66b56b08a6b7d2b557bf2df93d4af8425aa46094437d1cd8e36d096"
+    },
+    "real_robot/pico/human_rest.json": {
+      "destination": "gear_sonic_deploy/onboard/pico/human_rest.json",
+      "sha256": "6a649366d092207bc6d960dd0fc4fa0da8fdf36cf3f3de197a453d99bb5bd338"
+    },
+    "real_robot/pico/test_pose_reader.py": {
+      "destination": "gear_sonic_deploy/onboard/pico/test_pose_reader.py",
+      "sha256": "f84097abb1d292a213709a7634d58798bf325aa6f603f65c0519951bd026a751"
+    },
+    "real_robot/pico/receiver.py": {
+      "destination": "gear_sonic_deploy/onboard/pico/receiver.py",
+      "sha256": "32aa0acced5d92a89ed8ec405a93b9110a43665976019064f7e4037098e2c71a"
+    },
+    "real_robot/pico/test_receiver.py": {
+      "destination": "gear_sonic_deploy/onboard/pico/test_receiver.py",
+      "sha256": "04e6b311c39ff06b0375d267c3a59578bfc193f3d30c95867ed65104fc78df64"
+    },
+    "real_robot/pico/patch_sdk.py": {
+      "destination": "gear_sonic_deploy/onboard/pico/patch_sdk.py",
+      "sha256": "27d42536b8efe6eda80606f131c610fcac679d14b5a41ddff4a611d1050d8474"
+    },
+    "real_robot/pico/fetch_dependencies.py": {
+      "destination": "gear_sonic_deploy/onboard/pico/fetch_dependencies.py",
+      "sha256": "2b66f18601f57a6a4b733b65e2113649fb7e2648a086b193d2f9312d2687e765"
+    },
+    "real_robot/pico/dependencies.json": {
+      "destination": "gear_sonic_deploy/onboard/pico/dependencies.json",
+      "sha256": "f1d6d30d5131ed1eb00d15a3ed7eb6a35939c3b3da8855b66234b6367e9ce34d"
+    },
+    "real_robot/pico/devices.example.json": {
+      "destination": "gear_sonic_deploy/onboard/pico/devices.example.json",
+      "sha256": "c4b7d46d6cfee4b4e7303ed93c2ffea189c39a66dab67709905344deb5045201"
+    },
+    "real_robot/pico/Dockerfile": {
+      "destination": "gear_sonic_deploy/onboard/pico/Dockerfile",
+      "sha256": "7036ac0452f5d275465c708fa1f21f6cda0bad071918ef1a150c3db91dab01a5"
+    },
+    "real_robot/pico/prepare_container.sh": {
+      "destination": "gear_sonic_deploy/onboard/pico/prepare_container.sh",
+      "sha256": "28a2d6c4e86616bcae49850c6b55d91ee475311c9f8a3031d24523fa34b7f803"
+    },
+    "real_robot/pico/capture.sh": {
+      "destination": "gear_sonic_deploy/onboard/pico/capture.sh",
+      "sha256": "fc28fbc3a029df1e23c91d9b68ef6018e8bb7ce38452ae566437e5ea2b252cda"
+    },
+    "real_robot/pico/container_capture.sh": {
+      "destination": "gear_sonic_deploy/onboard/pico/container_capture.sh",
+      "sha256": "cbe9f1f1b81bf05df6c02175d1033f4b7930f5909d400653a30c836e44575b3b"
+    },
+    "real_robot/pico/.dockerignore": {
+      "destination": "gear_sonic_deploy/onboard/pico/.dockerignore",
+      "sha256": "55dda957e3683f61a081cf3cd32ef46a3bbdbc807ca85da912da47fee837ce9e"
+    },
+    "real_robot/pico/reference/SONIC_LICENSE": {
+      "destination": "gear_sonic_deploy/onboard/pico/licenses/SONIC_LICENSE",
+      "sha256": "24ab66be50d1aca4fc5e029ef76ce4ceaac6557ea21665caf4b140695a76ffee"
+    },
+    "real_robot/pico/reference/XRT_LICENSE": {
+      "destination": "gear_sonic_deploy/onboard/pico/licenses/XRT_LICENSE",
+      "sha256": "d5f3ff3a0bfd3d623c27003f3b9280fab5516365d7347f648f8046847b768edb"
+    },
+    "real_robot/console/server.py": {
+      "destination": "gear_sonic_deploy/onboard/console/server.py",
+      "sha256": "50f513ac41c52c1571dc198fcd0431ae9993bfcbed92363dbfbc832a75acb9b0"
+    },
+    "real_robot/console/test_console.py": {
+      "destination": "gear_sonic_deploy/onboard/console/test_console.py",
+      "sha256": "0e6a1f17a1bcaf5243aebc469065800662069f3ef2d738f869e9975201548594"
+    },
+    "real_robot/console/console.js": {
+      "destination": "gear_sonic_deploy/onboard/console/static/console.js",
+      "sha256": "ca3c3e93df01967758555d643b57eea67baa84a7673aea88b302ebe1b305f913"
+    },
+    "real_robot/console/pico-skeleton.js": {
+      "destination": "gear_sonic_deploy/onboard/console/static/pico-skeleton.js",
+      "sha256": "e57dcdf1ee6ce38216d68ace4e94707e53956dbde1aed72df4aaa44ebf3cd14f"
+    },
+    "planner_web/real_backend.py": {
+      "destination": "gear_sonic_deploy/onboard/shared/real_backend.py",
+      "sha256": "a2206fb6cf77537e725068b6d2f4185d552e56bf84ca2ce71a1c06ee45754b9d"
+    },
+    "planner_web/static/real.html": {
+      "destination": "gear_sonic_deploy/onboard/console/static/real.html",
+      "sha256": "27b4a6740c567050fc157ead2ce50cedbfe720da8237599adbc3b43deb3fa1a8"
+    },
+    "planner_web/static/real-remote.html": {
+      "destination": "gear_sonic_deploy/onboard/console/static/real-remote.html",
+      "sha256": "6db48aa7877d6130f3f7406047b233d3fcc390dced08ba23e48f2f4c94a9403c"
+    },
+    "planner_web/static/real.js": {
+      "destination": "gear_sonic_deploy/onboard/console/static/real.js",
+      "sha256": "372dd98468042d66719bd650a91f6683d332eec00a2080db896881e4363295b7"
+    },
+    "planner_web/static/sonic.js": {
+      "destination": "gear_sonic_deploy/onboard/console/static/sonic.js",
+      "sha256": "b3019343b0507d63c816b176f345bbde338f5e3d66b771dc99fe7f7467074045"
+    },
+    "planner_web/static/style.css": {
+      "destination": "gear_sonic_deploy/onboard/console/static/style.css",
+      "sha256": "35cba03cf37553cba7080a3257b7ef5db7049a2dcff27a8b4e6a63b219e3a263"
+    },
+    "planner_web/static/remote.css": {
+      "destination": "gear_sonic_deploy/onboard/console/static/remote.css",
+      "sha256": "e3c485d37d895342933f4cf7b5906039e52ca56639385cb4e454bed33340768c"
+    },
+    "real_robot/remote/remote_core.py": {
+      "destination": "gear_sonic_deploy/onboard/remote/remote_core.py",
+      "sha256": "3c31b2baec53e4e9ef04e7f01d752b97403b3c120166b3aad3f21bf202121a6d"
+    },
+    "real_robot/remote/sonic_remote.py": {
+      "destination": "gear_sonic_deploy/onboard/remote/sonic_remote.py",
+      "sha256": "99fa4bb500db553de7090aeb4c6a30ff776ca6ee6814739494236833e823deb7"
+    },
+    "real_robot/remote/test_remote.py": {
+      "destination": "gear_sonic_deploy/onboard/remote/test_remote.py",
+      "sha256": "24a8564ff97d3a4ed351c52c0586ad692999352b0aa231afd8c2395fc98a68f7"
+    },
+    "real_robot/remote/test_remote_integration.py": {
+      "destination": "gear_sonic_deploy/onboard/remote/test_remote_integration.py",
+      "sha256": "e2850d00e927af7c390fd6fa4224083cab74974abffcaba1f242f4440bc99474"
+    },
+    "real_robot/pico/handoff.py": {
+      "destination": "gear_sonic_deploy/onboard/pico/handoff.py",
+      "sha256": "9a085c37f2df71af48ec4725554fa6ad56910be321900718db2c5fe5b71f6ee1"
+    },
+    "real_robot/pico/reference/xrt_py_bindings.cpp": {
+      "destination": "gear_sonic_deploy/onboard/pico/reference/xrt_py_bindings.cpp",
+      "sha256": "de3339d078dd1e209e3c6399ca1ff4d01e9d0a51e337c518cc3868c00946581f"
+    },
+    "pico_wrist_source": {
+      "destination": "gear_sonic_deploy/onboard/pico/wrist_mapping.py",
+      "sha256": "c62fc4db03c011fcb2e308e26d5e52c34d20560aec14f52e8bbc3a7b02f3e674",
+      "note": "Logical source identifier; historical input hash retained after module renaming."
+    }
+  }
+}

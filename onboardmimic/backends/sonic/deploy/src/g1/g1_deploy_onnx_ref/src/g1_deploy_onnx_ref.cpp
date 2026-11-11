@@ -1,0 +1,6983 @@
+/**
+ * @file g1_deploy_onnx_ref.cpp
+ * @brief Main application: deploys an RL locomotion policy on the Unitree G1 robot.
+ *
+ * This single-file application contains:
+ *
+ *   - **G1Deploy** class – the top-level controller that wires together all
+ *     sub-systems (input, output, policy, encoder, planner, hands).
+ *   - **main()** – CLI argument parser and run-loop.
+ *
+ * ## Threading Model
+ *
+ * Four real-time threads are created by the Unitree SDK's
+ * `CreateRecurrentThreadEx`:
+ *
+ *   Thread           | Rate     | Method              | Responsibility
+ *   -----------------|----------|---------------------|-------------------------------
+ *   Input            | 100 Hz   | G1Deploy::Input     | Poll input interface, handle commands.
+ *   Control          | 50 Hz    | G1Deploy::Control   | Gather obs, run policy, compute motor targets.
+ *   Planner          | 10 Hz    | G1Deploy::Planner   | Re-plan locomotion trajectory.
+ *   Command Writer   | 500 Hz   | G1Deploy::LowCommandWriter | Publish motor commands via DDS.
+ *
+ * ## Control-Loop State Machine (ProgramState)
+ *
+ *   INIT → WAIT_FOR_CONTROL → CONTROL
+ *
+ *   - **INIT**: Wait for a valid LowState message from the robot.
+ *   - **WAIT_FOR_CONTROL**: Robot is ready; wait for operator "start" signal.
+ *   - **CONTROL**: Active policy execution – gather observations, infer actions,
+ *     write motor commands.  Exits on operator "stop" or error.
+ *
+ * ## CLI Arguments (selected)
+ *
+ *   Flag                  | Description
+ *   ----------------------|------------
+ *   --network             | DDS network interface (e.g. "eth0")
+ *   --model               | Path to the policy ONNX model
+ *   --motion-data         | Directory of pre-loaded reference motions
+ *   --obs-config          | Observation config YAML
+ *   --encoder-model       | Encoder ONNX model (for token_state)
+ *   --planner-model       | Locomotion planner ONNX model
+ *   --input-type          | keyboard / gamepad / zmq / ros2 / interface_manager / gamepad_manager / zmq_manager
+ *   --output-type         | zmq / ros2 / all
+ *   --disable-crc-check   | Skip CRC validation (for MuJoCo sim)
+ *   --planner-fp16        | Use FP16 for planner TensorRT engine
+ *   --policy-fp16         | Use FP16 for policy TensorRT engine
+ */
+#include <cmath>
+#include <cuda_runtime_api.h>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <pthread.h>
+#include <sched.h>
+#include <array>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include <unistd.h>
+#include <cstring>
+#include <cctype>
+#include <functional>
+#include <unordered_map>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <chrono>
+#include <algorithm>
+#include <numeric>
+#include <sstream>
+
+// DDS
+#include <unitree/robot/channel/channel_publisher.hpp>
+#include <unitree/robot/channel/channel_subscriber.hpp>
+
+// IDL
+#include <unitree/idl/hg/IMUState_.hpp>
+#include <unitree/idl/hg/LowCmd_.hpp>
+#include <unitree/idl/hg/LowState_.hpp>
+#include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
+
+// TRTInference
+#include <TRTInference/InferenceEngine.h>
+
+// ONNX
+#include <onnxruntime_cxx_api.h>
+
+// Motion Data Reader
+#include "../include/motion_data_reader.hpp"
+
+// Math utilities
+#include "../include/math_utils.hpp"
+
+// Observation configuration
+#include "../include/observation_config.hpp"
+
+// New Planner Classes
+#include "../include/localmotion_kplanner.hpp"
+#include "../include/localmotion_kplanner_tensorrt.hpp"
+
+// Utility classes
+#include "../include/utils.hpp"
+
+// Robot parameters
+#include "../include/robot_parameters.hpp"
+#include "../include/policy_parameters.hpp"
+
+// Input interface and input handlers
+#include "../include/input_interface/keyboard_handler.hpp"
+#include "../include/input_interface/gamepad.hpp"
+#include "../include/input_interface/zmq_endpoint_interface.hpp"
+#include "../include/input_interface/interface_manager.hpp"
+#include "../include/input_interface/gamepad_manager.hpp"
+#include "../include/input_interface/zmq_manager.hpp"
+
+// Output interface and output handlers
+#include "../include/output_interface/output_interface.hpp"
+
+// Optional ROS2 input handler
+#if HAS_ROS2
+#include "../include/input_interface/ros2_input_handler.hpp"
+#include "../include/output_interface/ros2_output_handler.hpp"
+#endif
+
+#include "../include/output_interface/zmq_output_handler.hpp"
+
+#include <cuda_runtime.h>
+#include "../include/state_logger.hpp"
+
+// Encoder
+#include "../include/encoder.hpp"
+
+// Control policy
+#include "../include/control_policy.hpp"
+
+// Dex3 hands
+#include "../include/dex3_hands.hpp"
+#include "../include/brainco_hands.hpp"
+#include "../include/dummy_hands.hpp"
+#include "../include/hands_interface.hpp"
+
+// Error monitor
+#include "../include/error_monitor.hpp"
+#include "../include/control_start_safety.hpp"
+#include "../include/left_shoulder_back_offset.hpp"
+#include "../include/joint_velocity_safety.hpp"
+#include "../include/lower_body_energy_governor.hpp"
+#include "../include/lower_body_braking_priority_slew.hpp"
+#include "../include/lower_body_impact_damper.hpp"
+#include "../include/lower_body_observation_guard.hpp"
+
+#include "audio_thread/audio_thread.hpp"
+
+// ZMQ-based robot channel (compatible with zmq_dds_bridge.py)
+#include "../include/zmq_robot_channel.hpp"
+
+// DDS
+using namespace unitree::common;
+using namespace unitree::robot;
+using namespace unitree_hg::msg::dds_;
+
+namespace waist_lock {
+
+constexpr std::array<int, 3> kMotorIndices = {WaistYaw, WaistRoll, WaistPitch};
+constexpr std::array<const char*, 3> kAxisNames = {"yaw", "roll", "pitch"};
+
+inline std::string TrimAndLower(std::string value) {
+  const auto first = std::find_if_not(
+      value.begin(), value.end(),
+      [](unsigned char ch) { return std::isspace(ch) != 0; });
+  const auto last = std::find_if_not(
+      value.rbegin(), value.rend(),
+      [](unsigned char ch) { return std::isspace(ch) != 0; }).base();
+  if (first >= last) {
+    return "";
+  }
+  value = std::string(first, last);
+  std::transform(
+      value.begin(), value.end(), value.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return value;
+}
+
+inline std::array<bool, 3> ParseAxes(const std::string& value) {
+  std::array<bool, 3> axes = {false, false, false};
+  const std::string normalized = TrimAndLower(value);
+  if (normalized.empty() || normalized == "none") {
+    return axes;
+  }
+  if (normalized.back() == ',') {
+    throw std::invalid_argument("waist axis list cannot end with ','");
+  }
+
+  std::stringstream stream(normalized);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    token = TrimAndLower(token);
+    if (token == "yaw") {
+      axes[0] = true;
+    } else if (token == "roll") {
+      axes[1] = true;
+    } else if (token == "pitch") {
+      axes[2] = true;
+    } else {
+      throw std::invalid_argument(
+          "expected none, yaw, roll, pitch, or a comma-separated list; got '" + token + "'");
+    }
+  }
+  return axes;
+}
+
+inline double ParsePositiveFinite(const std::string& value, const char* name) {
+  std::size_t parsed = 0;
+  const double result = std::stod(value, &parsed);
+  if (parsed != value.size() || !std::isfinite(result) || result <= 0.0) {
+    throw std::invalid_argument(std::string(name) + " must be a positive finite value");
+  }
+  return result;
+}
+
+inline bool AnyEnabled(const std::array<bool, 3>& axes) {
+  return std::any_of(axes.begin(), axes.end(), [](bool enabled) { return enabled; });
+}
+
+inline std::string Describe(const std::array<bool, 3>& axes) {
+  std::string result;
+  for (size_t i = 0; i < axes.size(); ++i) {
+    if (!axes[i]) {
+      continue;
+    }
+    if (!result.empty()) {
+      result += ",";
+    }
+    result += kAxisNames[i];
+  }
+  return result.empty() ? "none" : result;
+}
+
+}  // namespace waist_lock
+
+
+
+/**
+ * @class G1Deploy
+ * @brief Top-level controller that orchestrates the entire G1 deployment pipeline.
+ *
+ * Owns and wires together:
+ *  - InputInterface (keyboard / gamepad / ZMQ / ROS2 / managers)
+ *  - PolicyEngine (TensorRT control policy)
+ *  - EncoderEngine (optional TensorRT observation encoder)
+ *  - LocalMotionPlannerBase (optional TensorRT locomotion planner)
+ *  - Dex3Hands (optional Dex3 hand controller)
+ *  - StateLogger (ring buffer + CSV persistence)
+ *  - OutputInterface(s) (ZMQ / ROS2 state publishers)
+ *  - MotionDataReader (pre-loaded reference motions)
+ *
+ * Four real-time threads handle Input (100 Hz), Control (50 Hz),
+ * Planner (10 Hz), and Command Writing (500 Hz).
+ */
+class G1Deploy {
+  private:
+    /// State machine for the control loop lifecycle.
+    enum class ProgramState { INIT, WAIT_FOR_CONTROL, CONTROL };
+    
+    // =========================================================================
+    // Core timing, mode, and counters
+    // =========================================================================
+    double time_;          ///< Elapsed time since start (used during INIT ramp-up).
+    double publish_dt_;    ///< Command writer period (500 Hz = 0.002 s).
+    double control_dt_;    ///< Control loop period  (50 Hz = 0.02 s).
+    double planner_dt_;    ///< Planner loop period  (10 Hz = 0.1 s).
+    double input_dt_;      ///< Input poll period    (100 Hz = 0.01 s).
+    double duration_;      ///< Duration of the INIT ramp-up to default pose (3 s).
+    int counter_;          ///< General-purpose tick counter.
+    Mode mode_pr_;         ///< Ankle control mode (series PR vs. parallel AB).
+    uint8_t mode_machine_; ///< Robot variant code received from LowState.
+    
+    // =========================================================================
+    // Input interface and buffered input data
+    // =========================================================================
+    std::unique_ptr<InputInterface> input_interface_;
+    
+    // Buffered input data (the real data to the policy engine)
+    // has_*_data_ flags indicate whether the getter returned valid buffered data (true) or defaults (false)
+    bool has_vr_3point_data_ = false;
+    std::array<double, 9> vr_3point_position_buffer_;
+    std::array<double, 12> vr_3point_orientation_buffer_;
+    std::array<double, 3> vr_3point_compliance_buffer_;
+    bool has_vr_5point_data_ = false;
+    std::array<double, 15> vr_5point_position_buffer_;
+    std::array<double, 20> vr_5point_orientation_buffer_;
+    bool has_left_hand_data_ = false;
+    bool has_right_hand_data_ = false;
+    std::array<double, 7> left_hand_joint_buffer_;
+    std::array<double, 7> right_hand_joint_buffer_;
+    bool brainco_left_fallback_active_ = false;
+    bool brainco_right_fallback_active_ = false;
+    bool has_upper_body_data_ = false;
+    std::array<double, 17> upper_body_joint_positions_buffer_;
+    std::array<double, 17> upper_body_joint_velocities_buffer_;
+    std::vector<double> token_state_data_;  // Token buffer (size from config)
+    
+    // =========================================================================
+    // Motion data, current motion, and recording
+    // =========================================================================
+    // Motion data reader and current motion
+    MotionDataReader motion_reader_;
+    
+    // Current motion and frame (using shared_ptr for thread safety)
+    std::shared_ptr<const MotionSequence> current_motion_ = nullptr;
+    int current_frame_ = 0;
+    int saved_frame_for_observation_window_ = 0; // for observation window
+    std::mutex current_motion_mutex_; // for current motion and frame synchronization
+    
+    // =========================================================================
+    // Local motion planner and movement state
+    // =========================================================================
+    // New unified planner interface
+    std::string planner_path;
+    std::unique_ptr<LocalMotionPlannerBase> planner_;
+    std::shared_ptr<MotionSequence> planner_motion_;
+    
+    // Movement momentum system
+    MovementState last_movement_state_ = MovementState(static_cast<int>(LocomotionMode::IDLE), {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, -1.0f, -1.0f);
+    float replan_interval_running_ = 0.1;
+    float replan_interval_crawling_ = 0.2;
+    float replan_interval_boxing_ = 1.0;
+    float replan_interval_ = 1.0;
+    float replan_interval_counter_ = 0.0f;
+
+    // Idle-mode error-based readaptation with double-threshold state machine.
+    // States: IDLE (do nothing), ADAPTING (toward robot state), RECOVERING (toward planner target).
+    // Each state has a trigger threshold (enter) and stop threshold (exit).
+    enum class IdleReadaptState { IDLE, ADAPTING, RECOVERING };
+    std::array<double, 29> idle_readapt_original_targets_{};
+    bool idle_readapt_stored_ = false;
+    IdleReadaptState idle_readapt_state_ = IdleReadaptState::IDLE;
+    static constexpr double kAdaptTrigger  = 0.10;   // rad: start adapting
+    static constexpr double kAdaptStop     = 0.05;   // rad: stop adapting → IDLE
+    static constexpr double kRecoverTrigger = 0.045;  // rad: start recovering
+
+    
+    // =========================================================================
+    // Low-level robot I/O buffers, channels, and threads
+    // =========================================================================
+    // Flag to disable CRC checking for MuJoCo simulation
+    bool disable_crc_check_ = false;
+    // Keep simulation identity separate from CRC handling. ZMQ msgpack disables
+    // CRC for both real and simulated bridges, but real-robot safety gates must
+    // remain active.
+    bool simulation_mode_ = false;
+    double joint_measured_speed_limit_rad_s_ =
+        joint_velocity_safety::kDefaultMeasuredSpeedLimitRadS;
+    bool lower_body_energy_governor_enabled_ = false;
+    double lower_body_energy_governor_scale_ = 1.0;
+    bool lower_body_energy_governor_tremor_gated_ = false;
+    double lower_body_tremor_trigger_threshold_rad_s_ =
+        lower_body_energy_governor::kDefaultTremorTriggerThresholdRadS;
+    double lower_body_tremor_peak_to_peak_threshold_rad_s_ =
+        lower_body_energy_governor::kDefaultTremorPeakToPeakThresholdRadS;
+    double lower_body_tremor_recovery_damping_nm_per_rad_s_ = 0.0;
+    std::size_t lower_body_tremor_hold_ticks_ =
+        lower_body_energy_governor::kDefaultTremorHoldTicks;
+    lower_body_energy_governor::Governor lower_body_energy_governor_;
+    std::size_t lower_body_governor_report_ticks_ = 0;
+    std::size_t lower_body_governor_report_intervened_frames_ = 0;
+    std::size_t lower_body_governor_report_joint_events_ = 0;
+    bool lower_body_braking_priority_slew_enabled_ = false;
+    double lower_body_braking_priority_slew_max_step_rad_ =
+        lower_body_braking_priority_slew::
+            kDefaultMaxPositivePowerTargetStepRad;
+    std::size_t lower_body_braking_priority_slew_hold_ticks_ =
+        lower_body_braking_priority_slew::kDefaultHoldTicks;
+    lower_body_braking_priority_slew::Limiter
+        lower_body_braking_priority_slew_;
+    std::size_t lower_body_braking_priority_slew_report_ticks_ = 0;
+    std::size_t lower_body_braking_priority_slew_report_intervened_frames_ =
+        0;
+    std::size_t lower_body_braking_priority_slew_report_joint_events_ = 0;
+    bool lower_body_observation_guard_enabled_ = false;
+    std::size_t lower_body_observation_guard_hold_ticks_ =
+        lower_body_observation_guard::kDefaultRepairHoldTicks;
+    double lower_body_observation_guard_alpha_ =
+        lower_body_observation_guard::kDefaultRepairLowPassAlpha;
+    double lower_body_observation_guard_max_policy_dq_step_rad_s_ =
+        lower_body_observation_guard::kDefaultRepairMaxPolicyDqStepRadS;
+    double lower_body_observation_guard_max_position_dq_residual_rad_s_ =
+        lower_body_observation_guard::
+            kDefaultRepairMaxPositionDqResidualRadS;
+    bool lower_body_observation_guard_continuous_innovation_clip_ = false;
+    bool lower_body_observation_guard_repair_until_caught_up_ = false;
+    bool lower_body_observation_guard_all_monitored_ = false;
+    bool lower_body_observation_guard_both_ankle_rolls_ = false;
+    bool lower_body_observation_guard_ankle_roll_trigger_only_ = false;
+    bool lower_body_observation_guard_fixed_window_ = false;
+    lower_body_observation_guard::Guard lower_body_observation_guard_;
+    bool lower_body_impact_damper_enabled_ = false;
+    double lower_body_impact_damper_extra_kd_nm_per_rad_s_ =
+        lower_body_impact_damper::kDefaultExtraKdNmPerRadS;
+    std::size_t lower_body_impact_damper_hold_ticks_ =
+        lower_body_impact_damper::kDefaultHoldTicks;
+    bool lower_body_impact_damper_all_monitored_ = false;
+    lower_body_impact_damper::Damper lower_body_impact_damper_;
+    std::array<std::uint8_t, lower_body_impact_damper::kJointCount>
+        lower_body_impact_event_hardware_mask_{};
+    
+    bool reinitialize_heading_ = true;
+    bool report_temperature_ = false;
+    std::string pending_tts_;  // One-shot TTS message, consumed by GatherInputInterfaceData()
+
+    // Per-motor high temperature hysteresis (enter at >= 90, exit at < 85)
+    std::array<bool, G1_NUM_MOTOR> motor_high_temp_ = {};
+    static constexpr int16_t HIGH_TEMP_ENTER = 90;
+    static constexpr int16_t HIGH_TEMP_EXIT = 85;
+    bool high_temp_warning_ = false;
+    std::string high_temp_message_;
+
+    std::array<double, 4> init_ref_data_root_rot_array_;
+
+    DataBuffer<LowState_> low_state_buffer_;
+    DataBuffer<MotorCommand> motor_command_buffer_;
+    DataBuffer<IMUState_> imu_torso_buffer_;
+    DataBuffer<HeadingState> heading_state_buffer_;
+    DataBuffer<MovementState> movement_state_buffer_;
+    
+    ThreadPtr input_thread_ptr_, command_writer_ptr_, control_thread_ptr_, planner_thread_ptr_;
+    std::once_flag command_writer_setup_once_;
+
+    // All robot communication goes through the ZMQ bridge (real wireless / wired
+    // talk to robot-side run_zmq_dds_bridge.py; sim talks to in-process mock).
+    std::string zmq_robot_ip_;
+    int zmq_robot_state_port_ = 5560;
+    int zmq_robot_cmd_port_ = 5561;
+    int zmq_robot_lowcmd_udp_port_ = 0;
+    std::unique_ptr<ZmqRobotChannel> zmq_robot_channel_;
+
+    // =========================================================================
+    // External clients and peripheral managers
+    // =========================================================================
+    std::unique_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
+
+    // Hand driver (polymorphic): one of DummyHands / Dex3Hands / BraincoHands.
+    // Selected at startup by --hand-type CLI flag (default dex3).
+    std::unique_ptr<HandsBase> hands_;
+    std::string hand_type_ = "dex3";
+    double brainco_close_threshold_ = 0.3;
+    std::chrono::milliseconds brainco_clamp_duration_{300};
+    std::array<brainco_hand_safety::StagedCommandState, 2>
+        brainco_staged_command_state_;
+    // A Revo2 status read can transiently time out even while the USB/RS-485
+    // transport recovers on the following poll. Keep the last *measured*
+    // feedback for state continuity, command the affected hand open, and
+    // expose a separate host-side VLA gate. Hand loss must never stop WBC.
+    struct BraincoFeedbackCache {
+      std::array<double, 7> q = {0.0};
+      std::array<double, 7> dq = {0.0};
+      bool has_measured_sample = false;
+      bool grace_active = false;
+      std::chrono::steady_clock::time_point missing_since{};
+    };
+    std::array<BraincoFeedbackCache, 2> brainco_feedback_cache_;
+    std::chrono::milliseconds brainco_feedback_grace_{2000};
+    bool brainco_left_feedback_online_ = true;
+    bool brainco_right_feedback_online_ = true;
+    bool brainco_vla_command_allowed_ = true;
+    bool direct_upper_body_control_ = false;
+    bool direct_upper_body_arm_only_ = false;
+    bool direct_upper_body_skip_wrist_ = false;
+    double direct_upper_body_kp_scale_ = 1.0;
+    double direct_upper_body_kd_scale_ = 1.0;
+    std::array<bool, 3> waist_lock_axes_ = {false, false, false};
+    std::array<double, 3> waist_lock_targets_ = {0.0, 0.0, 0.0};
+    bool waist_lock_targets_initialized_ = false;
+    double waist_lock_kp_ = 250.0;
+    double waist_lock_kd_ = 5.0;
+    double left_shoulder_back_offset_deg_ = 0.0;
+    bool left_shoulder_offset_clamp_reported_ = false;
+
+    size_t UpperBodyOverrideStartIndex() const {
+      return direct_upper_body_arm_only_ ? 3 : 0;
+    }
+
+    bool IsUpperBodyWristIndex(size_t upper_body_index) const {
+      if (upper_body_index >= upper_body_joint_isaaclab_order_in_mujoco_index.size()) {
+        return false;
+      }
+      const int mujoco_idx = upper_body_joint_isaaclab_order_in_mujoco_index[upper_body_index];
+      return mujoco_idx == 19 || mujoco_idx == 20 || mujoco_idx == 21 ||
+             mujoco_idx == 26 || mujoco_idx == 27 || mujoco_idx == 28;
+    }
+
+    bool ShouldOverrideUpperBodyIndex(size_t upper_body_index) const {
+      if (upper_body_index < UpperBodyOverrideStartIndex()) {
+        return false;
+      }
+      if (direct_upper_body_skip_wrist_ && IsUpperBodyWristIndex(upper_body_index)) {
+        return false;
+      }
+      return true;
+    }
+
+    bool ShouldApplyUpperBodyObservationOverride() const {
+      return has_upper_body_data_ && !direct_upper_body_arm_only_;
+    }
+
+    bool HasWaistAxisLock() const {
+      return waist_lock::AnyEnabled(waist_lock_axes_);
+    }
+
+    // InitControl already ramps these joints to default_angles. Keeping the
+    // same nominal targets when CONTROL begins avoids preserving a transient
+    // gravity-induced lean from measured LowState.
+    void InitializeWaistLockTargets() {
+      if (!HasWaistAxisLock() || waist_lock_targets_initialized_) {
+        return;
+      }
+      for (size_t axis = 0; axis < waist_lock_axes_.size(); ++axis) {
+        if (!waist_lock_axes_[axis]) {
+          continue;
+        }
+        const int motor_index = waist_lock::kMotorIndices[axis];
+        waist_lock_targets_[axis] = default_angles[motor_index];
+      }
+
+      waist_lock_targets_initialized_ = true;
+      std::cout << "[WaistLock] Active nominal targets:";
+      for (size_t axis = 0; axis < waist_lock_axes_.size(); ++axis) {
+        if (waist_lock_axes_[axis]) {
+          std::cout << " " << waist_lock::kAxisNames[axis]
+                    << "=" << waist_lock_targets_[axis] << " rad";
+        }
+      }
+      std::cout << std::endl;
+    }
+
+    // This runs after both the policy and optional direct upper-body override,
+    // so every normal deploy path shares the same final waist constraint.
+    void ApplyWaistAxisLocks(MotorCommand& command) {
+      if (!waist_lock_targets_initialized_) {
+        return;
+      }
+      for (size_t axis = 0; axis < waist_lock_axes_.size(); ++axis) {
+        if (!waist_lock_axes_[axis]) {
+          continue;
+        }
+        const int motor_index = waist_lock::kMotorIndices[axis];
+        const double q_target = waist_lock_targets_[axis];
+        command.q_target.at(motor_index) = static_cast<float>(q_target);
+        command.dq_target.at(motor_index) = 0.0f;
+        command.kp.at(motor_index) = static_cast<float>(waist_lock_kp_);
+        command.kd.at(motor_index) = static_cast<float>(waist_lock_kd_);
+
+        // Keep the policy's last-action history consistent with the command
+        // actually sent, rather than the unclamped network output.
+        const int action_index = isaaclab_to_mujoco[motor_index];
+        const double action_scale = g1_action_scale[motor_index];
+        if (action_index >= 0 && action_index < G1_NUM_MOTOR &&
+            std::abs(action_scale) > 1e-9) {
+          last_action[action_index] =
+              (q_target - default_angles[motor_index]) / action_scale;
+        }
+      }
+    }
+
+    // Apply after the first-command continuity gate but before the existing
+    // one-second startup blend. The configured offset therefore enters
+    // smoothly on each WAIT_FOR_CONTROL -> CONTROL transition.
+    bool ApplyLeftShoulderBackOffset(MotorCommand& command) {
+      if (left_shoulder_back_offset_deg_ == 0.0) {
+        return true;
+      }
+
+      constexpr int motor_index = left_shoulder_back_offset::kMotorIndex;
+      const auto result = left_shoulder_back_offset::Apply(
+          static_cast<double>(command.q_target.at(motor_index)),
+          left_shoulder_back_offset_deg_);
+      if (!result.valid) {
+        std::cerr
+            << "[LeftShoulderOffset] invalid target/configuration; stopping "
+            << "before publishing the command" << std::endl;
+        return false;
+      }
+
+      command.q_target.at(motor_index) =
+          static_cast<float>(result.target_rad);
+      const int action_index = isaaclab_to_mujoco[motor_index];
+      const double action_scale = g1_action_scale[motor_index];
+      if (action_index >= 0 && action_index < G1_NUM_MOTOR &&
+          std::abs(action_scale) > 1e-9) {
+        last_action[action_index] =
+            (result.target_rad - default_angles[motor_index]) /
+            action_scale;
+      }
+
+      if (result.clamped && !left_shoulder_offset_clamp_reported_) {
+        std::cerr
+            << "[LeftShoulderOffset] requested target exceeded the G1 joint "
+            << "range; clamped to " << result.target_rad << " rad"
+            << std::endl;
+        left_shoulder_offset_clamp_reported_ = true;
+      }
+      return true;
+    }
+
+    void UpdateLastActionFromMotorCommand(const MotorCommand& command) {
+      for (int motor_index = 0; motor_index < G1_NUM_MOTOR;
+           ++motor_index) {
+        const int action_index = isaaclab_to_mujoco[motor_index];
+        const double action_scale = g1_action_scale[motor_index];
+        if (action_index >= 0 && action_index < G1_NUM_MOTOR &&
+            std::abs(action_scale) > 1e-9) {
+          last_action[action_index] =
+              (static_cast<double>(command.q_target[motor_index]) -
+               default_angles[motor_index]) /
+              action_scale;
+        }
+      }
+    }
+
+    bool ApplyLowerBodyImpactDamper(
+        MotorCommand& command,
+        bool enforce) {
+      std::array<double, lower_body_impact_damper::kJointCount> raw_kd{};
+      for (std::size_t joint = 0;
+           joint < lower_body_impact_damper::kJointCount; ++joint) {
+        raw_kd[joint] = command.kd[joint];
+      }
+
+      const auto result = lower_body_impact_damper_.Apply(
+          raw_kd, lower_body_impact_event_hardware_mask_, enforce);
+      if (!result.valid) {
+        std::cerr
+            << "✗ [LowerBodyImpactDamper] invalid/non-finite Kd or "
+            << "configuration; stopping safely" << std::endl;
+        return false;
+      }
+
+      if (result.active) {
+        for (std::size_t joint = 0;
+             joint < lower_body_impact_damper::kJointCount; ++joint) {
+          if (result.active_mask[joint] != 0) {
+            command.kd[joint] =
+                static_cast<float>(result.applied_kd[joint]);
+          }
+        }
+      }
+
+      if (state_logger_ &&
+          !state_logger_->LogLowerBodyImpactDamper(result)) {
+        std::cerr
+            << "[WARNING] Failed to log lower-body impact damper data"
+            << std::endl;
+      }
+      if (result.triggered) {
+        std::cout
+            << "[LowerBodyImpactDamper] localized recovery started; "
+            << "extra_kd="
+            << lower_body_impact_damper_extra_kd_nm_per_rad_s_
+            << " Nm/(rad/s), hold_ticks="
+            << lower_body_impact_damper_hold_ticks_ << std::endl;
+      }
+      return true;
+    }
+
+    bool ApplyLowerBodyEnergyGovernor(
+        MotorCommand& command,
+        bool enforce) {
+      if (!used_low_state_data_.data) {
+        std::cerr
+            << "✗ [LowerBodyEnergyGovernor] measured LowState is missing"
+            << std::endl;
+        return false;
+      }
+
+      std::array<double, lower_body_energy_governor::kJointCount>
+          raw_q_target{};
+      std::array<double, lower_body_energy_governor::kJointCount>
+          measured_q{};
+      std::array<double, lower_body_energy_governor::kJointCount>
+          measured_dq{};
+      std::array<double, lower_body_energy_governor::kJointCount> kp{};
+      std::array<double, lower_body_energy_governor::kJointCount> kd{};
+      std::array<double, lower_body_energy_governor::kJointCount>
+          dq_target{};
+      std::array<double, lower_body_energy_governor::kJointCount> tau_ff{};
+
+      for (std::size_t joint = 0;
+           joint < lower_body_energy_governor::kJointCount; ++joint) {
+        raw_q_target[joint] = command.q_target[joint];
+        measured_q[joint] =
+            used_low_state_data_.data->motor_state()[joint].q();
+        measured_dq[joint] =
+            used_low_state_data_.data->motor_state()[joint].dq();
+        kp[joint] = command.kp[joint];
+        kd[joint] = command.kd[joint];
+        dq_target[joint] = command.dq_target[joint];
+        tau_ff[joint] = command.tau_ff[joint];
+      }
+
+      const auto result = lower_body_energy_governor_.Apply(
+          raw_q_target, measured_q, measured_dq, kp, kd, dq_target,
+          tau_ff, enforce,
+          std::any_of(lower_body_impact_event_hardware_mask_.begin(),
+                      lower_body_impact_event_hardware_mask_.end(),
+                      [](std::uint8_t value) { return value != 0; }));
+      if (!result.valid) {
+        std::cerr
+            << "✗ [LowerBodyEnergyGovernor] invalid/non-finite command or "
+            << "state; stopping safely" << std::endl;
+        return false;
+      }
+
+      if (result.active && result.intervention_count > 0) {
+        for (std::size_t joint = 0;
+             joint < lower_body_energy_governor::kJointCount; ++joint) {
+          if (result.intervention_mask[joint] !=
+              lower_body_energy_governor::kNone) {
+            command.q_target[joint] = static_cast<float>(
+                result.applied_q_target[joint]);
+          }
+        }
+        // The policy observation must receive the command actually sent, so
+        // the governor does not create a hidden action-history mismatch.
+        UpdateLastActionFromMotorCommand(command);
+      }
+
+      if (state_logger_ &&
+          !state_logger_->LogLowerBodyEnergyGovernor(result)) {
+        std::cerr
+            << "[WARNING] Failed to log lower-body energy governor data"
+            << std::endl;
+      }
+
+      if (result.active) {
+        ++lower_body_governor_report_ticks_;
+        if (result.intervention_count > 0) {
+          ++lower_body_governor_report_intervened_frames_;
+          lower_body_governor_report_joint_events_ +=
+              result.intervention_count;
+        }
+        if (lower_body_governor_report_ticks_ >= 50) {
+          std::cout
+              << "[LowerBodyEnergyGovernor] last 50 active ticks: "
+              << "intervened_frames="
+              << lower_body_governor_report_intervened_frames_
+              << "/" << lower_body_governor_report_ticks_
+              << " joint_events="
+              << lower_body_governor_report_joint_events_ << std::endl;
+          lower_body_governor_report_ticks_ = 0;
+          lower_body_governor_report_intervened_frames_ = 0;
+          lower_body_governor_report_joint_events_ = 0;
+        }
+      }
+      return true;
+    }
+
+    bool ApplyLowerBodyBrakingPrioritySlew(
+        MotorCommand& command,
+        bool enforce) {
+      if (!used_low_state_data_.data) {
+        std::cerr
+            << "✗ [LowerBodyBrakingPrioritySlew] measured LowState is "
+            << "missing" << std::endl;
+        return false;
+      }
+
+      std::array<double, lower_body_braking_priority_slew::kJointCount>
+          raw_q_target{};
+      std::array<double, lower_body_braking_priority_slew::kJointCount>
+          measured_q{};
+      std::array<double, lower_body_braking_priority_slew::kJointCount>
+          measured_dq{};
+      std::array<double, lower_body_braking_priority_slew::kJointCount> kp{};
+      std::array<double, lower_body_braking_priority_slew::kJointCount> kd{};
+      std::array<double, lower_body_braking_priority_slew::kJointCount>
+          dq_target{};
+      std::array<double, lower_body_braking_priority_slew::kJointCount>
+          tau_ff{};
+      for (std::size_t joint = 0;
+           joint < lower_body_braking_priority_slew::kJointCount; ++joint) {
+        raw_q_target[joint] = command.q_target[joint];
+        measured_q[joint] =
+            used_low_state_data_.data->motor_state()[joint].q();
+        measured_dq[joint] =
+            used_low_state_data_.data->motor_state()[joint].dq();
+        kp[joint] = command.kp[joint];
+        kd[joint] = command.kd[joint];
+        dq_target[joint] = command.dq_target[joint];
+        tau_ff[joint] = command.tau_ff[joint];
+      }
+
+      const bool impact_trigger = std::any_of(
+          lower_body_impact_event_hardware_mask_.begin(),
+          lower_body_impact_event_hardware_mask_.end(),
+          [](std::uint8_t value) { return value != 0; });
+      const auto result = lower_body_braking_priority_slew_.Apply(
+          raw_q_target, measured_q, measured_dq, kp, kd, dq_target,
+          tau_ff, impact_trigger, enforce);
+      if (!result.valid) {
+        std::cerr
+            << "✗ [LowerBodyBrakingPrioritySlew] invalid/non-finite command, "
+            << "state or configuration; stopping safely" << std::endl;
+        return false;
+      }
+
+      if (result.intervention_count > 0) {
+        for (std::size_t joint = 0;
+             joint < lower_body_braking_priority_slew::kJointCount;
+             ++joint) {
+          if (result.intervention_mask[joint] != 0) {
+            command.q_target[joint] =
+                static_cast<float>(result.applied_q_target[joint]);
+          }
+        }
+        UpdateLastActionFromMotorCommand(command);
+      }
+
+      if (state_logger_ &&
+          !state_logger_->LogLowerBodyBrakingPrioritySlew(result)) {
+        std::cerr
+            << "[WARNING] Failed to log lower-body braking-priority slew "
+            << "data" << std::endl;
+      }
+      if (result.triggered) {
+        std::cout
+            << "[LowerBodyBrakingPrioritySlew] impact recovery started; "
+            << "max_positive_power_target_step="
+            << lower_body_braking_priority_slew_max_step_rad_
+            << " rad, hold_ticks="
+            << lower_body_braking_priority_slew_hold_ticks_ << std::endl;
+      }
+      if (result.active) {
+        ++lower_body_braking_priority_slew_report_ticks_;
+        if (result.intervention_count > 0) {
+          ++lower_body_braking_priority_slew_report_intervened_frames_;
+          lower_body_braking_priority_slew_report_joint_events_ +=
+              result.intervention_count;
+        }
+        if (lower_body_braking_priority_slew_report_ticks_ >= 50) {
+          std::cout
+              << "[LowerBodyBrakingPrioritySlew] last 50 active ticks: "
+              << "intervened_frames="
+              << lower_body_braking_priority_slew_report_intervened_frames_
+              << "/" << lower_body_braking_priority_slew_report_ticks_
+              << " joint_events="
+              << lower_body_braking_priority_slew_report_joint_events_
+              << std::endl;
+          lower_body_braking_priority_slew_report_ticks_ = 0;
+          lower_body_braking_priority_slew_report_intervened_frames_ = 0;
+          lower_body_braking_priority_slew_report_joint_events_ = 0;
+        }
+      }
+      return true;
+    }
+
+    bool CheckMeasuredJointSpeeds(
+        const LowState_& low_state,
+        const char* context) const {
+      if (simulation_mode_) {
+        return true;
+      }
+
+      std::array<float, G1_NUM_MOTOR> measured_dq{};
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        measured_dq[i] = low_state.motor_state()[i].dq();
+      }
+      const auto check = joint_velocity_safety::CheckMeasuredSpeeds(
+          measured_dq, joint_measured_speed_limit_rad_s_);
+      if (!check.valid) {
+        std::cerr
+            << "✗ [JointSpeedGate] invalid/non-finite measured velocity in "
+            << context << " at motor=" << check.worst_index << " ("
+            << joint_velocity_safety::kG1HardwareJointNames[
+                   check.worst_index]
+            << "); stopping safely" << std::endl;
+        return false;
+      }
+      if (check.violation_count == 0) {
+        return true;
+      }
+
+      std::cerr
+          << "✗ [JointSpeedGate] measured velocity hard limit exceeded in "
+          << context << ":";
+      for (std::size_t i = 0; i < check.violating.size(); ++i) {
+        if (check.violating[i]) {
+          std::cerr
+              << " motor=" << i << "("
+              << joint_velocity_safety::kG1HardwareJointNames[i] << ")"
+              << " |dq|=" << check.speed_rad_s[i] << "rad/s";
+        }
+      }
+      std::cerr
+          << " limit=" << joint_measured_speed_limit_rad_s_
+          << "rad/s; stopping whole-body control safely" << std::endl;
+      return false;
+    }
+
+    void ApplyBraincoHandCommandPolicy(
+        bool is_left,
+        bool has_data,
+        std::array<double, 7>& command) {
+      if (hand_type_ != "brainco") {
+        return;
+      }
+
+      const auto raw_command = command;
+      const bool feedback_grace_active =
+          brainco_feedback_cache_[is_left ? 0 : 1].grace_active;
+      const bool use_open_fallback =
+        feedback_grace_active ||
+        !has_data ||
+        !brainco_hand_safety::IsBinaryPredictionValid(raw_command) ||
+        !brainco_hand_safety::IsThresholdValid(brainco_close_threshold_);
+
+      bool& fallback_active = is_left
+        ? brainco_left_fallback_active_
+        : brainco_right_fallback_active_;
+      auto& staged_state =
+          brainco_staged_command_state_[is_left ? 0 : 1];
+      const auto previous_phase = staged_state.phase;
+      command = brainco_hand_safety::ResolveStagedGraspCommand(
+        has_data && !feedback_grace_active,
+        raw_command,
+        brainco_close_threshold_,
+        brainco_clamp_duration_,
+        staged_state,
+        std::chrono::steady_clock::now());
+      if (use_open_fallback) {
+        if (!fallback_active) {
+          std::cout << "[Hands] BrainCo " << (is_left ? "LEFT" : "RIGHT")
+                    << (feedback_grace_active
+                          ? " feedback stale; commanding OPEN"
+                          : " input unavailable/invalid; commanding OPEN");
+          if (has_data) {
+            std::cout << " (raw=[";
+            for (std::size_t i = 0; i < 6; ++i) {
+              if (i) std::cout << ",";
+              std::cout << raw_command[i];
+            }
+            std::cout << "])";
+          }
+          std::cout << std::endl;
+        }
+      } else if (fallback_active) {
+        std::cout << "[Hands] BrainCo " << (is_left ? "LEFT" : "RIGHT")
+                  << " input restored" << std::endl;
+      }
+      if (!use_open_fallback && staged_state.phase != previous_phase) {
+        std::cout << "[Hands] BrainCo " << (is_left ? "LEFT" : "RIGHT")
+                  << " command phase "
+                  << brainco_hand_safety::PhaseName(previous_phase)
+                  << " -> "
+                  << brainco_hand_safety::PhaseName(staged_state.phase)
+                  << std::endl;
+      }
+      fallback_active = use_open_fallback;
+    }
+
+    // Leaves q/dq populated with fresh physical feedback or the most recently
+    // measured feedback. If no sample has ever arrived, the caller's neutral
+    // values remain in place. Missing hand feedback is deliberately nonfatal:
+    // the independently published VLA gate stops new high-level commands while
+    // the whole-body controller keeps the robot supported.
+    bool ResolveBraincoFeedback(
+        bool is_left,
+        bool has_fresh_feedback,
+        std::array<double, 7>& q,
+        std::array<double, 7>& dq) {
+      auto& cache = brainco_feedback_cache_[is_left ? 0 : 1];
+      const char* side = is_left ? "LEFT" : "RIGHT";
+      const auto now = std::chrono::steady_clock::now();
+
+      if (has_fresh_feedback) {
+        cache.q = q;
+        cache.dq = dq;
+        cache.has_measured_sample = true;
+        if (cache.grace_active) {
+          const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - cache.missing_since).count();
+          std::cout << "[Hands] BrainCo " << side
+                    << " feedback restored after " << elapsed_ms << " ms"
+                    << std::endl;
+        }
+        cache.grace_active = false;
+        return true;
+      }
+
+      if (!cache.grace_active) {
+        cache.grace_active = true;
+        cache.missing_since = now;
+        std::cout << "[Hands] BrainCo " << side
+                  << " feedback offline; "
+                  << (cache.has_measured_sample
+                        ? "holding last measured state"
+                        : "no measured state is available")
+                  << ", commanding OPEN and blocking VLA commands while SONIC continues"
+                  << std::endl;
+      }
+      if (cache.has_measured_sample) {
+        q = cache.q;
+        dq = cache.dq;
+      }
+      return true;
+    }
+
+    // Motor error monitor (tracks fault state transitions)
+    ErrorMonitor error_monitor_;
+
+    static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
+    CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
+    RollingStats<1000> streaming_data_delay_rolling_stats_;
+    std::unique_ptr<AudioThread> audio_thread_;
+    
+    // =========================================================================
+    // Program state and last commanded actions
+    // =========================================================================
+    static constexpr std::chrono::milliseconds LOW_STATE_LATE_THRESHOLD{50};
+    static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
+    ProgramState program_state_;
+    std::array<double, G1_NUM_MOTOR> last_action;
+    std::array<double, 7> last_left_hand_action;
+    std::array<double, 7> last_right_hand_action;
+    control_start_safety::StartGate control_start_gate_;
+    control_start_safety::GatePhase last_reported_start_gate_phase_ =
+        control_start_safety::GatePhase::Idle;
+    std::array<float, G1_NUM_MOTOR> held_targets_before_control_{};
+    bool validate_first_policy_command_ = false;
+    std::size_t startup_blend_ticks_remaining_ = 0;
+    
+    // =========================================================================
+    // Logging / recording streams
+    // =========================================================================
+    std::unique_ptr<std::ofstream> target_motion_file_;
+    std::unique_ptr<std::ofstream> planner_motion_file_;
+    std::unique_ptr<std::ofstream> policy_input_file_;
+    std::unique_ptr<std::ofstream> record_input_file_;
+    std::unique_ptr<std::ifstream> playback_input_file_;
+
+    // Motion recorders for streamed and planner_motion
+    MotionRecorder zmq_motion_recorder_;
+    MotionRecorder planner_motion_recorder_;
+    bool enable_motion_recording_ = false;
+    
+    // =========================================================================
+    // Initial compliance values for VR 3-point control (set from command line)
+    // These are keyboard-controlled and are the ONLY source of compliance values
+    // =========================================================================
+    std::array<double, 3> initial_vr_3point_compliance_ = {0.5, 0.5, 0.0};
+    
+    // Initial max close ratio for Dex3 hands (set from command line)
+    // Default 1.0 allows full closure, use --max-close-ratio to limit
+    // Keyboard controls (J/K) always available for runtime adjustment
+    double initial_max_close_ratio_ = 1.0;
+    
+    // Track if vr_3point_compliance is observed by the policy
+    // If false, adjusting compliance via keyboard has no effect on the policy
+    bool has_vr_3point_compliance_obs_ = false;
+    
+    // Independent logging counter (not affected by planner buffer cleaning)
+    int logging_counter_ = 0;
+
+    TimestampedData<LowState_> used_low_state_data_;
+    TimestampedData<IMUState_> used_imu_torso_data_;
+
+    // State logger
+    std::unique_ptr<StateLogger> state_logger_;
+    
+    // Output interfaces (supports multiple simultaneous outputs)
+    std::vector<std::unique_ptr<OutputInterface>> output_interfaces_;
+
+    // =========================================================================
+    // Core ML components (encoder + policy) and interfaces
+    // =========================================================================
+    // Encoder engine
+    std::string model_path;
+    std::unique_ptr<EncoderEngine> encoder_engine_;
+    EncoderConfig encoder_config_;  // Encoder configuration from observation config
+    bool is_using_encoder_ = false;
+    int initial_encoder_mode_ = -2;  // -2: no token state. -1: need token state but no encoder. 0,1,2,...: encoder mode.
+    int last_logged_encoder_mode_ = -999;  // Track last logged mode to avoid spam
+    
+    // Token input safety tracking
+    bool first_token_received_ = false;  // True once we've received at least one token
+    std::optional<std::chrono::steady_clock::time_point> last_token_time_;  // Timestamp of last token received
+    static constexpr std::chrono::milliseconds TOKEN_TIMEOUT_MS{200};  // Max time between tokens before warning (200ms = 5Hz min)
+    
+    // Control policy
+    std::unique_ptr<PolicyEngine> policy_engine_;
+    
+    // =========================================================================
+    // Observation system configuration and runtime state
+    // =========================================================================
+    // Function pointer type for observation functions (returns bool for success/failure)
+    // Functions read from internal state (state_logger_, current_motion_, etc.)
+    // and write to the provided target buffer at the given offset
+    using ObservationFunction = std::function<bool(std::vector<double>&, size_t)>;
+    
+    // Observation registry - single place to define all observations
+    struct ObservationRegistry {
+      std::string name;
+      size_t dimension;
+      ObservationFunction function;
+      
+      ObservationRegistry(const std::string& n, size_t d, ObservationFunction f) 
+        : name(n), dimension(d), function(f) {}
+    };
+ 
+    // Structure for active observation function with metadata
+    struct ActiveObservation {
+      std::string name;
+      ObservationFunction function;
+      size_t offset;
+      size_t dimension;
+      
+      ActiveObservation(const std::string& n, ObservationFunction f, size_t off, size_t dim) 
+        : name(n), function(f), offset(off), dimension(dim) {}
+    };
+    
+    // Pre-allocated observation buffers to avoid allocation in control loop
+    std::vector<double> obs_buffer_;          // Policy observation buffer
+    std::vector<double> encoder_obs_buffer_;  // Encoder observation buffer
+    
+    // Observation configuration
+    std::vector<ObservationConfig> obs_config_; 
+    
+    // Active observation functions (validated and ready for runtime)
+    std::vector<ActiveObservation> active_obs_functions_;
+    
+    // Active encoder observation functions (for encoder input)
+    std::vector<ActiveObservation> active_encoder_obs_functions_;
+    
+    // VR3Point index
+    std::array<int, 3> actual_vr_3point_index = {-1, -1, -1};
+
+    // VR5Point index
+    std::array<int, 5> actual_vr_5point_index = {-1, -1, -1, -1, -1};
+
+    // =========================================================================
+    // Motion-based observation gatherers
+    // 
+    // These functions read from the currently-active MotionSequence to build
+    // observation vectors for the policy neural network.  They support
+    // multi-frame look-ahead (gathering future frames at a configurable
+    // step interval) for temporal context.
+    //
+    // Each gatherer writes its output into `target_buffer` at `offset` and
+    // updates `saved_frame_for_observation_window_` so that streamed motions
+    // know how many look-ahead frames are needed before the end.
+    // =========================================================================
+
+    /// Gather root Z position from N future frames (1 value per frame).
+    bool GatherMotionRootZPositionMultiFrame(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 5) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+      // Check if motion has valid body data
+      if (current_motion_->GetNumBodies() == 0) {
+        std::cerr << "✗ Error: Motion has no bodies - cannot gather root z position" << std::endl;
+        return false;
+      }
+      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      // Gather root z position from multiple future frames with step intervals
+      for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
+        // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
+        int target_frame = static_cast<int>(current_frame_);
+        if (operator_state.play) {
+          target_frame += frame_idx * step_size;
+          // If beyond motion length, clamp to last frame (hold final pose)
+          if (target_frame >= static_cast<int>(current_motion_->timesteps)) {
+            target_frame = static_cast<int>(current_motion_->timesteps) - 1;
+          }
+        }
+
+        const auto motion_root_z_pos = current_motion_->BodyPositions(target_frame)[0][2];
+        target_buffer[offset + frame_idx * 1] = motion_root_z_pos;
+      }
+      return true;
+    }
+
+    /// Gather body positions from N future frames (3 values per body per frame).
+    /// If body_part_indexes is empty, gathers all bodies; otherwise only the specified subset.
+    bool GatherMotionBodyPositionsMultiFrame(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 5, std::vector<int> body_part_indexes = {}) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+      // Check if motion has valid body data
+      if (current_motion_->GetNumBodies() == 0) {
+        std::cerr << "✗ Error: Motion has no bodies - cannot gather body positions" << std::endl;
+        return false;
+      }
+      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      // Gather positions from multiple future frames with step intervals
+      for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
+        // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
+        int target_frame = static_cast<int>(current_frame_);
+        if (operator_state.play) {
+          target_frame += frame_idx * step_size;
+          // If beyond motion length, clamp to last frame (hold final pose)
+          if (target_frame >= static_cast<int>(current_motion_->timesteps)) {
+            target_frame = static_cast<int>(current_motion_->timesteps) - 1;
+          }
+        }
+
+        const auto motion_body_pos = current_motion_->BodyPositions(target_frame);
+
+        // If body part indexes are empty, gather all bodies (all x, y, z coordinates)
+        if (body_part_indexes.empty()) {
+          size_t num_bodies = current_motion_->GetNumBodies();
+          size_t frame_offset = offset + frame_idx * num_bodies * 3;  // 3 coordinates per body
+          
+          std::vector<double> all_body_pos(num_bodies * 3);
+          for (size_t i = 0; i < num_bodies; i++) {
+            all_body_pos[i * 3 + 0] = motion_body_pos[i][0];  // x
+            all_body_pos[i * 3 + 1] = motion_body_pos[i][1];  // y
+            all_body_pos[i * 3 + 2] = motion_body_pos[i][2];  // z
+          }
+          std::copy(
+            all_body_pos.begin(),
+            all_body_pos.end(),
+            target_buffer.begin() + frame_offset
+          );
+        // If body part indexes are not empty, gather only the needed bodies 
+        } else {
+          // Get motion's body part indexes to map desired body index to storage index
+          const auto& motion_body_indexes = current_motion_->BodyPartIndexes();
+          
+          size_t frame_offset = offset + frame_idx * body_part_indexes.size() * 3;  // 3 coordinates per body
+          std::vector<double> needed_body_pos(body_part_indexes.size() * 3);
+          
+          for (size_t i = 0; i < body_part_indexes.size(); i++) {
+            int desired_body_index = body_part_indexes[i];
+            
+            // Find which storage index corresponds to this body index
+            int storage_index = -1;
+            for (size_t j = 0; j < motion_body_indexes.size(); j++) {
+              if (motion_body_indexes[j] == desired_body_index) {
+                storage_index = static_cast<int>(j);
+                break;
+              }
+            }
+            
+            // Extract all x, y, z coordinates
+            if (storage_index < 0) {
+              std::cerr << "✗ Error: Body index " << desired_body_index 
+                        << " not found in motion data. Available indices: [";
+              for (size_t j = 0; j < motion_body_indexes.size(); j++) {
+                std::cerr << motion_body_indexes[j];
+                if (j + 1 < motion_body_indexes.size()) std::cerr << ", ";
+              }
+              std::cerr << "]" << std::endl;
+              return false;
+            }
+            
+            needed_body_pos[i * 3 + 0] = motion_body_pos[storage_index][0];  // x
+            needed_body_pos[i * 3 + 1] = motion_body_pos[storage_index][1];  // y
+            needed_body_pos[i * 3 + 2] = motion_body_pos[storage_index][2];  // z
+          }
+          std::copy(
+            needed_body_pos.begin(),
+            needed_body_pos.end(),
+            target_buffer.begin() + frame_offset
+          );
+        }
+      }
+      return true;
+    }
+
+    /**
+     * @brief Gather the heading-corrected anchor orientation from N future frames.
+     *
+     * Computes the relative rotation from the robot's current base orientation
+     * to the heading-corrected reference orientation at each future frame.
+     * Outputs the first two columns of the 3×3 rotation matrix (6 values per frame).
+     *
+     * Also handles heading reinitialisation when `reinitialize_heading_` is set.
+     */
+    /**
+     * @brief Update heading state — must be called once per control tick BEFORE gathering observations.
+     *
+     * Handles heading reinitialisation (when operator triggers reset) and
+     * ensures init_ref_data_root_rot_array_ is set when starting from frame 0.
+     * This shared state is consumed by all orientation observation functions.
+     */
+    void UpdateHeadingState() {
+      if (!current_motion_ || current_motion_->timesteps == 0) { return; }
+      if (current_motion_->GetNumBodyQuaternions() == 0) { return; }
+      if (!state_logger_) { return; }
+
+      if (reinitialize_heading_) {
+        double sample_dt = control_dt_;
+        auto hist = state_logger_->GetLatest(1, sample_dt);
+        const auto& base_quat = hist[0].base_quat;
+
+        heading_state_buffer_.SetData(HeadingState(base_quat, 0.0));
+        reinitialize_heading_ = false;
+        const auto motion_body_quat_init = current_motion_->BodyQuaternions(current_frame_);
+        init_ref_data_root_rot_array_ = motion_body_quat_init[0];
+        std::cout << "Reset heading state to " << base_quat[0] << ", " << base_quat[1] << ", " << base_quat[2] << ", " << base_quat[3] << std::endl;
+        std::cout << "Reset delta heading to 0" << std::endl;
+        std::cout << "Reset init reference data root rotation to current frame: " << init_ref_data_root_rot_array_[0] << ", " << init_ref_data_root_rot_array_[1] << ", " << init_ref_data_root_rot_array_[2] << ", " << init_ref_data_root_rot_array_[3] << std::endl;
+        std::cout << "**********************************************************" << std::endl;
+        std::cout << "Reference motion name: " << current_motion_->name << std::endl;
+        std::cout << "**********************************************************" << std::endl;
+      }
+
+      if (current_frame_ == 0) {
+        const auto motion_body_quat_init = current_motion_->BodyQuaternions(0);
+        init_ref_data_root_rot_array_ = motion_body_quat_init[0];
+      }
+    }
+
+    /**
+     * @brief Compute the apply_delta_heading quaternion from current heading state.
+     *
+     * This is a pure computation with no side effects — safe to call from any
+     * observation function. Reads heading_state_buffer_ and init_ref_data_root_rot_array_.
+     */
+    std::array<double, 4> ComputeApplyDeltaHeading() {
+      auto heading_state_data = heading_state_buffer_.GetDataWithTime().data;
+      HeadingState heading_state = heading_state_data ? *heading_state_data : HeadingState();
+
+      auto init_heading = calc_heading_quat_d(heading_state.init_base_quat);
+      auto data_heading_inv = calc_heading_quat_inv_d(init_ref_data_root_rot_array_);
+      auto apply_delta_heading = quat_mul_d(init_heading, data_heading_inv);
+
+      if (heading_state.delta_heading != 0.0) {
+        auto delta_quat = euler_z_to_quat_d(heading_state.delta_heading);
+        apply_delta_heading = quat_mul_d(delta_quat, apply_delta_heading);
+      }
+      return apply_delta_heading;
+    }
+
+    /**
+     * @brief Gather anchor orientation from N future frames with configurable orientation mode.
+     *
+     * @param orientation_mode Controls which quaternion is used as the "left" side of the diff:
+     *   - 0: full base quaternion (existing motion_anchor_ori_b)
+     *   - 1: robot heading only (heading setting: motion_anchor_ori_heading)
+     *   - 2: reference first-frame heading (refheading setting: motion_anchor_ori_refheading)
+     */
+    bool GatherMotionAnchorOrientationMutiFrame(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 5, int orientation_mode = 0) {
+      if (!current_motion_ || current_motion_->timesteps == 0) {
+        return false;
+      }
+
+      if (current_motion_->GetNumBodyQuaternions() == 0) {
+        std::cout << "✗ Error: No motion_body_quat data available. Stopping control system." << std::endl;
+        return false;
+      }
+      if (!state_logger_) { return false; }
+
+      double sample_dt = control_dt_;
+      auto hist = state_logger_->GetLatest(1, sample_dt);
+      const auto& base_quat = hist[0].base_quat;
+
+      auto apply_delta_heading = ComputeApplyDeltaHeading();
+
+      // For refheading mode (2): pre-compute the first future frame's ref heading
+      // This is used as the "left" quaternion for ALL frames in the loop
+      std::array<double, 4> ref_first_heading = {1.0, 0.0, 0.0, 0.0};
+      if (orientation_mode == 2) {
+        int first_target_frame = static_cast<int>(current_frame_);
+        // first future frame is always frame_idx=0, so no step offset
+        if (first_target_frame >= static_cast<int>(current_motion_->timesteps)) {
+          first_target_frame = static_cast<int>(current_motion_->timesteps) - 1;
+        }
+        const auto first_body_quat = current_motion_->BodyQuaternions(first_target_frame);
+        auto first_ref_rot = quat_mul_d(apply_delta_heading, first_body_quat[0]);
+        ref_first_heading = calc_heading_quat_d(first_ref_rot);
+      }
+
+      // Gather orientations from multiple future frames with step intervals
+      for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
+        // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
+        int target_frame = static_cast<int>(current_frame_);
+        if (operator_state.play) {
+          target_frame += frame_idx * step_size;
+          // If beyond motion length, clamp to last frame (hold final pose)
+          if (target_frame >= static_cast<int>(current_motion_->timesteps)) {
+            target_frame = static_cast<int>(current_motion_->timesteps) - 1;
+          }
+        }
+
+        // Get reference data root rotation at this target frame (first body part, index 0)
+        const auto motion_body_quat = current_motion_->BodyQuaternions(target_frame);
+        std::array<double, 4> ref_data_root_rot_array = motion_body_quat[0];
+
+        // Calculate new reference root rotation with heading applied
+        auto new_ref_root_rot = quat_mul_d(apply_delta_heading, ref_data_root_rot_array);
+
+        // Calculate relative rotation based on orientation_mode:
+        //   0: full base quaternion (motion_anchor_ori_b)
+        //   1: robot heading only (motion_anchor_ori_heading)
+        //   2: reference first-frame heading (motion_anchor_ori_refheading)
+        std::array<double, 4> left_quat;
+        if (orientation_mode == 1) {
+          left_quat = calc_heading_quat_d(base_quat);
+        } else if (orientation_mode == 2) {
+          left_quat = ref_first_heading;
+        } else {
+          left_quat = base_quat;
+        }
+        auto base_to_ref_quat = quat_mul_d(quat_conjugate_d(left_quat), new_ref_root_rot);
+        auto rotation_matrix = quat_to_rotation_matrix_d(base_to_ref_quat);
+
+        // Extract first 2 columns of rotation matrix and flatten ROW-WISE to 1D array (6 elements)
+        // Python: .as_matrix()[..., :2].reshape(1, -1) flattens row by row
+        std::array<double, 6> motion_anchor_ori_b = {
+            rotation_matrix[0][0], rotation_matrix[0][1], // Row 0, cols 0-1
+            rotation_matrix[1][0], rotation_matrix[1][1], // Row 1, cols 0-1
+            rotation_matrix[2][0], rotation_matrix[2][1] // Row 2, cols 0-1
+        };
+
+        // Copy to observation buffer at the appropriate offset for this frame
+        size_t frame_offset = offset + frame_idx * 6; // 6 values per frame
+        std::copy(motion_anchor_ori_b.begin(), motion_anchor_ori_b.end(), target_buffer.begin() + frame_offset);
+      }
+
+      return true;
+    }
+
+    /**
+     * @brief Gather heading_diff_robot_ref: yaw diff from robot to reference first frame.
+     *
+     * Used by g1_dyn decoder in the refheading setting.
+     * Output: 6D rotation = quat_to_6d(quat_inv(robot_heading) * ref_first_heading)
+     */
+    bool GatherHeadingDiffRobotRef(std::vector<double>& target_buffer, size_t offset) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { return false; }
+      if (current_motion_->GetNumBodyQuaternions() == 0) { return false; }
+      if (!state_logger_) { return false; }
+
+      double sample_dt = control_dt_;
+      auto hist = state_logger_->GetLatest(1, sample_dt);
+      const auto& base_quat = hist[0].base_quat;
+
+      auto apply_delta_heading = ComputeApplyDeltaHeading();
+
+      // Get reference root quat at current frame (first future frame = frame_0)
+      int first_frame = static_cast<int>(current_frame_);
+      if (first_frame >= static_cast<int>(current_motion_->timesteps)) {
+        first_frame = static_cast<int>(current_motion_->timesteps) - 1;
+      }
+      const auto first_body_quat = current_motion_->BodyQuaternions(first_frame);
+      auto ref_root_rot = quat_mul_d(apply_delta_heading, first_body_quat[0]);
+
+      // Compute: quat_inv(robot_heading) * ref_first_heading
+      auto robot_heading = calc_heading_quat_d(base_quat);
+      auto ref_first_heading = calc_heading_quat_d(ref_root_rot);
+      auto diff_quat = quat_mul_d(quat_conjugate_d(robot_heading), ref_first_heading);
+
+      auto rotation_matrix = quat_to_rotation_matrix_d(diff_quat);
+      std::array<double, 6> heading_diff = {
+          rotation_matrix[0][0], rotation_matrix[0][1],
+          rotation_matrix[1][0], rotation_matrix[1][1],
+          rotation_matrix[2][0], rotation_matrix[2][1]
+      };
+      std::copy(heading_diff.begin(), heading_diff.end(), target_buffer.begin() + offset);
+      return true;
+    }
+
+    /// Gather joint positions from N future frames.  If joint_indexes is empty, gathers all 29.
+    /// When upper-body control is active (has_upper_body_data_), replaces upper-body joints with
+    /// the externally-provided targets.
+    bool GatherMotionJointPositionsMultiFrame(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 5, std::vector<int> joint_indexes = {}) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+      // Check if motion has valid joint data
+      const auto num_joints = current_motion_->GetNumJoints();
+      if (num_joints == 0) {
+        std::cerr << "✗ Error: Motion has no joints - cannot gather joint positions" << std::endl;
+        return false;
+      }
+      // Validate requested joint indexes
+      for (int idx : joint_indexes) {
+        if (idx < 0 || idx >= static_cast<int>(num_joints)) {
+          std::cerr << "✗ Error: joint index " << idx
+                    << " is out of range [0, " << (num_joints - 1)
+                    << "] in GatherMotionJointPositionsMultiFrame" << std::endl;
+          return false;
+        }
+      }
+      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      // Gather positions from multiple future frames with step intervals
+      for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
+        // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
+        int target_frame = static_cast<int>(current_frame_);
+        if (operator_state.play) {
+          target_frame += frame_idx * step_size;
+          // If beyond motion length, clamp to last frame (hold final pose)
+          if (target_frame >= static_cast<int>(current_motion_->timesteps)) {
+            target_frame = static_cast<int>(current_motion_->timesteps) - 1;
+          }
+        }
+
+        const auto motion_joint_pos = current_motion_->JointPositions(target_frame);
+
+        // If body part indexes are empty, gather all joints
+        if (joint_indexes.empty()) {
+          size_t frame_offset = offset + frame_idx * 29;  // 29 joints per frame
+          std::copy(
+            motion_joint_pos,
+            motion_joint_pos + num_joints,
+            target_buffer.begin() + frame_offset
+          );
+          
+          // If upper body control is enabled, use upper body joint positions in buffer to replace the motion_joint_pos
+          if (ShouldApplyUpperBodyObservationOverride()) {
+            std::array<double, 29> current_motion_joint_pos;
+            for (size_t i = 0; i < 29; i++) {
+              current_motion_joint_pos[i] = motion_joint_pos[i];
+            }
+            for (size_t i = 0; i < 17; i++) {
+              if (!ShouldOverrideUpperBodyIndex(i)) {
+                continue;
+              }
+              current_motion_joint_pos[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_positions_buffer_[i];
+            }
+            std::copy(
+              current_motion_joint_pos.begin(),
+              current_motion_joint_pos.end(),
+              target_buffer.begin() + frame_offset
+            );
+          }
+
+        // If body part indexes are not empty, gather only the needed joints
+        } else {
+          size_t frame_offset = offset + frame_idx * joint_indexes.size(); 
+          std::vector<double> needed_joints_pos(joint_indexes.size());
+          for (size_t i = 0; i < joint_indexes.size(); i++) {
+            size_t body_part_index = joint_indexes[i];
+            needed_joints_pos[i] = motion_joint_pos[body_part_index];
+          }
+          std::copy(
+            needed_joints_pos.begin(),
+            needed_joints_pos.end(),
+            target_buffer.begin() + frame_offset
+          );
+        }
+      }
+      
+      return true;
+    }
+    
+    /// Gather joint velocities from N future frames.  Zeroes velocities when not playing.
+    bool GatherMotionJointVelocitiesMultiFrame(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 5, std::vector<int> joint_indexes = {}) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+      // Check if motion has valid joint data
+      const auto num_joints = current_motion_->GetNumJoints();
+      if (num_joints == 0) {
+        std::cerr << "✗ Error: Motion has no joints - cannot gather joint velocities" << std::endl;
+        return false;
+      }
+      // Validate requested joint indexes
+      for (int idx : joint_indexes) {
+        if (idx < 0 || idx >= static_cast<int>(num_joints)) {
+          std::cerr << "✗ Error: joint index " << idx
+                    << " is out of range [0, " << (num_joints - 1)
+                    << "] in GatherMotionJointVelocitiesMultiFrame" << std::endl;
+          return false;
+        }
+      }
+      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      // Gather velocities from multiple future frames with step intervals
+      for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
+        // Calculate frame index (current frame + frame_idx * step_size for future frames)
+        int target_frame = static_cast<int>(current_frame_) + frame_idx * step_size;
+        
+        // If beyond motion length, clamp to last frame (hold final pose)
+        if (target_frame >= static_cast<int>(current_motion_->timesteps)) {
+          target_frame = static_cast<int>(current_motion_->timesteps) - 1;
+        }
+        
+        const auto motion_joint_vel = current_motion_->JointVelocities(target_frame);
+
+        // If body part indexes are empty, gather all joints
+        if (joint_indexes.empty()) {
+          size_t frame_offset = offset + frame_idx * 29;  // 29 joints per frame
+          if (operator_state.play) {
+            std::copy(
+              motion_joint_vel,
+              motion_joint_vel + num_joints,
+              target_buffer.begin() + frame_offset
+            );
+            // If upper body control is enabled, use upper body joint velocities in buffer to replace the motion_joint_vel
+            if (ShouldApplyUpperBodyObservationOverride()) {
+              std::array<double, 29> current_motion_joint_vel;
+              for (size_t i = 0; i < 29; i++) {
+                current_motion_joint_vel[i] = motion_joint_vel[i];
+              }
+              for (size_t i = 0; i < 17; i++) {
+                if (!ShouldOverrideUpperBodyIndex(i)) {
+                  continue;
+                }
+                current_motion_joint_vel[upper_body_joint_isaaclab_order_in_isaaclab_index[i]] = upper_body_joint_velocities_buffer_[i];
+              }
+              std::copy(
+                current_motion_joint_vel.begin(),
+                current_motion_joint_vel.end(),
+                target_buffer.begin() + frame_offset
+              );
+            }
+          } else {
+            std::fill_n(
+              target_buffer.begin() + frame_offset,
+              num_joints,
+              0.0
+            );
+          }
+        // If body part indexes are not empty, gather only the needed joints
+        } else {
+          size_t frame_offset = offset + frame_idx * joint_indexes.size(); 
+          if (operator_state.play) {
+            std::vector<double> needed_joints_vel(joint_indexes.size());
+            for (size_t i = 0; i < joint_indexes.size(); i++) {
+              size_t body_part_index = joint_indexes[i];
+              needed_joints_vel[i] = motion_joint_vel[body_part_index];
+            }
+            std::copy(
+              needed_joints_vel.begin(),
+              needed_joints_vel.end(),
+              target_buffer.begin() + frame_offset
+            );
+          } else {
+            std::fill_n(
+              target_buffer.begin() + frame_offset,
+              joint_indexes.size(),
+              0.0
+            );
+          }
+        }
+      }
+      
+      return true;
+    }
+    
+    /// Gather SMPL joint positions from N future frames (3 values × num_smpl_joints per frame).
+    bool GatherMotionSmplJointsMultiFrame(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 5, std::vector<int> smpl_indexes = {}) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+      // Check if motion has valid SMPL joint data
+      const auto num_smpl_joints = current_motion_->GetNumSmplJoints();
+      if (num_smpl_joints == 0) {
+        std::cerr << "✗ Error: Motion has no SMPL joints - cannot gather SMPL joint data" << std::endl;
+        return false;
+      }
+      // Validate requested SMPL joint indexes
+      for (int idx : smpl_indexes) {
+        if (idx < 0 || idx >= static_cast<int>(num_smpl_joints)) {
+          std::cerr << "✗ Error: SMPL joint index " << idx
+                    << " is out of range [0, " << (num_smpl_joints - 1)
+                    << "] in GatherMotionSmplJointsMultiFrame" << std::endl;
+          return false;
+        }
+      }
+      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      
+      // Gather SMPL joints from multiple future frames with step intervals
+      for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
+        // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
+        int target_frame = static_cast<int>(current_frame_);
+        if (operator_state.play) {
+          target_frame += frame_idx * step_size;
+          // If beyond motion length, clamp to last frame (hold final pose)
+          if (target_frame >= static_cast<int>(current_motion_->timesteps)) {
+            target_frame = static_cast<int>(current_motion_->timesteps) - 1;
+          }
+        }
+        
+        const auto motion_smpl_joints = current_motion_->SmplJoints(target_frame);
+
+        // If indexes are empty, gather all SMPL joints (all x, y, z coordinates)
+        if (smpl_indexes.empty()) {
+          size_t frame_offset = offset + frame_idx * num_smpl_joints * 3;  // 3 coordinates per joint
+          
+          for (size_t j = 0; j < num_smpl_joints; ++j) {
+            target_buffer[frame_offset + j * 3 + 0] = motion_smpl_joints[j][0]; // x
+            target_buffer[frame_offset + j * 3 + 1] = motion_smpl_joints[j][1]; // y
+            target_buffer[frame_offset + j * 3 + 2] = motion_smpl_joints[j][2]; // z
+          }
+        // If indexes are not empty, gather only the needed SMPL joints
+        } else {
+          size_t frame_offset = offset + frame_idx * smpl_indexes.size() * 3; 
+          for (size_t i = 0; i < smpl_indexes.size(); i++) {
+            size_t smpl_idx = smpl_indexes[i];
+            target_buffer[frame_offset + i * 3 + 0] = motion_smpl_joints[smpl_idx][0]; // x
+            target_buffer[frame_offset + i * 3 + 1] = motion_smpl_joints[smpl_idx][1]; // y
+            target_buffer[frame_offset + i * 3 + 2] = motion_smpl_joints[smpl_idx][2]; // z
+          }
+        }
+      }
+      
+      return true;
+    }
+    
+    /// Gather SMPL pose (axis-angle) data from N future frames (3 values × num_smpl_poses per frame).
+    bool GatherMotionSmplPosesMultiFrame(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 5, std::vector<int> pose_indexes = {}) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+      // Check if motion has valid SMPL pose data
+      const auto num_smpl_poses = current_motion_->GetNumSmplPoses();
+      if (num_smpl_poses == 0) {
+        std::cerr << "✗ Error: Motion has no SMPL poses - cannot gather SMPL pose data" << std::endl;
+        return false;
+      }
+      // Validate requested SMPL pose indexes
+      for (int idx : pose_indexes) {
+        if (idx < 0 || idx >= static_cast<int>(num_smpl_poses)) {
+          std::cerr << "✗ Error: SMPL pose index " << idx
+                    << " is out of range [0, " << (num_smpl_poses - 1)
+                    << "] in GatherMotionSmplPosesMultiFrame" << std::endl;
+          return false;
+        }
+      }
+      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      
+      // Gather SMPL poses from multiple future frames with step intervals
+      for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
+        // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
+        int target_frame = static_cast<int>(current_frame_);
+        if (operator_state.play) {
+          target_frame += frame_idx * step_size;
+          // If beyond motion length, clamp to last frame (hold final pose)
+          if (target_frame >= static_cast<int>(current_motion_->timesteps)) {
+            target_frame = static_cast<int>(current_motion_->timesteps) - 1;
+          }
+        }
+        
+        const auto motion_smpl_poses = current_motion_->SmplPoses(target_frame);
+
+        // If indexes are empty, gather all SMPL poses (all x, y, z coordinates)
+        if (pose_indexes.empty()) {
+          size_t frame_offset = offset + frame_idx * num_smpl_poses * 3;  // 3 coordinates per pose
+          
+          for (size_t p = 0; p < num_smpl_poses; ++p) {
+            target_buffer[frame_offset + p * 3 + 0] = motion_smpl_poses[p][0]; // x
+            target_buffer[frame_offset + p * 3 + 1] = motion_smpl_poses[p][1]; // y
+            target_buffer[frame_offset + p * 3 + 2] = motion_smpl_poses[p][2]; // z
+          }
+        // If indexes are not empty, gather only the needed SMPL poses
+        } else {
+          size_t frame_offset = offset + frame_idx * pose_indexes.size() * 3; 
+          for (size_t i = 0; i < pose_indexes.size(); i++) {
+            size_t pose_idx = pose_indexes[i];
+            target_buffer[frame_offset + i * 3 + 0] = motion_smpl_poses[pose_idx][0]; // x
+            target_buffer[frame_offset + i * 3 + 1] = motion_smpl_poses[pose_idx][1]; // y
+            target_buffer[frame_offset + i * 3 + 2] = motion_smpl_poses[pose_idx][2]; // z
+          }
+        }
+      }
+      
+      return true;
+    }
+    
+    // =========================================================================
+    // VR 3/5-point observation helpers and gatherers
+    //
+    // VR tracking data can come from two sources:
+    //   1. External input interface (ZMQ / ROS2) → use buffered values directly.
+    //   2. Computed from motion body positions with per-body offsets, then
+    //      normalised to the root body frame.
+    //
+    // The UpdateVR*PointIndices() helpers map the canonical VR body indices
+    // (e.g. left wrist = body 28) to storage indices in the current
+    // motion's BodyPartIndexes array (which varies between motions).
+    // =========================================================================
+
+    /// Map canonical VR 3-point body indices to current motion's storage indices.
+    /// @return True if all 3 required indices were found.
+    bool UpdateVR3PointIndices() {
+      if (!current_motion_ || current_motion_->timesteps == 0) {
+        return false;
+      }
+      
+      auto body_part_indexes = current_motion_->BodyPartIndexes();
+      
+      // Reset indices
+      actual_vr_3point_index = {-1, -1, -1};
+      
+      // Find positions of required indices
+      for (size_t i = 0; i < body_part_indexes.size(); i++) {
+        for (size_t j = 0; j < vr_3point_index.size(); j++) {
+          if (body_part_indexes[i] == vr_3point_index[j] && actual_vr_3point_index[j] == -1) {
+            actual_vr_3point_index[j] = static_cast<int>(i);
+            break; // Take first occurrence, move to next body part
+          }
+        }
+      }
+      
+      // Validate that all required indices were found
+      for (size_t j = 0; j < actual_vr_3point_index.size(); j++) {
+        if (actual_vr_3point_index[j] == -1) {
+          // VR3Point index not found - will fall back to interface values
+          return false;
+        }
+      }
+      
+      return true;
+    }
+
+    // Helper function to update VR3Point indices for current motion
+    // Returns true if all indices found, false otherwise
+    bool UpdateVR5PointIndices() {
+      if (!current_motion_ || current_motion_->timesteps == 0) { return false; }
+
+      auto body_part_indexes = current_motion_->BodyPartIndexes();
+
+      // Reset indices
+      actual_vr_5point_index = {-1, -1, -1, -1, -1};
+
+      // Find positions of required indices
+      for (size_t i = 0; i < body_part_indexes.size(); i++) {
+        for (size_t j = 0; j < vr_5point_index.size(); j++) {
+          if (body_part_indexes[i] == vr_5point_index[j] && actual_vr_5point_index[j] == -1) {
+            actual_vr_5point_index[j] = static_cast<int>(i);
+            break; // Take first occurrence, move to next body part
+          }
+        }
+      }
+
+      // Validate that all required indices were found
+      for (size_t j = 0; j < actual_vr_5point_index.size(); j++) {
+        if (actual_vr_5point_index[j] == -1) {
+          // VR5Point index not found - will fall back to interface values
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    bool GatherVR3PointPosition(std::vector<double>& target_buffer, size_t offset) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+
+
+      // 1. Input interface providing VR 3-point (ZMQ, ROS2) -> use buffer
+      // 2. Otherwise -> compute from motion body positions with offsets
+      bool use_buffered_vr3 = has_vr_3point_data_;
+      
+      if (use_buffered_vr3) {
+        // Use VR 3-point data from input interface directly
+        // The sender (ZMQ/ROS2/planner) has already applied offsets and root normalization
+        std::copy(vr_3point_position_buffer_.begin(), vr_3point_position_buffer_.end(), target_buffer.begin() + offset);
+        return true;
+      }
+      
+      // No external VR 3-point data - compute from motion's body positions
+      // Update VR3Point indices for current motion (different motions have different BodyPartIndexes)
+      // If indices not found, fall back to buffered interface values (fallback to default values)
+      if (!UpdateVR3PointIndices()) {
+        std::copy(vr_3point_position_buffer_.begin(), vr_3point_position_buffer_.end(), target_buffer.begin() + offset);
+        return true;
+      }
+      
+      // read from current motion
+      int frame = current_frame_ % current_motion_->timesteps;
+      const auto& motion_body_pos = current_motion_->BodyPositions(frame);
+      const auto& motion_body_quat = current_motion_->BodyQuaternions(frame);
+
+      // VR 3-point offsets in body's local frame (matching ros2_input_handler.hpp and visualize_motion.py)
+      // Order: left_wrist (index 0), right_wrist (index 1), head/torso (index 2)
+      // NOTE: Y-axis is mirrored for right wrist (symmetric robot)
+      constexpr std::array<std::array<double, 3>, 3> VR_3POINT_OFFSETS = {{
+        {0.18, -0.025, 0.0},   // left wrist offset
+        {0.18, +0.025, 0.0},   // right wrist offset (Y mirrored for symmetry)
+        {0.0, 0.0, 0.35}       // head offset (applied to torso body)
+      }};
+
+      // Apply offsets to body positions to get VR 3-point positions
+      std::array<double, 9> vr_3point_position;
+      for (int i = 0; i < 3; ++i) {
+        // Get body position and orientation
+        const auto& body_pos = motion_body_pos[actual_vr_3point_index[i]];
+        const auto& body_quat = motion_body_quat[actual_vr_3point_index[i]];
+        
+        // Rotate offset by body orientation to get offset in world frame
+        auto offset_world = quat_rotate_d(body_quat, VR_3POINT_OFFSETS[i]);
+        
+        // Add rotated offset to body position to get VR point position
+        vr_3point_position[i * 3 + 0] = body_pos[0] + offset_world[0];
+        vr_3point_position[i * 3 + 1] = body_pos[1] + offset_world[1];
+        vr_3point_position[i * 3 + 2] = body_pos[2] + offset_world[2];
+      }
+
+      // normalize positions to the root by - root_pos rotate and normalize the root_quat
+      auto root_pos = current_motion_->BodyPositions(frame)[0];
+      auto root_quat = current_motion_->BodyQuaternions(frame)[0];
+      
+      // Normalize each VR 3-point position relative to root
+      // Apply inverse transformation: subtract root position, then rotate by inverse root quaternion
+      auto root_quat_inv = quat_conjugate_d(root_quat); // Get inverse quaternion
+      
+      for (int i = 0; i < 3; ++i) {
+        // Extract position for this VR point
+        std::array<double, 3> point_pos = {
+          vr_3point_position[i * 3 + 0],
+          vr_3point_position[i * 3 + 1], 
+          vr_3point_position[i * 3 + 2]
+        };
+        
+        // Make position relative to root (subtract root position)
+        std::array<double, 3> relative_pos = {
+          point_pos[0] - root_pos[0],
+          point_pos[1] - root_pos[1],
+          point_pos[2] - root_pos[2]
+        };
+        
+        // Rotate relative position by inverse root quaternion
+        auto normalized_pos = quat_rotate_d(root_quat_inv, relative_pos);
+        
+        // Store normalized position back to the array
+        vr_3point_position[i * 3 + 0] = normalized_pos[0];
+        vr_3point_position[i * 3 + 1] = normalized_pos[1];
+        vr_3point_position[i * 3 + 2] = normalized_pos[2];
+      }
+      
+      std::copy(
+        vr_3point_position.begin(),
+        vr_3point_position.end(),
+        target_buffer.begin() + offset
+      );
+      
+      // Update buffer with the computed value from dataset 
+      vr_3point_position_buffer_ = vr_3point_position;
+      
+      return true;
+    }
+
+    bool GatherVR3PointOrientation(std::vector<double>& target_buffer, size_t offset) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+      
+      bool use_buffered_vr3 = has_vr_3point_data_;
+
+      if (use_buffered_vr3) {
+        std::copy(vr_3point_orientation_buffer_.begin(), vr_3point_orientation_buffer_.end(), target_buffer.begin() + offset);
+        return true;
+      }
+      
+      // No external VR 3-point data - compute from motion's body positions
+      // Update VR3Point indices for current motion (different motions have different BodyPartIndexes)
+      // If indices not found, fall back to buffered interface values (fallback to default values)
+      if (!UpdateVR3PointIndices()) {
+        std::copy(vr_3point_orientation_buffer_.begin(), vr_3point_orientation_buffer_.end(), target_buffer.begin() + offset);
+        return true;
+      }
+
+      // read from current motion
+      int frame = current_frame_ % current_motion_->timesteps;
+      const auto& motion_body_quat = current_motion_->BodyQuaternions(frame);
+
+      // Copy quaternions to observation buffer (flatten 3x4D quaternions to 12 values)
+      std::array<double, 12> vr_3point_orientation = {
+        motion_body_quat[actual_vr_3point_index[0]][0], motion_body_quat[actual_vr_3point_index[0]][1], motion_body_quat[actual_vr_3point_index[0]][2], motion_body_quat[actual_vr_3point_index[0]][3], // Quat 0: w,x,y,z
+        motion_body_quat[actual_vr_3point_index[1]][0], motion_body_quat[actual_vr_3point_index[1]][1], motion_body_quat[actual_vr_3point_index[1]][2], motion_body_quat[actual_vr_3point_index[1]][3], // Quat 1: w,x,y,z
+        motion_body_quat[actual_vr_3point_index[2]][0], motion_body_quat[actual_vr_3point_index[2]][1], motion_body_quat[actual_vr_3point_index[2]][2], motion_body_quat[actual_vr_3point_index[2]][3]  // Quat 2: w,x,y,z
+      };
+
+      // Normalize quaternions relative to root quaternion: quat_mul(quat_inv(root_quat), vr_quat)
+      auto root_quat = current_motion_->BodyQuaternions(frame)[0];
+      auto root_quat_inv = quat_conjugate_d(root_quat); // Get inverse quaternion
+      
+      for (int i = 0; i < 3; ++i) {
+        // Extract quaternion for this VR point
+        std::array<double, 4> point_quat = {
+          vr_3point_orientation[i * 4 + 0], // w
+          vr_3point_orientation[i * 4 + 1], // x
+          vr_3point_orientation[i * 4 + 2], // y
+          vr_3point_orientation[i * 4 + 3]  // z
+        };
+        
+        // Apply quaternion normalization: quat_mul(quat_inv(root_quat), vr_quat)
+        auto normalized_quat = quat_mul_d(root_quat_inv, point_quat);
+        
+        // Store normalized quaternion back to the array
+        vr_3point_orientation[i * 4 + 0] = normalized_quat[0]; // w
+        vr_3point_orientation[i * 4 + 1] = normalized_quat[1]; // x
+        vr_3point_orientation[i * 4 + 2] = normalized_quat[2]; // y
+        vr_3point_orientation[i * 4 + 3] = normalized_quat[3]; // z
+      }
+      
+      std::copy(
+        vr_3point_orientation.begin(),
+        vr_3point_orientation.end(),
+        target_buffer.begin() + offset
+      );
+      
+      // Update buffer with the computed value from dataset
+      vr_3point_orientation_buffer_ = vr_3point_orientation;
+      
+      return true;
+    }
+
+
+    bool GatherVR5PointPosition(std::vector<double>& target_buffer, size_t offset) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+
+      if (current_motion_ && current_motion_ == planner_motion_){
+        // if planner motion, read from buffered interface data
+        std::copy(vr_5point_position_buffer_.begin(), vr_5point_position_buffer_.end(), target_buffer.begin() + offset);
+        return true;
+      } else {
+        // Update VR3Point indices for current motion (different motions have different BodyPartIndexes)
+        // If indices not found, fall back to buffered interface values
+        if (!UpdateVR5PointIndices()) {
+          std::copy(vr_5point_position_buffer_.begin(), vr_5point_position_buffer_.end(), target_buffer.begin() + offset);
+          return true;
+        }
+        
+        // read from current motion
+        int frame = current_frame_ % current_motion_->timesteps;
+        const auto& motion_body_pos = current_motion_->BodyPositions(frame);
+        const auto& motion_body_quat = current_motion_->BodyQuaternions(frame);
+
+        // VR 3-point offsets in body's local frame (matching ros2_input_handler.hpp and visualize_motion.py)
+        // Order: left_wrist (index 0), right_wrist (index 1), head/torso (index 2)
+        // NOTE: Y-axis is mirrored for right wrist (symmetric robot)
+        constexpr std::array<std::array<double, 3>, 5> VR_5POINT_OFFSETS = {
+          std::array<double, 3>{0.0, 0.0, 0.0},   // left wrist offset
+          std::array<double, 3>{0.0, 0.0, 0.0},   // right wrist offset (Y mirrored for symmetry)
+          std::array<double, 3>{0.0, 0.0, 0.0},   // head offset (applied to torso body)
+          std::array<double, 3>{0.0, 0.0, 0.0},   // left ankle offset
+          std::array<double, 3>{0.0, 0.0, 0.0}    // right ankle offset
+        };
+
+        // Apply offsets to body positions to get VR 3-point positions
+        std::array<double, 15> vr_5point_position;
+        for (int i = 0; i < 5; ++i) {
+          // Get body position and orientation
+          const auto& body_pos = motion_body_pos[actual_vr_5point_index[i]];
+          const auto& body_quat = motion_body_quat[actual_vr_5point_index[i]];
+          
+          // Rotate offset by body orientation to get offset in world frame
+          auto offset_world = quat_rotate_d(body_quat, VR_5POINT_OFFSETS[i]);
+          
+          // Add rotated offset to body position to get VR point position
+          vr_5point_position[i * 3 + 0] = body_pos[0] + offset_world[0];
+          vr_5point_position[i * 3 + 1] = body_pos[1] + offset_world[1];
+          vr_5point_position[i * 3 + 2] = body_pos[2] + offset_world[2];
+        }
+
+        // normalize positions to the root by - root_pos rotate and normalize the root_quat
+        auto root_pos = current_motion_->BodyPositions(frame)[0];
+        auto root_quat = current_motion_->BodyQuaternions(frame)[0];
+        
+        // Normalize each VR 3-point position relative to root
+        // Apply inverse transformation: subtract root position, then rotate by inverse root quaternion
+        auto root_quat_inv = quat_conjugate_d(root_quat); // Get inverse quaternion
+        
+        for (int i = 0; i < 5; ++i) {
+          // Extract position for this VR point
+          std::array<double, 3> point_pos = {
+            vr_5point_position[i * 3 + 0],
+            vr_5point_position[i * 3 + 1], 
+            vr_5point_position[i * 3 + 2]
+          };
+          
+          // Make position relative to root (subtract root position)
+          std::array<double, 3> relative_pos = {
+            point_pos[0] - root_pos[0],
+            point_pos[1] - root_pos[1],
+            point_pos[2] - root_pos[2]
+          };
+          
+          // Rotate relative position by inverse root quaternion
+          auto normalized_pos = quat_rotate_d(root_quat_inv, relative_pos);
+          
+          // Store normalized position back to the array
+          vr_5point_position[i * 3 + 0] = normalized_pos[0];
+          vr_5point_position[i * 3 + 1] = normalized_pos[1];
+          vr_5point_position[i * 3 + 2] = normalized_pos[2];
+        }
+        
+        std::copy(
+          vr_5point_position.begin(),
+          vr_5point_position.end(),
+          target_buffer.begin() + offset
+        );
+        
+        // Update buffer with the computed value from dataset 
+        vr_5point_position_buffer_ = vr_5point_position;
+        
+        return true;
+      }
+      return false;
+    }
+
+    bool GatherVR5PointOrientation(std::vector<double>& target_buffer, size_t offset) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+      
+      if (current_motion_ && current_motion_ == planner_motion_){
+        std::copy(vr_5point_orientation_buffer_.begin(), vr_5point_orientation_buffer_.end(), target_buffer.begin() + offset);
+        return true;
+      } else {
+        // Update VR3Point indices for current motion (different motions have different BodyPartIndexes)
+        // If indices not found, fall back to buffered interface values
+        if (!UpdateVR5PointIndices()) {
+          std::copy(vr_5point_orientation_buffer_.begin(), vr_5point_orientation_buffer_.end(), target_buffer.begin() + offset);
+          return true;
+        }
+        
+        // read from current motion
+        int frame = current_frame_ % current_motion_->timesteps;
+        const auto& motion_body_quat = current_motion_->BodyQuaternions(frame);
+
+        // Copy quaternions to observation buffer (flatten 3x4D quaternions to 12 values)
+        std::array<double, 20> vr_5point_orientation = {
+          motion_body_quat[actual_vr_5point_index[0]][0], motion_body_quat[actual_vr_5point_index[0]][1], motion_body_quat[actual_vr_5point_index[0]][2], motion_body_quat[actual_vr_5point_index[0]][3], // Quat 0: w,x,y,z
+          motion_body_quat[actual_vr_5point_index[1]][0], motion_body_quat[actual_vr_5point_index[1]][1], motion_body_quat[actual_vr_5point_index[1]][2], motion_body_quat[actual_vr_5point_index[1]][3], // Quat 1: w,x,y,z
+          motion_body_quat[actual_vr_5point_index[2]][0], motion_body_quat[actual_vr_5point_index[2]][1], motion_body_quat[actual_vr_5point_index[2]][2], motion_body_quat[actual_vr_5point_index[2]][3], // Quat 2: w,x,y,z
+          motion_body_quat[actual_vr_5point_index[3]][0], motion_body_quat[actual_vr_5point_index[3]][1], motion_body_quat[actual_vr_5point_index[3]][2], motion_body_quat[actual_vr_5point_index[3]][3], // Quat 3: w,x,y,z
+          motion_body_quat[actual_vr_5point_index[4]][0], motion_body_quat[actual_vr_5point_index[4]][1], motion_body_quat[actual_vr_5point_index[4]][2], motion_body_quat[actual_vr_5point_index[4]][3]  // Quat 4: w,x,y,z
+        };
+
+        // Normalize quaternions relative to root quaternion: quat_mul(quat_inv(root_quat), vr_quat)
+        auto root_quat = current_motion_->BodyQuaternions(frame)[0];
+        auto root_quat_inv = quat_conjugate_d(root_quat); // Get inverse quaternion
+        
+        for (int i = 0; i < 5; ++i) {
+          // Extract quaternion for this VR point
+          std::array<double, 4> point_quat = {
+            vr_5point_orientation[i * 4 + 0], // w
+            vr_5point_orientation[i * 4 + 1], // x
+            vr_5point_orientation[i * 4 + 2], // y
+            vr_5point_orientation[i * 4 + 3]  // z
+          };
+          
+          // Apply quaternion normalization: quat_mul(quat_inv(root_quat), vr_quat)
+          auto normalized_quat = quat_mul_d(root_quat_inv, point_quat);
+          
+          // Store normalized quaternion back to the array
+          vr_5point_orientation[i * 4 + 0] = normalized_quat[0]; // w
+          vr_5point_orientation[i * 4 + 1] = normalized_quat[1]; // x
+          vr_5point_orientation[i * 4 + 2] = normalized_quat[2]; // y
+          vr_5point_orientation[i * 4 + 3] = normalized_quat[3]; // z
+        }
+        
+        std::copy(
+          vr_5point_orientation.begin(),
+          vr_5point_orientation.end(),
+          target_buffer.begin() + offset
+        );
+        
+        // Update buffer with the computed value from dataset
+        vr_5point_orientation_buffer_ = vr_5point_orientation;
+        
+        return true;
+      }
+      return false;
+    }
+
+    bool GatherVR3PointCompliance(std::vector<double>& target_buffer, size_t offset) {
+      if (!current_motion_ || current_motion_->timesteps == 0) { 
+        return false; 
+      }
+      // Compliance always comes from interface (not from motion dataset)
+      std::copy(vr_3point_compliance_buffer_.begin(), vr_3point_compliance_buffer_.end(), target_buffer.begin() + offset);
+      return true;
+    }
+
+    // =========================================================================
+    // History-based observation gatherers (from StateLogger)
+    //
+    // These functions read past robot state from the StateLogger ring buffer
+    // to provide temporal context to the policy.  They support multi-frame
+    // history with configurable step size (e.g., 4 frames at 1× dt = last
+    // 4 ticks; 10 frames at 2× dt = last 20 ticks sampled every other one).
+    //
+    // Each returns false if the required historical data is unavailable.
+    // =========================================================================
+
+    /// Gather historical body joint positions (num_frames × joints_per_frame).
+    bool GatherHisBodyJointPositions(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 1, std::vector<int> body_part_indexes = {}, bool newest_first = false) {
+      if (!state_logger_) { return false; }
+      // step_size here means: sample every step_size * dt (e.g., step_size=2 means 0, 2*dt, 4*dt, ...)
+      double sample_dt = control_dt_ * step_size;
+      auto hist = state_logger_->GetLatest(static_cast<size_t>(num_frames), sample_dt, newest_first);
+      
+      // Check if we have valid historical data
+      if (hist.empty() || hist[0].body_q.empty()) {
+        std::cerr << "✗ Error: No historical joint position data available" << std::endl;
+        return false;
+      }
+      const auto joints = static_cast<int>(hist[0].body_q.size());
+      // Validate requested joint indexes
+      for (int idx : body_part_indexes) {
+        if (idx < 0 || idx >= joints) {
+          std::cerr << "✗ Error: body joint index " << idx
+                    << " is out of range [0, " << (joints - 1)
+                    << "] in GatherHisBodyJointPositions" << std::endl;
+          return false;
+        }
+      }
+
+      for (int f = 0; f < num_frames; ++f) {
+        const auto &entry = hist[static_cast<size_t>(f)];
+        if (body_part_indexes.empty()) {
+          // All joints
+          size_t frame_offset = offset + static_cast<size_t>(f) * joints;
+          if (!entry.body_q.empty()) {
+            std::copy(entry.body_q.begin(), entry.body_q.begin() + joints, target_buffer.begin() + frame_offset);
+          } else {
+            std::fill_n(target_buffer.begin() + frame_offset, joints, 0.0);
+          }
+        } else {
+          // Specific joints
+          size_t frame_offset = offset + static_cast<size_t>(f) * body_part_indexes.size();
+          if (!entry.body_q.empty()) {
+            for (size_t i = 0; i < body_part_indexes.size(); ++i) {
+              int idx = body_part_indexes[i];
+              target_buffer[frame_offset + i] = (idx >= 0 && static_cast<size_t>(idx) < entry.body_q.size()) ? entry.body_q[static_cast<size_t>(idx)] : 0.0;
+            }
+          } else {
+            std::fill_n(target_buffer.begin() + frame_offset, body_part_indexes.size(), 0.0);
+          }
+        }
+      }
+      return true;
+    }
+
+    bool GatherHisBodyJointVelocities(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 1, std::vector<int> body_part_indexes = {}, bool newest_first = false) {
+      if (!state_logger_) { return false; }
+      double sample_dt = control_dt_ * step_size;
+      auto hist = state_logger_->GetLatest(static_cast<size_t>(num_frames), sample_dt, newest_first);
+      
+      // Check if we have valid historical data
+      if (hist.empty() || hist[0].body_dq.empty()) {
+        std::cerr << "✗ Error: No historical joint velocity data available" << std::endl;
+        return false;
+      }
+      const auto joints = static_cast<int>(hist[0].body_dq.size());
+      // Validate requested joint indexes
+      for (int idx : body_part_indexes) {
+        if (idx < 0 || idx >= joints) {
+          std::cerr << "✗ Error: body joint index " << idx
+                    << " is out of range [0, " << (joints - 1)
+                    << "] in GatherHisBodyJointVelocities" << std::endl;
+          return false;
+        }
+      }
+
+      for (int f = 0; f < num_frames; ++f) {
+        const auto &entry = hist[static_cast<size_t>(f)];
+        std::array<double, lower_body_observation_guard::kJointCount>
+            guarded_dq{};
+        const bool use_guarded_dq =
+            lower_body_observation_guard_enabled_ &&
+            entry.body_dq.size() ==
+                lower_body_observation_guard::kJointCount &&
+            lower_body_observation_guard_.Lookup(entry.index, guarded_dq);
+        if (body_part_indexes.empty()) {
+          size_t frame_offset = offset + static_cast<size_t>(f) * joints;
+          if (!entry.body_dq.empty()) {
+            if (use_guarded_dq) {
+              std::copy(
+                  guarded_dq.begin(), guarded_dq.begin() + joints,
+                  target_buffer.begin() + frame_offset);
+            } else {
+              std::copy(entry.body_dq.begin(), entry.body_dq.begin() + joints, target_buffer.begin() + frame_offset);
+            }
+          } else {
+            std::fill_n(target_buffer.begin() + frame_offset, joints, 0.0);
+          }
+        } else {
+          size_t frame_offset = offset + static_cast<size_t>(f) * body_part_indexes.size();
+          if (!entry.body_dq.empty()) {
+            for (size_t i = 0; i < body_part_indexes.size(); ++i) {
+              int idx = body_part_indexes[i];
+              target_buffer[frame_offset + i] =
+                  (idx >= 0 && static_cast<size_t>(idx) < entry.body_dq.size())
+                      ? (use_guarded_dq
+                             ? guarded_dq[static_cast<size_t>(idx)]
+                             : entry.body_dq[static_cast<size_t>(idx)])
+                      : 0.0;
+            }
+          } else {
+            std::fill_n(target_buffer.begin() + frame_offset, body_part_indexes.size(), 0.0);
+          }
+        }
+      }
+      return true;
+    }
+
+    bool GatherHisLastActions(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 1, std::vector<int> body_part_indexes = {}, bool newest_first = false) {
+      if (!state_logger_) { return false; }
+      double sample_dt = control_dt_ * step_size;
+      auto hist = state_logger_->GetLatest(static_cast<size_t>(num_frames), sample_dt, newest_first);
+      
+      // Check if we have valid historical data
+      if (hist.empty() || hist[0].last_action.empty()) {
+        std::cerr << "✗ Error: No historical last action data available" << std::endl;
+        return false;
+      }
+      const auto joints = static_cast<int>(hist[0].last_action.size());
+      // Validate requested joint indexes
+      for (int idx : body_part_indexes) {
+        if (idx < 0 || idx >= joints) {
+          std::cerr << "✗ Error: body joint index " << idx
+                    << " is out of range [0, " << (joints - 1)
+                    << "] in GatherHisLastActions" << std::endl;
+          return false;
+        }
+      }
+
+      for (int f = 0; f < num_frames; ++f) {
+        const auto &entry = hist[static_cast<size_t>(f)];
+        if (body_part_indexes.empty()) {
+          size_t frame_offset = offset + static_cast<size_t>(f) * joints;
+          if (!entry.last_action.empty()) {
+            std::copy(entry.last_action.begin(), entry.last_action.begin() + joints, target_buffer.begin() + frame_offset);
+          } else {
+            std::fill_n(target_buffer.begin() + frame_offset, joints, 0.0);
+          }
+        } else {
+          size_t frame_offset = offset + static_cast<size_t>(f) * body_part_indexes.size();
+          if (!entry.last_action.empty()) {
+            for (size_t i = 0; i < body_part_indexes.size(); ++i) {
+              int idx = body_part_indexes[i];
+              target_buffer[frame_offset + i] = (idx >= 0 && static_cast<size_t>(idx) < entry.last_action.size()) ? entry.last_action[static_cast<size_t>(idx)] : 0.0;
+            }
+          } else {
+            std::fill_n(target_buffer.begin() + frame_offset, body_part_indexes.size(), 0.0);
+          }
+        }
+      }
+      return true;
+    }
+
+    bool GatherHisBaseAngularVelocity(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 1, bool newest_first = false) {
+      if (!state_logger_) { return false; }
+      double sample_dt = control_dt_ * step_size;
+      auto hist = state_logger_->GetLatest(static_cast<size_t>(num_frames), sample_dt, newest_first);
+      
+      // Check if we have valid historical data
+      if (hist.empty()) {
+        std::cerr << "✗ Error: No historical base angular velocity data available" << std::endl;
+        return false;
+      }
+      
+      for (int f = 0; f < num_frames; ++f) {
+        const auto &entry = hist[static_cast<size_t>(f)];
+        size_t frame_offset = offset + static_cast<size_t>(f) * 3;
+        target_buffer[frame_offset + 0] = entry.base_ang_vel[0];
+        target_buffer[frame_offset + 1] = entry.base_ang_vel[1];
+        target_buffer[frame_offset + 2] = entry.base_ang_vel[2];
+      }
+      return true;
+    }
+
+    bool GatherHisGravityDir(std::vector<double>& target_buffer, size_t offset, int num_frames = 5, int step_size = 1, bool newest_first = false) {
+      if (!state_logger_) { return false; }
+      double sample_dt = control_dt_ * step_size;
+      auto hist = state_logger_->GetLatest(static_cast<size_t>(num_frames), sample_dt, newest_first);
+      
+      // Check if we have valid historical data
+      if (hist.empty()) {
+        std::cerr << "✗ Error: No historical gravity direction data available" << std::endl;
+        return false;
+      }
+      
+      for (int f = 0; f < num_frames; ++f) {
+        const auto &entry = hist[static_cast<size_t>(f)];
+        auto gravity_dir_inv = quat_conjugate_d(entry.base_quat);
+        std::array<double, 3> gravity_dir = quat_rotate_d(gravity_dir_inv, {0.0, 0.0, -1.0});
+        size_t frame_offset = offset + static_cast<size_t>(f) * 3;
+        target_buffer[frame_offset + 0] = gravity_dir[0];
+        target_buffer[frame_offset + 1] = gravity_dir[1];
+        target_buffer[frame_offset + 2] = gravity_dir[2];
+      }
+      return true;
+    }
+
+    // =========================================================================
+    // Token / encoder observation gatherers
+    //
+    // The token state can be produced in two ways:
+    //   1. Local encoder: GatherEncoderObservations() fills the encoder's
+    //      input buffer, Encode() runs TensorRT inference, and the output
+    //      tokens are copied into token_state_data_.
+    //   2. External source: token_state_data_ was already populated in
+    //      GatherInputInterfaceData() from ZMQ / ROS2.
+    // =========================================================================
+
+    /// Populate the token_state observation (either from local encoder or external data).
+    bool GatherTokenState(std::vector<double>& target_buffer, size_t offset) {
+      if (!is_using_encoder_) {
+        // No encoder configured; use token_state_data_ (can be set externally via ROS2/ZMQ)
+        std::copy(token_state_data_.begin(), token_state_data_.end(), target_buffer.begin() + offset);
+        return true;
+      }
+
+      if (!encoder_engine_) {
+        std::cerr << "✗ Error: Encoder engine not initialized!" << std::endl;
+        return false;
+      }
+
+      // Gather encoder observations (populate encoder's internal input buffer)
+      if (!GatherEncoderObservations()) {
+        std::cerr << "✗ Error: Failed to gather encoder observations!" << std::endl;
+        return false;
+      }
+
+      // Run encoder inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
+      if (!encoder_engine_->Encode()) {
+        std::cerr << "✗ Error: Encoder inference failed" << std::endl;
+        return false;
+      }
+
+      // Access encoded tokens from encoder's internal buffer (already populated by Encode)
+      auto& token_buffer = encoder_engine_->GetTokenBuffer();
+      const size_t token_dim = encoder_engine_->GetTokenDimension();
+      
+      // Validate token dimension matches expected size
+      if (token_dim != token_state_data_.size()) {
+        std::cerr << "✗ Error: Encoder output dimension (" << token_dim 
+                  << ") doesn't match token state buffer size (" << token_state_data_.size() << ")!" << std::endl;
+        return false;
+      }
+      
+      for (size_t i = 0; i < token_dim; ++i) {
+        const double v = static_cast<double>(token_buffer[i]);
+        token_state_data_[i] = v;
+        target_buffer[offset + i] = v;
+      }
+      return true;
+    }
+
+    bool GatherEncoderMode(std::vector<double>& target_buffer, size_t offset, int fill_zeros_num = 0) {
+      target_buffer[offset] = static_cast<float>(current_motion_->GetEncodeMode());
+      for (int i = 1; i <= fill_zeros_num; ++i) {
+        target_buffer[offset + i] = 0;
+      }
+      return true;
+    }
+
+    // =========================================================================
+    // Observation registry
+    //
+    // Single source of truth mapping observation names (as they appear in
+    // observation_config.yaml) to their dimension and gatherer lambda.
+    // Both the policy and encoder observation systems use this registry.
+    // =========================================================================
+
+    /// Build the complete observation registry (name, dimension, gatherer function).
+    std::vector<ObservationRegistry> GetObservationRegistry() {
+      // Use token dimension from encoder config (defaults to 64 if not configured)
+      size_t token_dim = (encoder_config_.dimension > 0) ? encoder_config_.dimension : 64;
+      return {{"token_state", token_dim, [this](std::vector<double>& buf, size_t offset) { return GatherTokenState(buf, offset); }},
+              {"encoder_mode", 3, [this](std::vector<double>& buf, size_t offset) { return GatherEncoderMode(buf, offset, 2); }},
+              {"encoder_mode_4", 4, [this](std::vector<double>& buf, size_t offset) { return GatherEncoderMode(buf, offset, 3); }},
+              {"motion_joint_positions", 29, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 1, 1); }},
+              {"motion_joint_velocities", 29, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 1, 1); }},
+              {"motion_anchor_orientation", 6, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 1, 1); }},
+              {"motion_root_z_position", 1, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 1, 1); }},
+              {"motion_root_z_position_10frame_step5", 10, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 10, 5); }},
+              {"motion_root_z_position_10frame_step1", 10, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 10, 1); }},
+              {"motion_root_z_position_3frame_step1", 3, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 3, 1); }},
+              {"motion_anchor_orientation_10frame_step5", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 5); }},
+              {"motion_anchor_orientation_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1); }},
+              // Heading-only variants (mode=1): use robot yaw-only quaternion
+              // Matches Python heading setting: quat_mul(quat_inv(get_heading_q(robot_pelvis_quat)), ref_quat)
+              {"motion_anchor_orientation_heading", 6, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 1, 1, 1); }},
+              {"motion_anchor_orientation_heading_10frame_step5", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 5, 1); }},
+              {"motion_anchor_orientation_heading_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1, 1); }},
+              // Refheading variants (mode=2): use reference first-frame yaw-only quaternion (no robot state)
+              // Matches Python refheading setting: quat_mul(quat_inv(get_heading_q(ref_first_frame)), ref_quat)
+              {"motion_anchor_orientation_refheading", 6, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 1, 1, 2); }},
+              {"motion_anchor_orientation_refheading_10frame_step5", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 5, 2); }},
+              {"motion_anchor_orientation_refheading_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1, 2); }},
+              {"motion_joint_positions_10frame_step5", 290, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 10, 5); }},
+              {"motion_joint_velocities_10frame_step5", 290, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 10, 5); }},
+              {"motion_joint_positions_10frame_step1", 290, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 10, 1); }},
+              {"motion_joint_velocities_10frame_step1", 290, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 10, 1); }},
+              {"motion_joint_positions_3frame_step1", 87, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 3, 1); }},
+              {"motion_joint_velocities_3frame_step1", 87, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 3, 1); }},
+              {"motion_joint_positions_lowerbody_10frame_step5", 120, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 10, 5, lower_body_joint_mujoco_order_in_isaaclab_index); }},
+              {"motion_joint_velocities_lowerbody_10frame_step5", 120, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 10, 5, lower_body_joint_mujoco_order_in_isaaclab_index); }},
+              {"motion_joint_positions_lowerbody_10frame_step1", 120, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 10, 1, lower_body_joint_mujoco_order_in_isaaclab_index); }},
+              {"motion_joint_velocities_lowerbody_10frame_step1", 120, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 10, 1, lower_body_joint_mujoco_order_in_isaaclab_index); }},
+              {"motion_joint_positions_wrists_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 10, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},
+              {"motion_joint_positions_wrists_2frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 2, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},
+              {"motion_joint_velocities_wrists_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 10, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},
+              {"motion_joint_positions_5frame_step5", 145, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 5, 5); }},
+              {"motion_joint_velocities_5frame_step5", 145, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 5, 5); }},
+              // SMPL data gathering (dimensions assume 24 joints, 21 poses - adjust based on actual data)
+              {"smpl_joints", 72, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 1, 1); }},  // 24*3
+              {"smpl_joints_5frame_step5", 360, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 5, 5); }},  // 24*3*5
+              {"smpl_joints_10frame_step5", 720, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 10, 5); }},  // 24*3*10
+              {"smpl_joints_10frame_step1", 720, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 10, 1); }},  // 24*3*10
+              {"smpl_joints_lower_10frame_step1", 270, [this](std::vector<double>& buf, size_t offset) {return GatherMotionSmplJointsMultiFrame(buf, offset, 10, 1, {0,1,2,4,5,7,8,10,11}); }},  // 9*3*10 lower body joints
+              {"smpl_joints_2frame_step1", 144, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 2, 1); }},  // 24*3*10
+              {"smpl_pose", 63, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 1, 1); }},  // 21*3
+              {"smpl_pose_5frame_step5", 315, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 5, 5); }},  // 21*3*5
+              {"smpl_pose_10frame_step5", 630, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 10, 5); }},  // 21*3*10
+              {"smpl_pose_10frame_step1", 630, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 10, 1); }},  // 21*3*10
+              {"smpl_elbow_wrist_poses_10frame_step1", 120, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 10, 1, {17, 18, 19, 20}); }},  // 4*3*10
+              {"smpl_root_z_10frame_step1", 10, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 10, 1); }},
+              {"smpl_anchor_orientation_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1); }},
+              {"smpl_anchor_orientation_2frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 2, 1); }},
+              // SMPL heading-only variants (mode=1, matches Python smpl_root_ori_heading_multi_future)
+              {"smpl_anchor_orientation_heading_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1, 1); }},
+              {"smpl_anchor_orientation_heading_2frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 2, 1, 1); }},
+              // SMPL refheading variants (mode=2, matches Python smpl_root_ori_refheading_multi_future)
+              {"smpl_anchor_orientation_refheading_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1, 2); }},
+              {"smpl_anchor_orientation_refheading_2frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 2, 1, 2); }},
+              // Heading diff: yaw from robot to reference first frame (refheading decoder input)
+              {"heading_diff_robot_ref", 6, [this](std::vector<double>& buf, size_t offset) { return GatherHeadingDiffRobotRef(buf, offset); }},
+              // VR 3-point data gathering
+              {"vr_3point_local_target", 9, [this](std::vector<double>& buf, size_t offset) { return GatherVR3PointPosition(buf, offset); }},
+              // NOTE: In the TELEOP time, the vr_3point_local_target == vr_3point_local_target_compliant
+              {"vr_3point_local_target_compliant", 9, [this](std::vector<double>& buf, size_t offset) { return GatherVR3PointPosition(buf, offset); }},
+              {"vr_3point_local_orn_target", 12, [this](std::vector<double>& buf, size_t offset) { return GatherVR3PointOrientation(buf, offset); }},
+              {"vr_3point_compliance", 3, [this](std::vector<double>& buf, size_t offset) { return GatherVR3PointCompliance(buf, offset); }},
+              // VR 5-point data gathering
+              {"vr_5point_local_target", 15, [this](std::vector<double>& buf, size_t offset) { return GatherVR5PointPosition(buf, offset); }},
+              {"vr_5point_local_orn_target", 20, [this](std::vector<double>& buf, size_t offset) { return GatherVR5PointOrientation(buf, offset); }},
+              // History robot state gathering
+              {"base_angular_velocity", 3, [this](std::vector<double>& buf, size_t offset) { return GatherHisBaseAngularVelocity(buf, offset, 1, 1); }},
+              {"body_joint_positions", 29, [this](std::vector<double>& buf, size_t offset) { return GatherHisBodyJointPositions(buf, offset, 1, 1); }},
+              {"body_joint_velocities", 29, [this](std::vector<double>& buf, size_t offset) { return GatherHisBodyJointVelocities(buf, offset, 1, 1); }},
+              {"last_actions", 29, [this](std::vector<double>& buf, size_t offset) { return GatherHisLastActions(buf, offset, 1, 1); }},
+              {"gravity_dir", 3, [this](std::vector<double>& buf, size_t offset) { return GatherHisGravityDir(buf, offset, 1, 1); }},
+              {"his_body_joint_positions_4frame_step1", 116, [this](std::vector<double>& buf, size_t offset) { return GatherHisBodyJointPositions(buf, offset, 4, 1); }},
+              {"his_body_joint_velocities_4frame_step1", 116, [this](std::vector<double>& buf, size_t offset) { return GatherHisBodyJointVelocities(buf, offset, 4, 1); }},
+              {"his_last_actions_4frame_step1", 116, [this](std::vector<double>& buf, size_t offset) { return GatherHisLastActions(buf, offset, 4, 1); }},
+              {"his_base_angular_velocity_4frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherHisBaseAngularVelocity(buf, offset, 4, 1); }},
+              {"his_gravity_dir_4frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherHisGravityDir(buf, offset, 4, 1); }},
+              {"his_body_joint_positions_10frame_step1", 290, [this](std::vector<double>& buf, size_t offset) { return GatherHisBodyJointPositions(buf, offset, 10, 1); }},
+              {"his_body_joint_velocities_10frame_step1", 290, [this](std::vector<double>& buf, size_t offset) { return GatherHisBodyJointVelocities(buf, offset, 10, 1); }},
+              {"his_last_actions_10frame_step1", 290, [this](std::vector<double>& buf, size_t offset) { return GatherHisLastActions(buf, offset, 10, 1); }},
+              {"his_base_angular_velocity_10frame_step1", 30, [this](std::vector<double>& buf, size_t offset) { return GatherHisBaseAngularVelocity(buf, offset, 10, 1); }},
+              {"his_gravity_dir_10frame_step1", 30, [this](std::vector<double>& buf, size_t offset) { return GatherHisGravityDir(buf, offset, 10, 1); }}};
+    }
+    
+    // Initialize observation functions
+    void InitializeObservationFunctions() {
+      // Get all available observations from registry (single source of truth!)
+      auto registry = GetObservationRegistry();
+      
+      // =========================================================================
+      // Initialize policy observations
+      // =========================================================================
+      active_obs_functions_.clear();
+      size_t current_offset = 0;
+      
+      for (const auto& config : obs_config_) {
+        if (!config.enabled) continue;
+        
+        // Find observation in registry
+        auto registry_it = std::find_if(registry.begin(), registry.end(),
+          [&config](const ObservationRegistry& obs) {
+            return obs.name == config.name;
+          });
+        
+        if (registry_it == registry.end()) {
+          std::cerr << "✗ Error: Unknown observation function '" << config.name << "' in configuration!" << std::endl;
+          throw std::runtime_error("Invalid observation configuration: unknown function '" + config.name + "'");
+        }
+        
+        // Get dimension directly from registry entry
+        size_t dimension = registry_it->dimension;
+        if (dimension == 0) {
+          std::cerr << "✗ Error: Observation function '" << config.name << "' has invalid dimension!" << std::endl;
+          throw std::runtime_error("Invalid observation configuration: zero dimension for '" + config.name + "'");
+        }
+        
+        // Add to active functions (get function directly from registry)
+        active_obs_functions_.emplace_back(config.name, registry_it->function, current_offset, dimension);
+        current_offset += dimension;
+      }
+      
+      // Validate total dimension matches model input
+      size_t model_input_dim = policy_engine_->GetInputDimension();
+      if (current_offset != model_input_dim) {
+        std::cerr << "✗ Error: Total observation dimension (" << current_offset 
+                  << ") doesn't match model input dimension (" << model_input_dim << ")!" << std::endl;
+        throw std::runtime_error("Observation dimension mismatch");
+      }
+      
+      // =========================================================================
+      // Initialize encoder observations (only if encoder is actually loaded)
+      // =========================================================================
+      active_encoder_obs_functions_.clear();
+      if (encoder_engine_ && encoder_engine_->IsInitialized() && encoder_config_.dimension > 0 && !encoder_config_.encoder_observations.empty()) {
+        std::cout << "Initializing encoder observations..." << std::endl;
+        size_t encoder_offset = 0;
+        size_t encoder_input_size = encoder_engine_->GetInputDimension();
+        
+        for (const auto& config : encoder_config_.encoder_observations) {
+          if (!config.enabled) continue;
+          
+          // Find observation in registry
+          auto registry_it = std::find_if(registry.begin(), registry.end(),
+            [&config](const ObservationRegistry& obs) {
+              return obs.name == config.name;
+            });
+          
+          if (registry_it == registry.end()) {
+            std::cerr << "✗ Error: Unknown encoder observation function '" << config.name << "'!" << std::endl;
+            throw std::runtime_error("Invalid encoder observation: unknown function '" + config.name + "'");
+          }
+          
+          size_t dimension = registry_it->dimension;
+          if (dimension == 0) {
+            std::cerr << "✗ Error: Encoder observation '" << config.name << "' has invalid dimension!" << std::endl;
+            throw std::runtime_error("Invalid encoder observation: zero dimension for '" + config.name + "'");
+          }
+          
+          // Add to active encoder functions
+          active_encoder_obs_functions_.emplace_back(config.name, registry_it->function, encoder_offset, dimension);
+          encoder_offset += dimension;
+        }
+        
+        // Validate encoder input dimension matches expected
+        if (encoder_offset != encoder_input_size) {
+          std::ostringstream oss;
+          oss << "Encoder observation dimension mismatch: got " << encoder_offset
+              << ", expected " << encoder_input_size;
+          throw std::runtime_error(oss.str());
+        }
+        
+        std::cout << "✓ Initialized " << active_encoder_obs_functions_.size() 
+                  << " encoder observations (total dim: " << encoder_offset << ")" << std::endl;
+      }
+      
+      // =========================================================================
+      // Check if vr_3point_compliance observation is enabled (in main or encoder obs)
+      // This affects whether keyboard compliance controls (g/h/b/v) have any effect
+      // =========================================================================
+      has_vr_3point_compliance_obs_ = false;
+      
+      // Check main observations
+      for (const auto& obs : active_obs_functions_) {
+        if (obs.name == "vr_3point_compliance") {
+          has_vr_3point_compliance_obs_ = true;
+          break;
+        }
+      }
+      
+      // Check encoder observations if not found in main
+      if (!has_vr_3point_compliance_obs_) {
+        for (const auto& obs : active_encoder_obs_functions_) {
+          if (obs.name == "vr_3point_compliance") {
+            has_vr_3point_compliance_obs_ = true;
+            break;
+          }
+        }
+      }
+    }
+    
+    // Log observation configuration
+    void LogObservationConfiguration() {
+      std::cout << "\n=== Observation Configuration ===" << std::endl;
+      std::cout << "Active policy observations (runtime order):" << std::endl;
+      
+      size_t total_enabled_dim = 0;
+      
+      // Show only active observations (clean and focused)
+      for (size_t i = 0; i < active_obs_functions_.size(); i++) {
+        const auto& active_obs = active_obs_functions_[i];
+        
+        std::cout << "  " << (i + 1) << ". " 
+                  << active_obs.name << " (" << active_obs.dimension << "D)"
+                  << " [offset: " << active_obs.offset << "]" << std::endl;
+        
+        total_enabled_dim += active_obs.dimension;
+      }
+      
+      std::cout << "\nPolicy Summary:" << std::endl;
+      std::cout << "  Total dimension: " << total_enabled_dim << std::endl;
+      size_t model_input_dim = policy_engine_->GetInputDimension();
+      std::cout << "  Model dimension: " << model_input_dim << std::endl;
+      
+      if (total_enabled_dim == model_input_dim) {
+        std::cout << "  ✓ Dimension match: Configuration is valid!" << std::endl;
+      } else {
+        std::ostringstream oss;
+        oss << "Policy observation dimension mismatch: total_enabled_dim=" << total_enabled_dim
+            << ", model_input_dim=" << model_input_dim
+            << ", difference=" << (int64_t)model_input_dim - (int64_t)total_enabled_dim;
+        throw std::runtime_error(oss.str());
+      }
+      
+      // Show encoder observations if enabled
+      if (!active_encoder_obs_functions_.empty()) {
+        std::cout << "\n--- Encoder Observations ---" << std::endl;
+        size_t total_encoder_dim = 0;
+        
+        for (size_t i = 0; i < active_encoder_obs_functions_.size(); i++) {
+          const auto& active_obs = active_encoder_obs_functions_[i];
+          
+          std::cout << "  " << (i + 1) << ". " 
+                    << active_obs.name << " (" << active_obs.dimension << "D)"
+                    << " [offset: " << active_obs.offset << "]" << std::endl;
+          
+          total_encoder_dim += active_obs.dimension;
+        }
+        
+        std::cout << "\nEncoder Summary:" << std::endl;
+        std::cout << "  Total dimension: " << total_encoder_dim << std::endl;
+        if (encoder_engine_ && encoder_engine_->IsInitialized()) {
+          size_t encoder_input_size = encoder_engine_->GetInputDimension();
+          std::cout << "  Model dimension: " << encoder_input_size << std::endl;
+          
+          if (total_encoder_dim == encoder_input_size) {
+            std::cout << "  ✓ Dimension match: Encoder configuration is valid!" << std::endl;
+          } else {
+            std::ostringstream oss;
+            oss << "Encoder configuration dimension mismatch: total_encoder_dim=" << total_encoder_dim
+                << ", encoder_model_input_dim=" << encoder_input_size;
+            throw std::runtime_error(oss.str());
+          }
+        }
+      }
+      
+      std::cout << "================================\n" << std::endl;
+    }
+    
+    // Gather observations (simplified - functions read from internal state)
+    bool GatherObservations() {
+      // Clear observation buffer
+      std::fill(obs_buffer_.begin(), obs_buffer_.end(), 0.0);
+      
+      // Process observations using pre-built active functions (no map lookup needed!)
+      for (const auto& active_obs : active_obs_functions_) {
+        bool success = active_obs.function(obs_buffer_, active_obs.offset);
+        
+        if (!success) {
+          std::cout << "Error: Failed to gather observation: " << active_obs.name << std::endl;
+          return false;
+        }
+      }
+      
+      return true;
+    }
+
+    // Gather encoder observations (populate encoder input buffer)
+    // Observation functions read from internal state (state_logger_, current_motion_, etc.)
+    // Mode-specific optimization: Only compute observations required for current encoder mode
+    bool GatherEncoderObservations() {
+      if (!is_using_encoder_ || active_encoder_obs_functions_.empty()) {
+        return true;  // Nothing to do
+      }
+
+      // Get reference to encoder's internal input buffer
+      auto& encoder_input_buffer = encoder_engine_->GetInputBuffer();
+      
+      // Clear encoder observation buffer (safe default for unused observations)
+      std::fill(encoder_obs_buffer_.begin(), encoder_obs_buffer_.end(), 0.0);
+      
+      // Store the intended encoder mode for warning purposes
+      int intended_encoder_mode = current_motion_->GetEncodeMode();
+      
+      // Build list of modes to try (start with current mode, then all others as fallback)
+      std::vector<int> modes_to_try;
+      
+      if (!encoder_config_.encoder_modes.empty()) {
+        // Start with intended mode if valid
+        if (current_motion_->GetEncodeMode() >= 0) {
+          modes_to_try.push_back(current_motion_->GetEncodeMode());
+        }
+        
+        // Add all other modes as fallbacks
+        for (const auto& mode_config : encoder_config_.encoder_modes) {
+          if (mode_config.mode_id != current_motion_->GetEncodeMode()) {
+            modes_to_try.push_back(mode_config.mode_id);
+          }
+        }
+      }
+      
+      // If no modes configured, try without mode filter
+      if (modes_to_try.empty()) {
+        modes_to_try.push_back(-1);  // -1 means no mode filter (all observations required)
+      }
+      
+      // Try each mode until one succeeds
+      for (size_t attempt = 0; attempt < modes_to_try.size(); ++attempt) {
+        int mode_to_try = modes_to_try[attempt];
+        current_motion_->SetEncodeMode(mode_to_try);
+        
+        // Determine which observations to gather based on encoder mode
+        std::vector<std::string> required_observations;
+        bool use_mode_filter = false;
+        std::string mode_name;
+        
+        // Check if mode-specific filtering is configured
+        if (!encoder_config_.encoder_modes.empty() && current_motion_->GetEncodeMode() >= 0) {
+          // Find the current mode configuration
+          for (const auto& mode_config : encoder_config_.encoder_modes) {
+            if (mode_config.mode_id == current_motion_->GetEncodeMode()) {
+              required_observations = mode_config.required_observations;
+              use_mode_filter = true;
+              mode_name = mode_config.name;
+              
+              // Only log when mode changes to avoid spam
+              if (current_motion_->GetEncodeMode() != last_logged_encoder_mode_) {
+                std::cout << "[Mode Filter] Switched to mode '" << mode_config.name << "' (ID=" << current_motion_->GetEncodeMode() 
+                          << ") with " << required_observations.size() << " required observations" << std::endl;
+                last_logged_encoder_mode_ = current_motion_->GetEncodeMode();
+              }
+              break;
+            }
+          }
+        }
+        
+        // Process encoder observations using pre-built active functions
+        bool all_success = true;
+        for (const auto& active_obs : active_encoder_obs_functions_) {
+          // Check if this observation is required for current mode
+          bool is_required = !use_mode_filter;  // If no mode filter, all are required
+          
+          if (use_mode_filter) {
+            // Check if observation is in required list
+            is_required = std::find(required_observations.begin(), required_observations.end(), 
+                                    active_obs.name) != required_observations.end();
+          }
+          
+          if (is_required) {
+            // Compute the observation
+            bool success = active_obs.function(encoder_obs_buffer_, active_obs.offset);
+            
+            if (!success) {
+              std::cerr << "✗ Error: Failed to gather encoder observation: " << active_obs.name 
+                        << " for mode " << current_motion_->GetEncodeMode() 
+                        << (!mode_name.empty() ? " ('" + mode_name + "')" : "") << std::endl;
+              all_success = false;
+              break;
+            }
+          }
+          // else: Not required for this mode - leave as zero (already initialized)
+          //       This saves computation time for expensive observations
+        }
+        
+        // Check if this mode succeeded
+        if (all_success) {
+          // Success! Copy encoder observations to encoder input buffer (double -> float)
+          for (size_t i = 0; i < encoder_input_buffer.size() && i < encoder_obs_buffer_.size(); ++i) {
+            encoder_input_buffer[i] = static_cast<float>(encoder_obs_buffer_[i]);
+          }
+          
+          // Warn if we had to switch from intended mode
+          if (current_motion_->GetEncodeMode() != intended_encoder_mode && attempt > 0) {
+            std::cerr << "⚠ Warning: Intended encoder mode " << intended_encoder_mode 
+                      << " failed, successfully switched to fallback mode " << current_motion_->GetEncodeMode() 
+                      << (!mode_name.empty() ? " ('" + mode_name + "')" : "") << std::endl;
+          }
+          
+          return true;
+        } else {
+          // This mode failed - warn if it was the intended mode
+          if (current_motion_->GetEncodeMode() == intended_encoder_mode && attempt == 0) {
+            std::cerr << "⚠ Warning: Intended encoder mode " << intended_encoder_mode 
+                      << (!mode_name.empty() ? " ('" + mode_name + "')" : "")
+                      << " failed, trying fallback modes..." << std::endl;
+          }
+          
+          // Clear buffer and try next mode
+          std::fill(encoder_obs_buffer_.begin(), encoder_obs_buffer_.end(), 0.0);
+        }
+      }
+      
+      // All modes failed
+      std::cerr << "✗ Error: All available encoder modes failed to gather observations" << std::endl;
+      return false;
+    }
+
+
+
+  public:
+    OperatorState operator_state;
+
+    G1Deploy(
+      std::string networkInterface,
+      std::string model_file_path,
+      std::string motion_data_path,
+      bool disable_crc_check = false,
+      std::string obs_config_path = "",
+      std::string encoder_file_path = "",
+      std::string planner_file_path = "",
+      std::string target_motion_file_path = "",
+      std::string planner_motion_file_path = "",
+      std::string policy_input_file_path = "",
+      std::string input_type = "keyboard",
+      std::string output_type = "zmq",
+      std::string record_input_file_path = "",
+      std::string playback_input_file_path = "",
+      bool planner_fp16 = false,
+      bool policy_fp16 = false,
+      std::string logs_dir = "",
+      bool enable_csv_logs = false,
+      std::string zmq_host = "localhost",
+      int zmq_port = 5556,
+      std::string zmq_topic = "pose",
+      bool zmq_conflate = false,
+      bool zmq_verbose = false,
+      int zmq_out_port = 5557,
+      std::string zmq_out_topic = "g1_debug",
+      bool enable_motion_recording = false,
+      std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
+      double initial_max_close_ratio = 1.0,
+      std::string zmq_robot_ip = "",
+      int zmq_robot_state_port = 5560,
+      int zmq_robot_cmd_port = 5561,
+      int zmq_robot_lowcmd_udp_port = 0,
+      std::string hand_type = "dex3",
+      double brainco_close_threshold = 0.3,
+      int brainco_clamp_ms = 300,
+      int brainco_feedback_grace_ms = 2000,
+      bool direct_upper_body_control = false,
+      bool direct_upper_body_arm_only = false,
+      bool direct_upper_body_skip_wrist = false,
+      double direct_upper_body_kp_scale = 1.0,
+      double direct_upper_body_kd_scale = 1.0,
+      std::array<bool, 3> waist_lock_axes = {false, false, false},
+      double waist_lock_kp = 250.0,
+      double waist_lock_kd = 5.0,
+      double left_shoulder_back_offset_deg = 0.0,
+      double joint_measured_speed_limit_rad_s =
+          joint_velocity_safety::kDefaultMeasuredSpeedLimitRadS,
+      bool lower_body_energy_governor_enabled = false,
+      double lower_body_energy_governor_scale = 1.0,
+      bool lower_body_energy_governor_tremor_gated = false,
+      double lower_body_tremor_trigger_threshold_rad_s =
+          lower_body_energy_governor::kDefaultTremorTriggerThresholdRadS,
+      double lower_body_tremor_peak_to_peak_threshold_rad_s =
+          lower_body_energy_governor::kDefaultTremorPeakToPeakThresholdRadS,
+      double lower_body_tremor_recovery_damping_nm_per_rad_s = 0.0,
+      std::size_t lower_body_tremor_hold_ticks =
+          lower_body_energy_governor::kDefaultTremorHoldTicks,
+      bool lower_body_braking_priority_slew_enabled = false,
+      double lower_body_braking_priority_slew_max_step_rad =
+          lower_body_braking_priority_slew::
+              kDefaultMaxPositivePowerTargetStepRad,
+      std::size_t lower_body_braking_priority_slew_hold_ticks =
+          lower_body_braking_priority_slew::kDefaultHoldTicks,
+      bool lower_body_observation_guard_enabled = false,
+      std::size_t lower_body_observation_guard_hold_ticks =
+          lower_body_observation_guard::kDefaultRepairHoldTicks,
+      double lower_body_observation_guard_alpha =
+          lower_body_observation_guard::kDefaultRepairLowPassAlpha,
+      double lower_body_observation_guard_max_policy_dq_step_rad_s =
+          lower_body_observation_guard::kDefaultRepairMaxPolicyDqStepRadS,
+      double lower_body_observation_guard_max_position_dq_residual_rad_s =
+          lower_body_observation_guard::
+              kDefaultRepairMaxPositionDqResidualRadS,
+      bool lower_body_observation_guard_continuous_innovation_clip = false,
+      bool lower_body_observation_guard_repair_until_caught_up = false,
+      bool lower_body_observation_guard_all_monitored = false,
+      bool lower_body_observation_guard_both_ankle_rolls = false,
+      bool lower_body_observation_guard_ankle_roll_trigger_only = false,
+      bool lower_body_observation_guard_fixed_window = false,
+      bool lower_body_impact_damper_enabled = false,
+      double lower_body_impact_damper_extra_kd_nm_per_rad_s =
+          lower_body_impact_damper::kDefaultExtraKdNmPerRadS,
+      std::size_t lower_body_impact_damper_hold_ticks =
+          lower_body_impact_damper::kDefaultHoldTicks,
+      bool lower_body_impact_damper_all_monitored = false)
+      : time_(0.0),
+        publish_dt_(0.002),
+        control_dt_(0.02),
+        planner_dt_(0.1),
+        input_dt_(0.01),
+        duration_(3.0),
+        counter_(0),
+        mode_pr_(Mode::PR),
+        mode_machine_(0),
+        disable_crc_check_(disable_crc_check),
+        joint_measured_speed_limit_rad_s_(
+            joint_measured_speed_limit_rad_s),
+        lower_body_energy_governor_enabled_(
+            lower_body_energy_governor_enabled),
+        lower_body_energy_governor_scale_(
+            lower_body_energy_governor_scale),
+        lower_body_energy_governor_tremor_gated_(
+            lower_body_energy_governor_tremor_gated),
+        lower_body_tremor_trigger_threshold_rad_s_(
+            lower_body_tremor_trigger_threshold_rad_s),
+        lower_body_tremor_peak_to_peak_threshold_rad_s_(
+            lower_body_tremor_peak_to_peak_threshold_rad_s),
+        lower_body_tremor_recovery_damping_nm_per_rad_s_(
+            lower_body_tremor_recovery_damping_nm_per_rad_s),
+        lower_body_tremor_hold_ticks_(lower_body_tremor_hold_ticks),
+        lower_body_braking_priority_slew_enabled_(
+            lower_body_braking_priority_slew_enabled),
+        lower_body_braking_priority_slew_max_step_rad_(
+            lower_body_braking_priority_slew_max_step_rad),
+        lower_body_braking_priority_slew_hold_ticks_(
+            lower_body_braking_priority_slew_hold_ticks),
+        lower_body_observation_guard_enabled_(
+            lower_body_observation_guard_enabled),
+        lower_body_observation_guard_hold_ticks_(
+            lower_body_observation_guard_hold_ticks),
+        lower_body_observation_guard_alpha_(
+            lower_body_observation_guard_alpha),
+        lower_body_observation_guard_max_policy_dq_step_rad_s_(
+            lower_body_observation_guard_max_policy_dq_step_rad_s),
+        lower_body_observation_guard_max_position_dq_residual_rad_s_(
+            lower_body_observation_guard_max_position_dq_residual_rad_s),
+        lower_body_observation_guard_continuous_innovation_clip_(
+            lower_body_observation_guard_continuous_innovation_clip),
+        lower_body_observation_guard_repair_until_caught_up_(
+            lower_body_observation_guard_repair_until_caught_up),
+        lower_body_observation_guard_all_monitored_(
+            lower_body_observation_guard_all_monitored),
+        lower_body_observation_guard_both_ankle_rolls_(
+            lower_body_observation_guard_both_ankle_rolls),
+        lower_body_observation_guard_ankle_roll_trigger_only_(
+            lower_body_observation_guard_ankle_roll_trigger_only),
+        lower_body_observation_guard_fixed_window_(
+            lower_body_observation_guard_fixed_window),
+        lower_body_impact_damper_enabled_(
+            lower_body_impact_damper_enabled),
+        lower_body_impact_damper_extra_kd_nm_per_rad_s_(
+            lower_body_impact_damper_extra_kd_nm_per_rad_s),
+        lower_body_impact_damper_hold_ticks_(
+            lower_body_impact_damper_hold_ticks),
+        lower_body_impact_damper_all_monitored_(
+            lower_body_impact_damper_all_monitored),
+        program_state_(ProgramState::INIT),
+        last_action {0.0},
+        last_left_hand_action {0.0},
+        last_right_hand_action {0.0},
+        enable_motion_recording_(enable_motion_recording),
+        initial_vr_3point_compliance_(initial_compliance),
+        initial_max_close_ratio_(initial_max_close_ratio),
+        zmq_robot_ip_(zmq_robot_ip),
+        zmq_robot_state_port_(zmq_robot_state_port),
+        zmq_robot_cmd_port_(zmq_robot_cmd_port),
+        zmq_robot_lowcmd_udp_port_(zmq_robot_lowcmd_udp_port),
+        hand_type_(hand_type),
+        brainco_close_threshold_(brainco_close_threshold),
+        brainco_clamp_duration_(brainco_clamp_ms),
+        brainco_feedback_grace_(brainco_feedback_grace_ms),
+        direct_upper_body_control_(direct_upper_body_control),
+        direct_upper_body_arm_only_(direct_upper_body_arm_only),
+        direct_upper_body_skip_wrist_(direct_upper_body_skip_wrist),
+        direct_upper_body_kp_scale_(direct_upper_body_kp_scale),
+        direct_upper_body_kd_scale_(direct_upper_body_kd_scale),
+        waist_lock_axes_(waist_lock_axes),
+        waist_lock_kp_(waist_lock_kp),
+        waist_lock_kd_(waist_lock_kd),
+        left_shoulder_back_offset_deg_(left_shoulder_back_offset_deg),
+        //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
+        model_path(model_file_path),
+        planner_path(planner_file_path) {
+
+      if (!brainco_hand_safety::IsThresholdValid(brainco_close_threshold_)) {
+        throw std::invalid_argument(
+          "BrainCo close threshold must be finite and within [0, 1]");
+      }
+      if (brainco_clamp_ms < 0 || brainco_clamp_ms > 60000) {
+        throw std::invalid_argument(
+          "BrainCo clamp duration must be an integer within [0, 60000] ms");
+      }
+      if (brainco_feedback_grace_ms < 0 || brainco_feedback_grace_ms > 60000) {
+        throw std::invalid_argument(
+          "BrainCo feedback grace must be an integer within [0, 60000] ms");
+      }
+      if (!std::isfinite(waist_lock_kp_) || waist_lock_kp_ <= 0.0 ||
+          !std::isfinite(waist_lock_kd_) || waist_lock_kd_ <= 0.0) {
+        throw std::invalid_argument("Waist lock Kp/Kd must be positive finite values");
+      }
+      if (!left_shoulder_back_offset::IsValidOffsetDeg(
+              left_shoulder_back_offset_deg_)) {
+        throw std::invalid_argument(
+            "Left shoulder back offset must be finite and within [0, 90] degrees");
+      }
+      if (!joint_velocity_safety::IsPositiveFinite(
+              joint_measured_speed_limit_rad_s_)) {
+        throw std::invalid_argument(
+            "Joint measured speed limit must be a positive finite value");
+      }
+      lower_body_energy_governor::Config governor_config;
+      governor_config.enabled = lower_body_energy_governor_enabled_;
+      governor_config.dt = control_dt_;
+      governor_config.envelope_scale = lower_body_energy_governor_scale_;
+      governor_config.tremor_gate_enabled =
+          lower_body_energy_governor_tremor_gated_;
+      governor_config.tremor_trigger_threshold_rad_s =
+          lower_body_tremor_trigger_threshold_rad_s_;
+      governor_config.tremor_peak_to_peak_threshold_rad_s =
+          lower_body_tremor_peak_to_peak_threshold_rad_s_;
+      governor_config.tremor_recovery_damping_nm_per_rad_s =
+          lower_body_tremor_recovery_damping_nm_per_rad_s_;
+      governor_config.tremor_hold_ticks = lower_body_tremor_hold_ticks_;
+      if (!lower_body_energy_governor_.SetConfig(governor_config)) {
+        throw std::invalid_argument(
+            "Lower-body energy governor scale and limits must be positive "
+            "finite values");
+      }
+      lower_body_braking_priority_slew::Config braking_slew_config;
+      braking_slew_config.enabled =
+          lower_body_braking_priority_slew_enabled_;
+      braking_slew_config.max_positive_power_target_step_rad =
+          lower_body_braking_priority_slew_max_step_rad_;
+      braking_slew_config.hold_ticks =
+          lower_body_braking_priority_slew_hold_ticks_;
+      if (!lower_body_braking_priority_slew_.SetConfig(
+              braking_slew_config)) {
+        throw std::invalid_argument(
+            "Lower-body braking-priority slew max step must be positive and "
+            "finite, and its hold duration must be nonzero");
+      }
+      lower_body_observation_guard::Config observation_guard_config;
+      observation_guard_config.enabled =
+          lower_body_observation_guard_enabled_ ||
+          lower_body_impact_damper_enabled_ ||
+          lower_body_braking_priority_slew_enabled_ ||
+          (lower_body_energy_governor_enabled_ &&
+           lower_body_energy_governor_tremor_gated_);
+      observation_guard_config.repair_observation =
+          lower_body_observation_guard_enabled_;
+      observation_guard_config.repair_hold_ticks =
+          lower_body_observation_guard_hold_ticks_;
+      observation_guard_config.repair_low_pass_alpha =
+          lower_body_observation_guard_alpha_;
+      observation_guard_config.repair_max_policy_dq_step_rad_s =
+          lower_body_observation_guard_max_policy_dq_step_rad_s_;
+      observation_guard_config.repair_max_position_dq_residual_rad_s =
+          lower_body_observation_guard_max_position_dq_residual_rad_s_;
+      observation_guard_config.control_dt_s = control_dt_;
+      observation_guard_config.continuous_innovation_clip =
+          lower_body_observation_guard_continuous_innovation_clip_;
+      observation_guard_config.repair_until_caught_up =
+          lower_body_observation_guard_repair_until_caught_up_;
+      observation_guard_config.repair_all_monitored_joints =
+          lower_body_observation_guard_all_monitored_;
+      observation_guard_config.repair_both_ankle_roll_joints =
+          lower_body_observation_guard_both_ankle_rolls_;
+      observation_guard_config.trigger_ankle_roll_only =
+          lower_body_observation_guard_ankle_roll_trigger_only_;
+      observation_guard_config.extend_repair_window_on_retrigger =
+          !lower_body_observation_guard_fixed_window_;
+      if (!lower_body_observation_guard_.SetConfig(observation_guard_config)) {
+        throw std::invalid_argument(
+            "Lower-body observation guard thresholds/repair limits must be "
+            "finite and nonnegative, alpha must be within [0,1], hold/control "
+            "periods must be positive, and repair modes must not conflict");
+      }
+      lower_body_impact_damper::Config impact_damper_config;
+      impact_damper_config.enabled = lower_body_impact_damper_enabled_;
+      impact_damper_config.extra_kd_nm_per_rad_s =
+          lower_body_impact_damper_extra_kd_nm_per_rad_s_;
+      impact_damper_config.hold_ticks =
+          lower_body_impact_damper_hold_ticks_;
+      impact_damper_config.damp_all_monitored_joints =
+          lower_body_impact_damper_all_monitored_;
+      if (!lower_body_impact_damper_.SetConfig(impact_damper_config)) {
+        throw std::invalid_argument(
+            "Lower-body impact damper Kd and hold duration must be positive");
+      }
+      if (zmq_robot_state_port_ <= 0 || zmq_robot_state_port_ > 65535 ||
+          zmq_robot_cmd_port_ <= 0 || zmq_robot_cmd_port_ > 65535 ||
+          zmq_robot_lowcmd_udp_port_ < 0 ||
+          zmq_robot_lowcmd_udp_port_ > 65535) {
+        throw std::invalid_argument(
+          "ZMQ robot state/cmd ports must be within [1, 65535] and "
+          "LowCmd UDP must be 0 or within [1, 65535]");
+      }
+
+      if (zmq_robot_ip_.empty()) {
+        const char* configured_ip = std::getenv("G1_WBC_DEFAULT_WIRELESS_ROBOT_IP");
+        if (configured_ip != nullptr) {
+          zmq_robot_ip_ = configured_ip;
+        }
+      }
+      simulation_mode_ = false; // ONBOARD_ALWAYS_REAL_SAFETY
+      // All robot communication goes through the ZMQ bridge.
+      std::cout << "[ZMQ Bridge] Robot endpoint: " << zmq_robot_ip_
+                << " state=" << zmq_robot_state_port_
+                << " cmd=" << zmq_robot_cmd_port_
+                << " lowcmd_udp=" << zmq_robot_lowcmd_udp_port_
+                << std::endl;
+      // msgpack serialization doesn't preserve CRC; the bridge recomputes it before publishing.
+      disable_crc_check_ = true;
+      std::cout << "[ZMQ Bridge] CRC checking disabled (msgpack mode)" << std::endl;
+      if (simulation_mode_) {
+        std::cout
+            << "[JointSpeedGate] disabled for MuJoCo simulation"
+            << std::endl;
+      } else {
+        std::cout
+            << "[JointSpeedGate] real-robot measured-velocity gate enabled: "
+            << "hard_limit="
+            << joint_measured_speed_limit_rad_s_
+            << " rad/s" << std::endl;
+      }
+      if (direct_upper_body_control_) {
+        std::cout << "[UpperBody] Direct motor target override enabled for "
+                  << (direct_upper_body_arm_only_ ? "arms only; waist follows SONIC baseline" : "waist+arms")
+                  << (direct_upper_body_skip_wrist_ ? "; wrist follows SONIC baseline" : "")
+                  << " (kp_scale=" << direct_upper_body_kp_scale_
+                  << ", kd_scale=" << direct_upper_body_kd_scale_ << ")" << std::endl;
+      }
+      if (HasWaistAxisLock()) {
+        std::cout << "[WaistLock] Requested axes: "
+                  << waist_lock::Describe(waist_lock_axes_)
+                  << " (will hold nominal standing angles after Init Done, Kp="
+                  << waist_lock_kp_ << ", Kd=" << waist_lock_kd_ << ")" << std::endl;
+      }
+      if (left_shoulder_back_offset_deg_ > 0.0) {
+        std::cout
+            << "[LeftShoulderOffset] ENABLED: additive rearward pitch="
+            << left_shoulder_back_offset_deg_
+            << " deg (motor 15, joint-limited, startup-blended)"
+            << std::endl;
+      }
+      std::cout
+          << "[LowerBodyEnergyGovernor] "
+          << (lower_body_energy_governor_enabled_ ? "ENABLED" : "disabled")
+          << " (braking priority, 100 ms positive-work envelope, scale="
+          << lower_body_energy_governor_scale_;
+      if (lower_body_energy_governor_tremor_gated_) {
+        std::cout << ", tremor-gated threshold="
+                  << lower_body_tremor_trigger_threshold_rad_s_
+                  << " rad/s-per-tick per-side, reversal="
+                  << lower_body_tremor_peak_to_peak_threshold_rad_s_
+                  << " rad/s, recovery_damping="
+                  << lower_body_tremor_recovery_damping_nm_per_rad_s_
+                  << " Nm/(rad/s), hold="
+                  << lower_body_tremor_hold_ticks_ * control_dt_
+                  << " s";
+      }
+      std::cout << ")" << std::endl;
+      std::cout
+          << "[LowerBodyObservationGuard] "
+          << (lower_body_observation_guard_enabled_ ? "ENABLED" : "disabled")
+          << " (policy observation only; innovation>="
+          << lower_body_observation_guard::kDefaultInnovationThresholdRadS
+          << " rad/s, target_delta<="
+          << lower_body_observation_guard::kDefaultMaxTargetDeltaRad
+          << " rad, prior_torque<="
+          << lower_body_observation_guard::kDefaultMaxPriorVirtualTorqueNm
+          << " Nm, hold="
+          << lower_body_observation_guard_hold_ticks_ * control_dt_
+          << " s, alpha=" << lower_body_observation_guard_alpha_
+          << ", max_policy_dq_step="
+          << lower_body_observation_guard_max_policy_dq_step_rad_s_
+          << " rad/s"
+          << ", max_position_dq_residual="
+          << lower_body_observation_guard_max_position_dq_residual_rad_s_
+          << " rad/s"
+          << ", continuous_innovation_clip="
+          << (lower_body_observation_guard_continuous_innovation_clip_
+                  ? "yes" : "no")
+          << ", repair_until_caught_up="
+          << (lower_body_observation_guard_repair_until_caught_up_
+                  ? "yes" : "no")
+          << ", all_monitored="
+          << (lower_body_observation_guard_all_monitored_ ? "yes" : "no")
+          << ", both_ankle_rolls="
+          << (lower_body_observation_guard_both_ankle_rolls_ ? "yes" : "no")
+          << ", trigger_joints="
+          << (lower_body_observation_guard_ankle_roll_trigger_only_
+                  ? "ankle-roll-only" : "knees-and-ankles")
+          << ", window="
+          << (lower_body_observation_guard_fixed_window_
+                  ? "fixed" : "refresh-on-retrigger")
+          << ")" << std::endl;
+      std::cout
+          << "[LowerBodyImpactDamper] "
+          << (lower_body_impact_damper_enabled_ ? "ENABLED" : "disabled")
+          << " ("
+          << (lower_body_impact_damper_all_monitored_ ? "all-six" : "localized")
+          << ", extra_kd="
+          << lower_body_impact_damper_extra_kd_nm_per_rad_s_
+          << " Nm/(rad/s), hold="
+          << lower_body_impact_damper_hold_ticks_ * control_dt_
+          << " s, linear decay)" << std::endl;
+
+      zmq_robot_channel_ = std::make_unique<ZmqRobotChannel>();
+      if (!zmq_robot_channel_->Init(
+            zmq_robot_ip_,
+            zmq_robot_state_port_,
+            zmq_robot_cmd_port_,
+            false,
+            UDP_STATE_PORT,
+            zmq_robot_lowcmd_udp_port_)) {
+        throw std::runtime_error("Failed to initialize ZMQ robot channel");
+      }
+      zmq_robot_channel_->SetLowStateCallback(
+        std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1));
+      zmq_robot_channel_->SetImuCallback(
+        std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1));
+
+      // ChannelFactory still required by Dex3Hands.initialize() (legacy DDS pub/sub
+      // are constructed but never used; cmds are routed through ZMQ via setZmqChannel).
+      ChannelFactory::Instance()->Init(0, networkInterface);
+
+      // Instantiate hand driver based on --hand-type.
+      if (hand_type_ == "none") {
+        hands_ = std::make_unique<DummyHands>();
+        std::cout << "[Hands] DummyHands (no hardware)" << std::endl;
+      } else if (hand_type_ == "brainco") {
+        hands_ = std::make_unique<BraincoHands>();
+        std::cout << "[Hands] BraincoHands (BrainCo Revo2 staged grasp; normalized mean score > "
+                  << brainco_close_threshold_ << " requests closure)" << std::endl;
+        std::cout << "[Hands] BrainCo grasp sequence: OPEN -> CLAMP "
+                  << brainco_clamp_duration_.count()
+                  << " ms -> CURL; CLAMP=[0.5,0.25,0.5,0.5,0.5,0.5]"
+                  << std::endl;
+        std::cout << "[Hands] BrainCo feedback loss policy: command hand OPEN, "
+                  << "block VLA immediately, keep SONIC/WBC running"
+                  << std::endl;
+      } else {
+        // default dex3
+        hands_ = std::make_unique<Dex3Hands>();
+        std::cout << "[Hands] Dex3Hands (Unitree Dex3-1 7-DOF)" << std::endl;
+      }
+      hands_->initialize("");
+      hands_->setZmqChannel(zmq_robot_channel_.get());
+
+      const bool local_sim =
+          zmq_robot_ip_ == "localhost" || zmq_robot_ip_ == "127.0.0.1" ||
+          zmq_robot_ip_ == "::1";
+      if (hand_type_ == "brainco" && !local_sim) {
+        std::array<double, 7> left_q{};
+        std::array<double, 7> left_dq{};
+        std::array<double, 7> right_q{};
+        std::array<double, 7> right_dq{};
+        bool left_ready = false;
+        bool right_ready = false;
+        for (int attempt = 0; attempt < 30; ++attempt) {
+          left_ready = hands_->getJointState(true, left_q, left_dq);
+          right_ready = hands_->getJointState(false, right_q, right_dq);
+          if (left_ready && right_ready) break;
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!left_ready || !right_ready) {
+          std::cout
+              << "[BraincoHands] WARNING: physical feedback unavailable at startup "
+              << "(left=" << (left_ready ? "OK" : "MISSING")
+              << ", right=" << (right_ready ? "OK" : "MISSING")
+              << "). SONIC will continue; VLA commands remain blocked until both hands are online."
+              << std::endl;
+        }
+        brainco_left_feedback_online_ = left_ready;
+        brainco_right_feedback_online_ = right_ready;
+        brainco_vla_command_allowed_ = left_ready && right_ready;
+        ResolveBraincoFeedback(true, left_ready, left_q, left_dq);
+        ResolveBraincoFeedback(false, right_ready, right_q, right_dq);
+        if (left_ready && right_ready) {
+          std::cout << "[BraincoHands] physical feedback ready: L=[";
+          for (std::size_t i = 0; i < 6; ++i) {
+            if (i) std::cout << ",";
+            std::cout << left_q[i];
+          }
+          std::cout << "] R=[";
+          for (std::size_t i = 0; i < 6; ++i) {
+            if (i) std::cout << ",";
+            std::cout << right_q[i];
+          }
+          std::cout << "]" << std::endl;
+        }
+      }
+
+      audio_thread_ = std::make_unique<AudioThread>();
+
+      if(!target_motion_file_path.empty())
+      {
+        // clear existing file:
+        std::ofstream f(target_motion_file_path);
+        f.close();
+
+        // open file in append mode:
+        target_motion_file_ = std::make_unique<std::ofstream>(target_motion_file_path, std::ios::app);
+      }
+
+      if(!planner_motion_file_path.empty())
+      {
+        // clear existing file:
+        std::ofstream f(planner_motion_file_path);
+        f.close();
+
+        // open file in append mode:
+        planner_motion_file_ = std::make_unique<std::ofstream>(planner_motion_file_path, std::ios::app);
+      }
+
+      if(!policy_input_file_path.empty())
+      {
+        // clear existing file:
+        std::ofstream f(policy_input_file_path);
+        f.close();
+
+        // open file in append mode:
+        policy_input_file_ = std::make_unique<std::ofstream>(policy_input_file_path, std::ios::app);
+      }
+
+      if(!record_input_file_path.empty())
+      {
+        // clear existing file:
+        std::ofstream f(record_input_file_path);
+        f.close();
+
+        // open file in append mode:
+        record_input_file_ = std::make_unique<std::ofstream>(record_input_file_path, std::ios::app);
+        std::cout << "Initialized record input file: " << record_input_file_path << std::endl;
+      }
+
+      if(!playback_input_file_path.empty())
+      {
+        // open file in append mode:
+        playback_input_file_ = std::make_unique<std::ifstream>(playback_input_file_path);
+        std::cout << "Initialized playback input file: " << playback_input_file_path << std::endl;
+      }
+
+      movement_state_buffer_.SetData(MovementState());
+
+      // Initialize planner motion state as shared_ptr
+      planner_motion_ = std::make_shared<MotionSequence>();
+      planner_motion_->ReserveCapacity(1500, 29, 1, 1, 0, 0);
+      planner_motion_->timesteps = 0;
+      planner_motion_->name = "planner_motion";
+
+      // MotionSwitcherClient is handled by run_zmq_dds_bridge.py on the robot side
+      // (see _release_motion_switcher in scripts/bridge/run_zmq_dds_bridge.py); skip here.
+      std::cout << "[ZMQ Bridge] Skipping MotionSwitcherClient (handled by bridge)" << std::endl;
+      // Load motion data
+      if (motion_reader_.ReadFromCSV(motion_data_path)) {
+        if (!motion_reader_.motions.empty()) {
+          std::cout << "✓ Motion data loaded successfully!" << std::endl;
+          // motion_reader_.PrintSummary();
+          motion_reader_.current_motion_index_ = 0;
+          std::string motion_name;
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex_);
+            current_motion_ = motion_reader_.GetMotionShared(motion_reader_.current_motion_index_);
+            current_frame_ = 0;
+            motion_name = current_motion_->name;
+          }
+          operator_state.play = false;
+          std::cout << "Started with motion: " << motion_name << " (paused at frame 0)" << std::endl;
+        } else {
+          std::cout << "✗ Error: Motion directory found but no valid motions loaded from " << motion_data_path
+                    << std::endl;
+          std::cout << "Check that motion folders contain valid CSV files." << std::endl;
+          std::cout << "Control system cannot function without motion data!" << std::endl;
+          std::cout << "Exiting..." << std::endl;
+          throw std::runtime_error("No valid motions found in motion data directory");
+        }
+      } else {
+        std::cout << "✗ Error: Could not access motion data from " << motion_data_path << std::endl;
+        std::cout << "Make sure the path exists and contains motion folders." << std::endl;
+        std::cout << "Control system cannot function without motion data!" << std::endl;
+        std::cout << "Exiting..." << std::endl;
+        throw std::runtime_error("Failed to load motion data");
+      }
+      
+      // Initialize control policy
+      policy_engine_ = std::make_unique<PolicyEngine>();
+      
+      if (!policy_engine_->Initialize(model_path, policy_fp16)) {
+        throw std::runtime_error("Failed to initialize control policy from: " + model_path);
+      }
+      
+      // Initialize observation buffer with correct size (zero-initialized)
+      size_t obs_dim = policy_engine_->GetInputDimension();
+      obs_buffer_.resize(obs_dim, 0.0);
+      
+      // Capture CUDA graph for optimized execution
+      if (!policy_engine_->CaptureGraph()) {
+        throw std::runtime_error("Failed to capture control policy CUDA graph");
+      }
+      
+      std::cout << "✓ Policy model loaded successfully!" << std::endl;
+
+      // Load observation configuration FIRST (before encoder/planner initialization)
+      std::cout << "Loading observation configuration..." << std::endl;
+      FullObservationConfig full_obs_config;
+      if (!obs_config_path.empty()) {
+        std::cout << "Using observation config file: " << obs_config_path << std::endl;
+        full_obs_config = ObservationConfigParser::ParseFullConfig(obs_config_path);
+      } else {
+        std::cout << "Using default observation configuration" << std::endl;
+        full_obs_config.observations = ObservationConfigParser::ParseConfig();
+      }
+      
+      // Check if config parsing failed (empty observations returned)
+      if (full_obs_config.observations.empty()) {
+        throw std::runtime_error("Failed to parse observation configuration - check config file for errors");
+      }
+      
+      obs_config_ = full_obs_config.observations;
+      encoder_config_ = full_obs_config.encoder;
+      
+      // Initialize token buffer size from encoder config
+      if (encoder_config_.dimension > 0) {
+        token_state_data_.resize(encoder_config_.dimension, 0.0);
+        std::cout << "✓ Token state buffer initialized (size: " << encoder_config_.dimension << ")" << std::endl;
+      }
+      
+      // =========================================================================
+      // Initialize encoder engine
+      // =========================================================================
+      // Note: Parser already validates that if token_state is enabled, encoder_config has dimension > 0
+      // So if dimension <= 0 here, it means token_state is disabled - just ignore encoder_file_path
+      if (!encoder_file_path.empty() && encoder_config_.dimension > 0) {
+        std::cout << "Initializing encoder..." << std::endl;
+        encoder_engine_ = std::make_unique<EncoderEngine>();
+        
+        if (!encoder_engine_->Initialize(encoder_file_path, encoder_config_.use_fp16)) {
+          throw std::runtime_error("Failed to initialize encoder engine from: " + encoder_file_path);
+        }
+        
+        // Validate encoder output dimension matches config
+        if (encoder_engine_->GetTokenDimension() != static_cast<size_t>(encoder_config_.dimension)) {
+          std::cerr << "⚠ Warning: Encoder model output dimension (" << encoder_engine_->GetTokenDimension() 
+                    << ") doesn't match config dimension (" << encoder_config_.dimension << ")" << std::endl;
+        }
+        
+        // Initialize encoder observation buffer with correct size
+        size_t encoder_input_size = encoder_engine_->GetInputDimension();
+        encoder_obs_buffer_.resize(encoder_input_size, 0.0);
+
+        // Capture CUDA graph for optimized execution
+        if (!encoder_engine_->CaptureGraph()) {
+          throw std::runtime_error("Failed to capture encoder CUDA graph");
+        }
+        
+        std::cout << "✓ Encoder model loaded successfully!" << std::endl;
+        is_using_encoder_ = true;
+        initial_encoder_mode_ = 0;  // Encoder available, default to mode 0.
+      } else {
+        if (encoder_config_.dimension > 0) {
+          std::cout << "Encoder config found but no encoder file provided - tokens can be set externally" << std::endl;
+          initial_encoder_mode_ = -1;
+        } else {
+          std::cout << "No encoder configured" << std::endl;
+          initial_encoder_mode_ = -2;
+        }
+        is_using_encoder_ = false;
+      }
+      
+      // =========================================================================
+      // Initialize encode_mode for all loaded reference motions and planner motion
+      // =========================================================================
+      // Set the encode_mode for all loaded reference motions based on encoder availability
+      std::cout << "Setting encode_mode for " << motion_reader_.motions.size() << " loaded reference motions..." << std::endl;
+      for (auto& motion : motion_reader_.motions) {
+        motion->SetEncodeMode(initial_encoder_mode_);
+        std::cout << "  Motion '" << motion->name << "' encode_mode set to: " << initial_encoder_mode_ << std::endl;
+      }
+      
+      // Set encode_mode for planner motion
+      planner_motion_->SetEncodeMode(initial_encoder_mode_);
+      std::cout << "Planner motion encode_mode set to: " << initial_encoder_mode_ << std::endl;
+
+      // Initialize planner
+      if (!planner_path.empty()) {
+        PlannerConfig planner_config;
+        planner_config.model_path = planner_path;
+        if (planner_path.find("V0") != std::string::npos)
+        {
+          planner_config.version = 0;
+        }
+        else if (planner_path.find("V1") != std::string::npos)
+        {
+          planner_config.version = 1;
+        }
+        else if (planner_path.find("V2") != std::string::npos)
+        {
+          planner_config.version = 2;
+        }
+        else
+        {
+          std::cout << "Unsupported planner version: " << planner_path << std::endl;
+          throw std::runtime_error("Unsupported planner version: " + planner_path);
+        }
+        planner_ = std::make_unique<LocalMotionPlannerTensorRT>(planner_fp16, 0, planner_config);
+      }
+      
+      // Initialize observation function map
+      InitializeObservationFunctions();
+      
+      // Log observation configuration details
+      LogObservationConfiguration();
+
+      // Prepare robot configuration for data collection (after all initialization is complete)
+      std::map<std::string, std::variant<std::string, int, double, bool>> robot_config;
+      robot_config["model_path"] = model_path;
+      robot_config["reference_motion_path"] = motion_data_path;
+      robot_config["planner_path"] = planner_path.empty() ? "none" : planner_path;
+      robot_config["obs_config_path"] = obs_config_path.empty() ? "none" : obs_config_path;
+      robot_config["encoder_file"] = encoder_file_path.empty() ? "none" : encoder_file_path;
+      robot_config["control_frequency"] = 1.0 / control_dt_;
+      robot_config["planner_frequency"] = 1.0 / planner_dt_;
+      robot_config["control_startup_blend_ticks"] =
+          static_cast<int>(control_start_safety::kStartupBlendTicks);
+      robot_config["is_using_encoder"] = is_using_encoder_;
+      robot_config["policy_fp16"] = policy_fp16;
+      robot_config["planner_fp16"] = planner_fp16;
+      robot_config["waist_lock_axes"] = waist_lock::Describe(waist_lock_axes_);
+      robot_config["waist_lock_kp"] = waist_lock_kp_;
+      robot_config["waist_lock_kd"] = waist_lock_kd_;
+      robot_config["left_shoulder_back_offset_deg"] =
+          left_shoulder_back_offset_deg_;
+      robot_config["lower_body_energy_governor_enabled"] =
+          lower_body_energy_governor_enabled_;
+      robot_config["lower_body_energy_governor_scale"] =
+          lower_body_energy_governor_scale_;
+      robot_config["lower_body_energy_governor_tremor_gated"] =
+          lower_body_energy_governor_tremor_gated_;
+      robot_config["lower_body_tremor_trigger_threshold_rad_s"] =
+          lower_body_tremor_trigger_threshold_rad_s_;
+      robot_config["lower_body_tremor_peak_to_peak_threshold_rad_s"] =
+          lower_body_tremor_peak_to_peak_threshold_rad_s_;
+      robot_config["lower_body_tremor_recovery_damping_nm_per_rad_s"] =
+          lower_body_tremor_recovery_damping_nm_per_rad_s_;
+      robot_config["lower_body_tremor_hold_ticks"] =
+          static_cast<int>(lower_body_tremor_hold_ticks_);
+      robot_config["lower_body_braking_priority_slew_enabled"] =
+          lower_body_braking_priority_slew_enabled_;
+      robot_config["lower_body_braking_priority_slew_max_step_rad"] =
+          lower_body_braking_priority_slew_max_step_rad_;
+      robot_config["lower_body_braking_priority_slew_hold_ticks"] =
+          static_cast<int>(lower_body_braking_priority_slew_hold_ticks_);
+      robot_config["lower_body_observation_guard_enabled"] =
+          lower_body_observation_guard_enabled_;
+      robot_config["lower_body_observation_guard_hold_ticks"] =
+          static_cast<int>(lower_body_observation_guard_hold_ticks_);
+      robot_config["lower_body_observation_guard_alpha"] =
+          lower_body_observation_guard_alpha_;
+      robot_config["lower_body_observation_guard_max_policy_dq_step_rad_s"] =
+          lower_body_observation_guard_max_policy_dq_step_rad_s_;
+      robot_config[
+          "lower_body_observation_guard_max_position_dq_residual_rad_s"] =
+          lower_body_observation_guard_max_position_dq_residual_rad_s_;
+      robot_config["lower_body_observation_guard_continuous_innovation_clip"] =
+          lower_body_observation_guard_continuous_innovation_clip_;
+      robot_config["lower_body_observation_guard_repair_until_caught_up"] =
+          lower_body_observation_guard_repair_until_caught_up_;
+      robot_config["lower_body_observation_guard_all_monitored"] =
+          lower_body_observation_guard_all_monitored_;
+      robot_config["lower_body_observation_guard_both_ankle_rolls"] =
+          lower_body_observation_guard_both_ankle_rolls_;
+      robot_config["lower_body_observation_guard_ankle_roll_trigger_only"] =
+          lower_body_observation_guard_ankle_roll_trigger_only_;
+      robot_config["lower_body_observation_guard_fixed_window"] =
+          lower_body_observation_guard_fixed_window_;
+      robot_config["lower_body_impact_damper_enabled"] =
+          lower_body_impact_damper_enabled_;
+      robot_config["lower_body_impact_damper_extra_kd_nm_per_rad_s"] =
+          lower_body_impact_damper_extra_kd_nm_per_rad_s_;
+      robot_config["lower_body_impact_damper_hold_ticks"] =
+          static_cast<int>(lower_body_impact_damper_hold_ticks_);
+      robot_config["lower_body_impact_damper_all_monitored"] =
+          lower_body_impact_damper_all_monitored_;
+
+      // Initialize state logger with complete robot configuration
+      try {
+        std::string resolved_logs_dir = logs_dir;
+        // dt is control_dt_; pass complete robot_config to constructor
+        state_logger_ = std::make_unique<StateLogger>(resolved_logs_dir, 10000, G1_NUM_MOTOR, G1_NUM_MOTOR, 
+                                                       control_dt_, enable_csv_logs, robot_config);
+      } catch (const std::exception& e) {
+        std::cerr << "[ERROR] Failed to initialize state logger: " << e.what() << std::endl;
+        std::cerr << "State logger is required for operation. Exiting..." << std::endl;
+        throw;  // Re-throw to stop program initialization
+      }
+
+      // Initialize input interface based on type
+      if (input_type == "gamepad") {
+        input_interface_ = std::make_unique<unitree::common::Gamepad>();
+        std::cout << "Initialized gamepad input interface" << std::endl;
+        std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
+      } 
+      else if (input_type == "gamepad_manager") {
+        input_interface_ = std::make_unique<GamepadManager>(zmq_host, zmq_port, zmq_topic, zmq_conflate, zmq_verbose);
+        std::cout << "Initialized demo gamepad manager input interface" << std::endl;
+        std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
+        std::cout << "  Topic: " << zmq_topic << std::endl;
+        std::cout << "  Conflate: " << (zmq_conflate ? "enabled" : "disabled") << std::endl;
+        std::cout << "  Verbose: " << (zmq_verbose ? "enabled" : "disabled") << std::endl;
+        std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
+      }
+      else if (input_type == "manager") {
+        input_interface_ = std::make_unique<InterfaceManager>(
+          zmq_host, zmq_port, zmq_topic, zmq_conflate, zmq_verbose
+        );
+        std::cout << "Initialized interface manager (Shift+1/2/3/4 [! @ # $] to switch: keyboard, gamepad, zmq"
+#if HAS_ROS2
+                  " , ros2"
+#endif
+                  ")" << std::endl;
+        std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
+        std::cout << "  Topic: " << zmq_topic << std::endl;
+        std::cout << "  Conflate: " << (zmq_conflate ? "enabled" : "disabled") << std::endl;
+        std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
+      }
+      else if (input_type == "zmq") {
+        input_interface_ = std::make_unique<ZMQEndpointInterface>(
+          zmq_host, zmq_port, zmq_topic, zmq_conflate, zmq_verbose
+        );
+        std::cout << "Initialized ZMQ endpoint interface" << std::endl;
+        std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
+        std::cout << "  Topic: " << zmq_topic << std::endl;
+        std::cout << "  Conflate: " << (zmq_conflate ? "enabled" : "disabled") << std::endl;
+        std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
+      }
+      else if (input_type == "zmq_manager") {
+        input_interface_ = std::make_unique<ZMQManager>(
+          zmq_host, zmq_port, zmq_topic, "command", "planner", zmq_conflate, zmq_verbose
+        );
+        std::cout << "Initialized ZMQ manager" << std::endl;
+        std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
+        std::cout << "  Pose topic: " << zmq_topic << std::endl;
+        std::cout << "  Command topic: command" << std::endl;
+        std::cout << "  Planner topic: planner" << std::endl;
+        std::cout << "  Conflate: " << (zmq_conflate ? "enabled" : "disabled") << std::endl;
+        std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
+      }
+#if HAS_ROS2
+      else if (input_type == "ros2") {
+        // ROS2 input interface will be initialized without encoder mode parameter
+        input_interface_ = std::make_unique<ROS2InputHandler>(true, "g1_deploy_ros2_handler");
+        std::cout << "Initialized ROS2 input interface" << std::endl;
+        std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
+      }
+#endif
+      else {
+        input_interface_ = std::make_unique<SimpleKeyboard>();
+        std::cout << "Initialized keyboard input interface (default)" << std::endl;
+        std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
+      }
+
+      // Set initial VR 3-point compliance values for all input interfaces
+      // These are keyboard-controlled: g/h for left hand, b/v for right hand
+      if (input_interface_) {
+        input_interface_->SetVR3PointCompliance(initial_vr_3point_compliance_);
+        // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
+        input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
+        /* hand_type=none -> dummy ops are no-op */ hands_->SetMaxCloseRatio(initial_max_close_ratio_);
+        std::cout << "[INFO] Initial VR 3-point compliance: ["
+                  << initial_vr_3point_compliance_[0] << ", "
+                  << initial_vr_3point_compliance_[1] << ", "
+                  << initial_vr_3point_compliance_[2] << "]" << std::endl;
+        std::cout << "[INFO] Initial hand max close ratio: " << initial_max_close_ratio_ 
+                  << " (1.0 = full closure allowed, 0.2 = limited)" << std::endl;
+        std::cout << "[INFO] Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1 (range: 0.01-0.5)" << std::endl;
+        std::cout << "[INFO] Keyboard controls: x/c = hand max close ratio +/- 0.1 (range: 0.2-1.0)" << std::endl;
+        
+        // Info message about compliance observation status
+        if (!has_vr_3point_compliance_obs_) {
+          std::cout << "\n┌─────────────────────────────────────────────────────────────────────────────┐" << std::endl;
+          std::cout << "│  Compliance control: DISABLED                                               │" << std::endl;
+          std::cout << "│  Policy does not observe 'vr_3point_compliance'.                            │" << std::endl;
+          std::cout << "│  Keyboard controls (g/h/b/v) will be ignored for this policy.               │" << std::endl;
+          std::cout << "│  To enable, use a compliance-aware policy that observes it natively.        │" << std::endl;
+          std::cout << "└─────────────────────────────────────────────────────────────────────────────┘\n" << std::endl;
+        } else {
+          std::cout << "\n┌─────────────────────────────────────────────────────────────────────────────┐" << std::endl;
+          std::cout << "│  Compliance control: ENABLED                                                │" << std::endl;
+          std::cout << "│  Policy observes 'vr_3point_compliance'. Keyboard controls (g/h/b/v) work.  │" << std::endl;
+          std::cout << "└─────────────────────────────────────────────────────────────────────────────┘\n" << std::endl;
+        }
+      }
+
+      // Initialize output interfaces based on type (now that state_logger_ is ready)
+      // Supports multiple simultaneous outputs with --output-type all
+      bool create_zmq = (output_type == "zmq" || output_type == "all");
+      bool create_ros2 = false;
+#if HAS_ROS2
+      create_ros2 = (output_type == "ros2" || output_type == "all");
+#endif
+
+      if (create_zmq) {
+        auto zmq_handler = std::make_unique<ZMQOutputHandler>(*state_logger_, zmq_out_port, zmq_out_topic);
+        std::cout << "Initialized ZMQ output interface" << std::endl;
+        // Publish robot config so subscribers can receive it before control loop starts
+        zmq_handler->publish_config();
+        output_interfaces_.push_back(std::move(zmq_handler));
+      }
+
+#if HAS_ROS2
+      if (create_ros2) {
+        auto ros2_handler = std::make_unique<ROS2OutputHandler>(*state_logger_, "g1_output_handler");
+        std::cout << "Initialized ROS2 output interface" << std::endl;
+        // Publish robot config so subscribers can receive it before control loop starts
+        ros2_handler->publish_config();
+        output_interfaces_.push_back(std::move(ros2_handler));
+      }
+#endif
+
+      if (output_interfaces_.empty() && output_type != "all") {
+        std::cout << "Unknown output type '" << output_type << "' - no output will be published" << std::endl;
+      } else {
+        std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
+      }
+
+      // create threads
+      input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
+      command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
+                                                    &G1Deploy::LowCommandWriter, this);
+      control_thread_ptr_ =
+          CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_dt_ * 1e6, &G1Deploy::Control, this);
+      
+      if (planner_) {
+        planner_thread_ptr_ =
+          CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6, &G1Deploy::Planner, this);
+      }
+    }
+
+    ~G1Deploy()
+    {
+      // CUDA resources are now cleaned up by the PolicyEngine and planner classes automatically
+    }
+
+    void ConfigureCommandWriterThread() {
+      // This runs inside LowCommandWriter.  The historical implementation ran
+      // after creating all recurrent threads but configured pthread_self(),
+      // which was the constructor/main thread rather than the 500 Hz writer.
+      int requested_priority = 20;
+      if (const char* configured =
+              std::getenv("SONIC_COMMAND_WRITER_RT_PRIORITY")) {
+        try {
+          requested_priority = std::stoi(configured);
+        } catch (const std::exception&) {
+          std::cerr
+              << "[LowCmd TX] WARNING: invalid "
+              << "SONIC_COMMAND_WRITER_RT_PRIORITY='" << configured
+              << "'; using 20" << std::endl;
+          requested_priority = 20;
+        }
+      }
+
+      const int min_priority = sched_get_priority_min(SCHED_FIFO);
+      const int max_priority = sched_get_priority_max(SCHED_FIFO);
+      requested_priority =
+          std::clamp(requested_priority, min_priority, max_priority);
+      struct sched_param param {};
+      param.sched_priority = requested_priority;
+      const int priority_rc =
+          pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+      if (priority_rc != 0) {
+        std::cerr
+            << "[LowCmd TX] WARNING: could not set command_writer SCHED_FIFO/"
+            << requested_priority << ": " << std::strerror(priority_rc)
+            << " (continuing with normal scheduling)" << std::endl;
+      }
+
+      if (const char* configured_cpu =
+              std::getenv("SONIC_COMMAND_WRITER_CPU")) {
+        try {
+          const int cpu = std::stoi(configured_cpu);
+          if (cpu >= 0 && cpu < CPU_SETSIZE) {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(cpu, &cpuset);
+            const int affinity_rc = pthread_setaffinity_np(
+                pthread_self(), sizeof(cpu_set_t), &cpuset);
+            if (affinity_rc != 0) {
+              std::cerr
+                  << "[LowCmd TX] WARNING: could not pin command_writer to CPU "
+                  << cpu << ": " << std::strerror(affinity_rc) << std::endl;
+            }
+          } else {
+            std::cerr
+                << "[LowCmd TX] WARNING: SONIC_COMMAND_WRITER_CPU out of range: "
+                << configured_cpu << std::endl;
+          }
+        } catch (const std::exception&) {
+          std::cerr
+              << "[LowCmd TX] WARNING: invalid SONIC_COMMAND_WRITER_CPU='"
+              << configured_cpu << "'" << std::endl;
+        }
+      }
+
+      int actual_policy = 0;
+      struct sched_param actual_param {};
+      const int query_rc = pthread_getschedparam(
+          pthread_self(), &actual_policy, &actual_param);
+      if (query_rc == 0) {
+        const char* policy_name =
+            actual_policy == SCHED_FIFO ? "SCHED_FIFO" :
+            actual_policy == SCHED_RR ? "SCHED_RR" : "SCHED_OTHER";
+        std::cout
+            << "[LowCmd TX] command_writer scheduling=" << policy_name
+            << " priority=" << actual_param.sched_priority << std::endl;
+      } else {
+        std::cerr
+            << "[LowCmd TX] WARNING: could not query command_writer scheduling: "
+            << std::strerror(query_rc) << std::endl;
+      }
+    }
+
+    /// DDS callback: receives a 500 Hz LowState message from the robot SDK.
+    /// Validates CRC (unless disabled for MuJoCo sim) and stores the result
+    /// in the thread-safe low_state_buffer_.
+    void LowStateHandler(const void* message) {
+      LowState_ low_state = *(const LowState_*)message;
+
+      // Only perform CRC check if not disabled (for MuJoCo simulation compatibility)
+      if (!disable_crc_check_) {
+        uint32_t received_crc = low_state.crc();
+        uint32_t calculated_crc = Crc32Core((uint32_t*)&low_state, (sizeof(LowState_) >> 2) - 1);
+
+        if (received_crc != calculated_crc) {
+          static int crc_error_count = 0;
+          crc_error_count++;
+          std::cout << "[ERROR] CRC Error #" << crc_error_count << " - Received: 0x" << std::hex << received_crc
+                    << ", Calculated: 0x" << calculated_crc << ", Size: " << sizeof(LowState_) << " bytes" << std::dec
+                    << std::endl;
+          return;
+        }
+      }
+
+      // Check motor error states (prints only on transitions)
+      {
+        std::array<uint32_t, G1_NUM_MOTOR> motorstates;
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          motorstates[i] = low_state.motor_state()[i].motorstate();
+        }
+        error_monitor_.update(motorstates);
+      }
+
+      low_state_buffer_.SetData(low_state);
+
+      // update mode machine
+      if (mode_machine_ != low_state.mode_machine()) {
+        if (mode_machine_ == 0) std::cout << "G1 type: " << unsigned(low_state.mode_machine()) << std::endl;
+        mode_machine_ = low_state.mode_machine();
+      }
+    }
+
+    /// DDS callback: receives secondary (torso) IMU data.
+    void imuTorsoHandler(const void* message) {
+      IMUState_ imu_torso = *(const IMUState_*)message;
+      imu_torso_buffer_.SetData(imu_torso);
+    }
+
+    /**
+     * @brief Command-writer thread body (500 Hz).
+     *
+     * Reads the latest MotorCommand from motor_command_buffer_, packs it
+     * into a LowCmd_ DDS message with CRC, and publishes via DDS or ZMQ.
+     * Also publishes Dex3 hand commands at the same cadence.
+     */
+    void LowCommandWriter() {
+      std::call_once(
+          command_writer_setup_once_,
+          [this]() { ConfigureCommandWriterThread(); });
+
+      LowCmd_ dds_low_command;
+      dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
+      dds_low_command.mode_machine() = mode_machine_;
+
+      // SAFETY: Initialize ALL 35 motor_cmd to safe values (mode=0 disables motor)
+      // This prevents sending garbage commands to hand joints (29-34) via ZMQ bridge
+      for (size_t i = 0; i < 35; i++) {
+        dds_low_command.motor_cmd().at(i).mode() = 0;  // Disabled
+        dds_low_command.motor_cmd().at(i).tau() = 0.0f;
+        dds_low_command.motor_cmd().at(i).q() = 0.0f;
+        dds_low_command.motor_cmd().at(i).dq() = 0.0f;
+        dds_low_command.motor_cmd().at(i).kp() = 0.0f;
+        dds_low_command.motor_cmd().at(i).kd() = 0.0f;
+      }
+
+      const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
+      if (mc) {
+        // Only set the 29 body joints (0-28), leave hand joints (29-34) disabled
+        for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
+          dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
+          dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
+          dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);
+          dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);
+          dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i);
+          dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
+        }
+
+        dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
+
+        // Publish via ZMQ bridge (only path now).
+        if (zmq_robot_channel_) {
+          // PublishLowCmd records writer gaps and non-blocking send failures.
+          // Do not retry a stale frame here; the robot-side watchdog owns the
+          // fail-safe decision for a missing stream.
+          (void)zmq_robot_channel_->PublishLowCmd(dds_low_command);
+        }
+      }
+
+      // Publish Dex3 hand commands at the same publish cadence
+      /* hand_type=none -> dummy ops are no-op */ hands_->writeOnce();
+    }
+
+    /// Gracefully stop all threads and send a damping-only command.
+    void Stop() {
+      operator_state.stop = true;
+
+      if (control_thread_ptr_) {
+        input_thread_ptr_->Wait();
+        input_thread_ptr_.reset();
+        control_thread_ptr_->Wait();
+        control_thread_ptr_.reset();
+        command_writer_ptr_->Wait();
+        command_writer_ptr_.reset();
+        if (planner_thread_ptr_) {
+          planner_thread_ptr_->Wait();
+          planner_thread_ptr_.reset();
+        }
+      }
+      CreateDampingCommand();
+      LowCommandWriter();
+      std::cout << "Stop" << std::endl;
+    }
+
+    /// Write a zero-torque, damping-only motor command (safe shutdown pose).
+    void CreateDampingCommand() {
+      MotorCommand motor_command_tmp;
+      const std::shared_ptr<const LowState_> ls = low_state_buffer_.GetDataWithTime().data;
+
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        motor_command_tmp.tau_ff.at(i) = 0.0;
+        motor_command_tmp.q_target.at(i) = 0.0;
+        motor_command_tmp.dq_target.at(i) = 0.0;
+        motor_command_tmp.kp.at(i) = 0;
+        motor_command_tmp.kd.at(i) = 8;
+      }
+      motor_command_buffer_.SetData(motor_command_tmp);
+    }
+
+    /**
+     * @brief INIT state handler: ramp the robot from its current pose to the
+     *        default standing angles over `duration_` seconds (linear interpolation).
+     *
+     * Called at 50 Hz until the ramp completes, at which point the state machine
+     * transitions to WAIT_FOR_CONTROL. Keep every hand backend open throughout
+     * INIT so a real hand cannot grasp before the body reaches its init pose.
+     * @return True once a valid, fault-free LowState is available; false if
+     *         the robot is not yet safe to command.
+     */
+    bool InitControl() {
+      auto low_state_data = low_state_buffer_.GetDataWithTime();
+      const std::shared_ptr<const LowState_> ls = low_state_data.data;
+      if (!ls) {
+        return false;
+      }
+      if (!CheckMeasuredJointSpeeds(*ls, "INIT")) {
+        operator_state.stop = true;
+        return false;
+      }
+
+      bool has_motor_fault = false;
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        has_motor_fault = has_motor_fault || ls->motor_state()[i].motorstate() != 0;
+      }
+      if (has_motor_fault) {
+        // Control() backs off for 100 ms after a false return.  Report every
+        // ~5 seconds so a persistent hardware fault is visible without
+        // flooding the terminal.
+        static int init_fault_report_count = 0;
+        if (init_fault_report_count++ % 50 == 0) {
+          std::cout << "[ERROR] INIT blocked by motor fault(s):";
+          for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+            const uint32_t fault = ls->motor_state()[i].motorstate();
+            if (fault != 0) {
+              std::cout << " motor=" << i << " code=0x" << std::hex << fault << std::dec;
+            }
+          }
+          std::cout << std::endl;
+        }
+        return false;
+      }
+
+      MotorCommand motor_command_tmp;
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        motor_command_tmp.tau_ff.at(i) = 0.0;
+        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i]);
+        motor_command_tmp.dq_target.at(i) = 0.0;
+        motor_command_tmp.kp.at(i) = kps[i];
+        motor_command_tmp.kd.at(i) = kds[i];
+      }
+      time_ += control_dt_;
+      if (time_ < duration_) {
+        for (int i = 0; i < G1_NUM_MOTOR; i++) {
+          double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
+          double current_pos = ls->motor_state()[i].q();
+          motor_command_tmp.q_target.at(i) =
+              static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
+        }
+        /* hand_type=none -> dummy ops are no-op */ {
+          hands_->open(true);
+          hands_->open(false);
+        }
+      } else {
+        program_state_ = ProgramState::WAIT_FOR_CONTROL;
+        /* hand_type=none -> dummy ops are no-op */ {
+          hands_->open(true);
+          hands_->open(false);
+        }
+        std::cout << "Init Done" << std::endl;
+      }
+      motor_command_buffer_.SetData(motor_command_tmp);
+      return true;
+    }
+
+    /// Check for valid LowState data and recent updates; if invalid, transition to ERROR state.
+    bool CheckSafety() {
+      auto low_state_data = low_state_buffer_.GetDataWithTime();
+      const std::shared_ptr<const LowState_> ls = low_state_data.data;
+      if (!ls) {
+        std::cout << "[ERROR] LowState data is not available in the middle of the control loop!" << std::endl;
+        return false;
+      }
+
+      auto now = std::chrono::steady_clock::now();
+      if (now - low_state_data.timestamp > LOW_STATE_ABSENT_THRESHOLD) {
+        const auto buffer_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - low_state_data.timestamp).count();
+        std::cout << "[ERROR] Lost LowState data connection from robot! "
+                  << "buffer_age=" << buffer_age_ms << "ms";
+        if (zmq_robot_channel_) {
+          std::cout << ", zmq_state_count=" << zmq_robot_channel_->GetStateCount()
+                    << ", zmq_last_lowstate_age=" << zmq_robot_channel_->GetLastLowStateAgeMs()
+                    << "ms";
+        }
+        std::cout << std::endl;
+        return false;
+      }
+
+      bool has_motor_fault = false;
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        const uint32_t fault = ls->motor_state()[i].motorstate();
+        if (fault != 0) {
+          if (!has_motor_fault) {
+            std::cout << "[ERROR] Motor fault(s) block control:";
+          }
+          has_motor_fault = true;
+          std::cout << " motor=" << i << " code=0x" << std::hex << fault << std::dec;
+        }
+      }
+      if (has_motor_fault) {
+        std::cout << std::endl;
+        return false;
+      }
+      if (!CheckMeasuredJointSpeeds(*ls, "control safety check")) {
+        return false;
+      }
+
+      return true;
+    }
+
+    /// Get current ROS 2 timestamp (seconds) from the first ROS2 output interface, or 0.0 if none.
+    double GetRosTimestamp() {
+      // Get ROS timestamp from the first ROS2 output interface (0.0 if none available)
+      double ros_timestamp = 0.0;
+#if HAS_ROS2
+      for (auto& output_interface : output_interfaces_) {
+        if (output_interface && output_interface->GetType() == OutputInterface::OutputType::ROS2) {
+          auto* ros2_handler = dynamic_cast<ROS2OutputHandler*>(output_interface.get());
+          if (ros2_handler) {
+            ros_timestamp = ros2_handler->GetROSTimestamp();
+            break;  // Use timestamp from first ROS2 interface found
+          }
+        }
+      }
+#endif
+      return ros_timestamp;
+    }
+
+    /**
+     * @brief Read the latest robot state (IMU + joints + hands) and log it.
+     *
+     * Reads LowState and torso IMU from their DataBuffers, remaps joint positions
+     * from hardware order to IsaacLab order (subtracting default_angles), and
+     * calls StateLogger::LogFullState() with the complete snapshot.
+     *
+     * @return False if LowState or IMU data is missing.
+     *         Real-robot joint velocity is checked by CheckSafety immediately
+     *         before this function.
+     */
+    bool GatherRobotStateToLogger() {
+      auto low_state_data = low_state_buffer_.GetDataWithTime();
+      auto imu_data = imu_torso_buffer_.GetDataWithTime();
+      const std::shared_ptr<const LowState_> ls = low_state_data.data;
+      const std::shared_ptr<const IMUState_> imu_torso = imu_data.data;
+      if (!ls || !imu_torso) {
+        std::cout << "✗ Error: LowState or IMUState is not available in the middle of the control loop!" << std::endl;
+        return false;
+      }
+      used_low_state_data_ = (low_state_data);
+      used_imu_torso_data_ = (imu_data);
+      // robot state data
+      std::array<double, G1_NUM_MOTOR> body_q = {0.0};
+      std::array<double, G1_NUM_MOTOR> body_dq = {0.0};
+
+      auto unitree_joint_state = ls->motor_state();
+      std::array<double, G1_NUM_MOTOR * 2> motor_temperature = {0.0};
+      std::array<double, G1_NUM_MOTOR> motor_error = {0.0};
+      std::array<double, G1_NUM_MOTOR> motor_torque = {0.0};
+      for (int i = 0; i < G1_NUM_MOTOR; i++) {
+        body_q[i] =
+            unitree_joint_state[mujoco_to_isaaclab[i]].q() - default_angles[mujoco_to_isaaclab[i]]; // URDF order
+        body_dq[i] = unitree_joint_state[mujoco_to_isaaclab[i]].dq(); // URDF order
+        // Extract motor temperature (2 values per motor: winding, driver) in hardware order
+        motor_temperature[i * 2]     = static_cast<double>(unitree_joint_state[i].temperature()[0]);
+        motor_temperature[i * 2 + 1] = static_cast<double>(unitree_joint_state[i].temperature()[1]);
+        // Extract motor error code in hardware order
+        motor_error[i] = static_cast<double>(unitree_joint_state[i].motorstate());
+        // Extract estimated torque in hardware order
+        motor_torque[i] = static_cast<double>(unitree_joint_state[i].tau_est());
+
+        // High temperature hysteresis check (enter >= 90, exit < 85)
+        int16_t max_temp = std::max(unitree_joint_state[i].temperature()[0],
+                                    unitree_joint_state[i].temperature()[1]);
+        if (motor_high_temp_[i]) {
+          if (max_temp < HIGH_TEMP_EXIT) { motor_high_temp_[i] = false; }
+        } else {
+          if (max_temp >= HIGH_TEMP_ENTER) { motor_high_temp_[i] = true; }
+        }
+      }
+
+      // Build high temperature warning message for audio
+      {
+        static const char* joint_names_hw[] = {
+          "Left Hip Pitch", "Left Hip Roll", "Left Hip Yaw", "Left Knee",
+          "Left Ankle Pitch", "Left Ankle Roll", "Right Hip Pitch", "Right Hip Roll",
+          "Right Hip Yaw", "Right Knee", "Right Ankle Pitch", "Right Ankle Roll",
+          "Waist Yaw", "Waist Roll", "Waist Pitch",
+          "Left Shoulder Pitch", "Left Shoulder Roll", "Left Shoulder Yaw", "Left Elbow",
+          "Left Wrist Roll", "Left Wrist Pitch", "Left Wrist Yaw",
+          "Right Shoulder Pitch", "Right Shoulder Roll", "Right Shoulder Yaw", "Right Elbow",
+          "Right Wrist Roll", "Right Wrist Pitch", "Right Wrist Yaw",
+        };
+        bool any_high = false;
+        std::string high_temp_msg = "Warning! High temperature at ";
+        std::string high_temp_print_msg = "Warning! High temperature at ";
+        bool first = true;
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          if (motor_high_temp_[i]) {
+            any_high = true;
+            int16_t t = std::max(unitree_joint_state[i].temperature()[0],
+                                 unitree_joint_state[i].temperature()[1]);
+            if (!first) { high_temp_msg += ", "; high_temp_print_msg += ", "; }
+            high_temp_msg += joint_names_hw[i];
+            high_temp_print_msg += std::string(joint_names_hw[i]) + "(" + std::to_string(t) + ")";
+            first = false;
+          }
+        }
+        high_temp_warning_ = any_high;
+        high_temp_message_ = any_high ? high_temp_msg : "";
+
+        // Print to console at ~1s intervals while overheating (50 Hz control loop)
+        if (any_high) {
+          static int high_temp_print_counter = 0;
+          if (high_temp_print_counter % 50 == 0) {
+            std::cout << "[HighTemp] " << high_temp_print_msg << std::endl;
+          }
+          high_temp_print_counter++;
+        }
+      }
+
+      std::array<double, 4> base_quat = float_to_double<4>(ls->imu_state().quaternion()); // qw, qx, qy, qz
+      std::array<double, 3> base_ang_vel = float_to_double<3>(ls->imu_state().gyroscope());
+      std::array<double, 3> base_accel = float_to_double<3>(ls->imu_state().accelerometer());
+
+      std::array<double, 4> body_torso_quat = float_to_double<4>(imu_torso->quaternion()); //qw, qx, qy, qz 
+      std::array<double, 3> body_torso_ang_vel = float_to_double<3>(imu_torso->gyroscope());
+      std::array<double, 3> body_torso_accel = float_to_double<3>(imu_torso->accelerometer());
+
+      // Collect current hand feedback. BrainCo feedback arrives as six physical
+      // MotorStatus values over the robot ZMQ bridge and is normalized/padded
+      // by BraincoHands into this fixed 7-value logger schema.
+      std::array<double, 7> left_hand_q = {0.0};
+      std::array<double, 7> left_hand_dq = {0.0};
+      std::array<double, 7> right_hand_q = {0.0};
+      std::array<double, 7> right_hand_dq = {0.0};
+
+      const bool has_left_hand_state =
+          hands_->getJointState(true, left_hand_q, left_hand_dq);
+      const bool has_right_hand_state =
+          hands_->getJointState(false, right_hand_q, right_hand_dq);
+
+      brainco_left_feedback_online_ = true;
+      brainco_right_feedback_online_ = true;
+      brainco_vla_command_allowed_ = true;
+
+      if (hand_type_ == "brainco" &&
+          (!has_left_hand_state || !has_right_hand_state)) {
+        const bool local_sim =
+            zmq_robot_ip_ == "localhost" || zmq_robot_ip_ == "127.0.0.1" ||
+            zmq_robot_ip_ == "::1";
+        if (local_sim) {
+          // MuJoCo currently has no BrainCo finger dynamics. Treat the final
+          // thresholded command as ideal simulated feedback instead of forcing
+          // the state-conditioned checkpoint to see fourteen permanent zeros.
+          for (std::size_t i = 0; i < 6; ++i) {
+            left_hand_q[i] = last_left_hand_action[i];
+            right_hand_q[i] = last_right_hand_action[i];
+          }
+        } else {
+          brainco_left_feedback_online_ = has_left_hand_state;
+          brainco_right_feedback_online_ = has_right_hand_state;
+          brainco_vla_command_allowed_ =
+              has_left_hand_state && has_right_hand_state;
+          ResolveBraincoFeedback(
+              true, has_left_hand_state, left_hand_q, left_hand_dq);
+          ResolveBraincoFeedback(
+              false, has_right_hand_state, right_hand_q, right_hand_dq);
+        }
+      } else if (hand_type_ == "brainco") {
+        // Cache the physical feedback while it is fresh, so a later short
+        // transport outage can retain measured (not synthetic) hand state.
+        ResolveBraincoFeedback(true, true, left_hand_q, left_hand_dq);
+        ResolveBraincoFeedback(false, true, right_hand_q, right_hand_dq);
+      }
+
+      // This per-tick event mask is consumed later by the command path.  Clear
+      // it before running the detector so a one-shot impact cannot be reused
+      // accidentally on a later policy tick.
+      lower_body_impact_event_hardware_mask_.fill(0);
+
+      // Log robot state for analysis and debugging
+      if (state_logger_) {
+        // Get ROS timestamp if using ROS2 output interface (0.0 for non-ROS2 interfaces)
+        double ros_timestamp = GetRosTimestamp();
+        const std::uint64_t state_index = state_logger_->LogFullState(
+            base_quat, base_ang_vel, base_accel, body_torso_quat,
+            body_torso_ang_vel, body_torso_accel,
+            std::span(body_q),
+            std::span(body_dq),
+            std::span(last_action),
+            std::span(motor_temperature),
+            std::span(motor_error),
+            std::span(motor_torque),
+            std::span(left_hand_q),
+            std::span(left_hand_dq),
+            std::span(right_hand_q),
+            std::span(right_hand_dq),
+            std::span(last_left_hand_action),
+            std::span(last_right_hand_action),
+            brainco_left_feedback_online_,
+            brainco_right_feedback_online_,
+            brainco_vla_command_allowed_,
+            ros_timestamp);
+
+        std::array<double, lower_body_observation_guard::kJointCount>
+            q_target_policy_order{};
+        std::array<double, lower_body_observation_guard::kJointCount>
+            kp_policy_order{};
+        std::array<double, lower_body_observation_guard::kJointCount>
+            kd_policy_order{};
+        static_assert(
+            G1_NUM_MOTOR == lower_body_observation_guard::kJointCount);
+        for (std::size_t policy_index = 0;
+             policy_index < lower_body_observation_guard::kJointCount;
+             ++policy_index) {
+          const std::size_t hardware_index = static_cast<std::size_t>(
+              mujoco_to_isaaclab[policy_index]);
+          q_target_policy_order[policy_index] =
+              last_action[policy_index] * g1_action_scale[hardware_index];
+          kp_policy_order[policy_index] = kps[hardware_index];
+          kd_policy_order[policy_index] = kds[hardware_index];
+        }
+        const auto guard_result = lower_body_observation_guard_.Update(
+            state_index, body_q, body_dq, q_target_policy_order,
+            kp_policy_order, kd_policy_order,
+            program_state_ == ProgramState::CONTROL);
+        for (std::size_t policy_index = 0;
+             policy_index < lower_body_observation_guard::kJointCount;
+             ++policy_index) {
+          if (guard_result.event_mask[policy_index] == 0) {
+            continue;
+          }
+          const std::size_t hardware_index = static_cast<std::size_t>(
+              mujoco_to_isaaclab[policy_index]);
+          if (hardware_index <
+              lower_body_impact_event_hardware_mask_.size()) {
+            lower_body_impact_event_hardware_mask_[hardware_index] = 1;
+          }
+        }
+        state_logger_->LogLowerBodyObservationGuard(guard_result);
+        if (guard_result.triggered) {
+          std::cout
+              << "[LowerBodyImpactDetector] event state index="
+              << state_index << " joints=" << guard_result.event_count
+              << " observation_repairs=" << guard_result.repair_count
+              << " max_dq_innovation="
+              << guard_result.max_abs_dq_innovation_rad_s
+              << " rad/s" << std::endl;
+        }
+      }
+      return true;
+    }
+
+    /**
+     * @brief Snapshot all input-interface data into local buffers.
+     *
+     * Called once per control tick **before** GatherObservations().  Copies VR
+     * positions / orientations / compliance, hand joints, upper-body targets,
+     * and external token state from the active InputInterface into member
+     * buffers so that observations, logging, and output all use a consistent
+     * snapshot.
+     *
+     * Also handles the external-token-state fallback logic:
+     *  - If encoder is loaded → token_state_data_ will be populated later
+     *    by GatherTokenState() during observation gathering.
+     *  - If no encoder and external token data arrives (ZMQ/ROS2) → copies it.
+     *  - If no encoder and no external data → error recovery depending on
+     *    initial_encoder_mode_ (-1 = stop, 0+ = fall back to local encoder).
+     */
+    bool GatherInputInterfaceData() {
+      // Snapshot input interface data into buffers before gathering observations
+      // This ensures observations, logging, and output all use the same data
+      // some of the data will be overwritten by the motion dataset if we are not using the buffered interface data
+      std::tie(has_vr_3point_data_, vr_3point_position_buffer_) = input_interface_->GetVR3PointPosition();
+      std::tie(std::ignore, vr_3point_orientation_buffer_) = input_interface_->GetVR3PointOrientation();
+      vr_3point_compliance_buffer_ = input_interface_->GetVR3PointCompliance();
+      std::tie(has_vr_5point_data_, vr_5point_position_buffer_) = input_interface_->GetVR5PointPosition();
+      std::tie(std::ignore, vr_5point_orientation_buffer_) = input_interface_->GetVR5PointOrientation();
+      std::tie(has_left_hand_data_, left_hand_joint_buffer_) = input_interface_->GetHandPose(true);
+      std::tie(has_right_hand_data_, right_hand_joint_buffer_) = input_interface_->GetHandPose(false);
+      ApplyBraincoHandCommandPolicy(
+        true, has_left_hand_data_, left_hand_joint_buffer_);
+      ApplyBraincoHandCommandPolicy(
+        false, has_right_hand_data_, right_hand_joint_buffer_);
+      std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
+      std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
+
+      auto last_update_time = input_interface_->GetLastUpdateTime();
+      if (last_update_time.has_value()) {
+        auto streaming_data_delay = std::chrono::steady_clock::now() - last_update_time.value();
+        streaming_data_delay_rolling_stats_.push(static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(streaming_data_delay).count()));
+
+        bool streaming_data_absent = streaming_data_delay > STREAMING_DATA_ABSENT_THRESHOLD;
+        streaming_data_absent_debouncer_.update(streaming_data_absent);
+      }
+
+      auto low_state_data = low_state_buffer_.GetDataWithTime();
+      bool low_state_late = (std::chrono::steady_clock::now() - low_state_data.timestamp) > LOW_STATE_LATE_THRESHOLD;
+
+      audio_thread_->SetCommand(
+        AudioCommand{
+          .streaming_data_absent = streaming_data_absent_debouncer_.state(),
+          .motor_error = error_monitor_.hasErrors(),
+          .low_state_late = low_state_late,
+          .tts_message = std::move(pending_tts_),
+          .high_temperature = high_temp_warning_,
+          .high_temperature_message = high_temp_message_,
+        });
+      pending_tts_.clear();
+
+      // if encoder mode is not -2, we need to get the token state data either from the encoder or the external token state
+      if (initial_encoder_mode_ != -2) {
+        // get the external token state from the input interface
+        bool has_ext_token_data;
+        std::vector<double> temp_token_state_data;
+        {
+            std::lock_guard<std::mutex> motion_lock(current_motion_mutex_);
+            std::tie(has_ext_token_data, temp_token_state_data) = input_interface_->GetExternalTokenState();
+        }
+
+        // if the external token state is not empty, we need to copy the data to the token_state_data_
+        // and set the is_using_encoder_ to false
+        if (has_ext_token_data) {
+          if (temp_token_state_data.empty()) {
+            std::cout << "⚠ Warning: The external token state is empty" << std::endl;
+            std::cout << "but interface says it has external token state" << std::endl;
+            std::cout << "No copying happened." << std::endl;
+            return true;
+          }
+
+          // check if the size of the temp_token_state_data is the same as the token_state_data_
+          if (temp_token_state_data.size() != token_state_data_.size()) {
+            std::cout << "⚠ Warning: The size of the external token state is not the same as what defined in the config file" << std::endl;
+            std::cout << "temp_token_state_data.size(): " << temp_token_state_data.size() << std::endl;
+            std::cout << "token_state_data_.size(): " << token_state_data_.size() << std::endl;
+            std::cout << "No copying happened." << std::endl;
+          } else {
+            std::copy(temp_token_state_data.begin(), temp_token_state_data.end(), token_state_data_.begin());
+            is_using_encoder_ = false;
+            // Safety: Mark that we've received at least one token
+            if (!first_token_received_) {
+              first_token_received_ = true;
+              std::cout << "[Token Safety] ✓ First token received! Control can now be started." << std::endl;
+            }
+            last_token_time_ = std::chrono::steady_clock::now();
+            
+            static int token_copy_count = 0;
+            if (token_copy_count % 50 == 0) {  // Warn every ~1 second
+              std::cout << "[Token Flow] Copied external tokens, tokens[0]=" << token_state_data_[0] << std::endl;
+
+            }
+            token_copy_count++;
+          }
+        } 
+        else if (!has_ext_token_data && !is_using_encoder_) { // if encoder is not used and the external token state is empty
+          if (initial_encoder_mode_ == -1) { // no encoder is loaded, we need to wait for the external tokens
+            // Token input mode: waiting for external tokens
+            auto now = std::chrono::steady_clock::now();
+            
+            // Check if we've received first token
+            if (!first_token_received_) {
+              // Warn but don't block - allow control to start
+              static auto startup_time = std::chrono::steady_clock::now();
+              auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startup_time);
+              
+              // Reset the current token_state_data_ to zeros
+              token_state_data_.assign(token_state_data_.size(), 0.0);
+              
+              static int wait_count = 0;
+              if (wait_count % 250 == 0) {  // Print every ~5 seconds (50Hz * 250 = 5s)
+                std::cout << "⚠ [Token Safety] WARNING: No tokens received yet (" 
+                          << elapsed.count() << "s elapsed). "
+                          << "Robot will use zero tokens until tokens start streaming." << std::endl;
+              }
+              wait_count++;
+            } else {
+              // We've received tokens before, check freshness
+              if (last_token_time_.has_value()) {
+                auto time_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_token_time_.value());
+                
+                if (time_since_last > TOKEN_TIMEOUT_MS) {
+                  static int stale_count = 0;
+                  if (stale_count % 50 == 0) {  // Warn every ~1 second
+                    std::cout << "⚠ [Token Safety] WARNING: No tokens received for " 
+                              << time_since_last.count() << "ms (timeout: " 
+                              << TOKEN_TIMEOUT_MS.count() << "ms). "
+                              << "Robot will use last received tokens." << std::endl;
+                  }
+                  stale_count++;
+                  // Don't pause - just warn
+                }
+              }
+            }
+            
+          } else { 
+            // if encoder mode is not -1, we need to turn on the encoder
+            std::cout << "No encoder is used and not using external tokens" << std::endl;
+            std::cout << "Turning on the encoder now" << std::endl;
+            is_using_encoder_ = true;
+          }
+        }
+      }
+      return true;
+    }
+
+    /**
+     * @brief Run the policy neural network and produce a motor command.
+     *
+     * Converts the double-precision observation buffer to float, copies it
+     * into the PolicyEngine's pinned input buffer, runs TensorRT inference,
+     * then maps the action output (IsaacLab order) to a MotorCommand
+     * (hardware order) using `g1_action_scale` and `default_angles`.
+     */
+    bool CreatePolicyCommand() {
+      // Convert double observation to float and populate policy's internal input buffer
+      auto& obs_buffer_float = policy_engine_->GetInputBuffer();
+      for (size_t i = 0; i < obs_buffer_.size(); i++) {
+        obs_buffer_float[i] = static_cast<float>(obs_buffer_[i]);
+      }
+
+      // Run policy inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
+      if (!policy_engine_->Infer()) {
+        std::cerr << "✗ Error: Control policy inference failed" << std::endl;
+        return false;
+      }
+
+      // Access actions from control policy's internal buffer (already populated by Infer)
+      auto& action_buffer = policy_engine_->GetActionBuffer();
+      float* floatarr = action_buffer.data();
+
+      MotorCommand motor_command_tmp;
+      for (int i = 0; i < G1_NUM_MOTOR; i++) {
+        const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
+        last_action[i] = static_cast<double>(floatarr[i]);
+        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i] + action_value);
+        motor_command_tmp.tau_ff.at(i) = 0.0;
+        motor_command_tmp.kp.at(i) = kps[i];
+        motor_command_tmp.kd.at(i) = kds[i];
+        motor_command_tmp.dq_target.at(i) = 0.0;
+      }
+      if (direct_upper_body_control_ && has_upper_body_data_) {
+        for (size_t i = 0; i < upper_body_joint_isaaclab_order_in_mujoco_index.size(); ++i) {
+          if (!ShouldOverrideUpperBodyIndex(i)) {
+            continue;
+          }
+          const int mujoco_idx = upper_body_joint_isaaclab_order_in_mujoco_index[i];
+          const int action_idx = isaaclab_to_mujoco[mujoco_idx];
+          double q_target = upper_body_joint_positions_buffer_[i];
+          double dq_target = upper_body_joint_velocities_buffer_[i];
+          const double action_scale = g1_action_scale[mujoco_idx];
+
+          motor_command_tmp.q_target.at(mujoco_idx) = static_cast<float>(q_target);
+          motor_command_tmp.dq_target.at(mujoco_idx) = static_cast<float>(dq_target);
+          motor_command_tmp.kp.at(mujoco_idx) =
+            static_cast<float>(motor_command_tmp.kp.at(mujoco_idx) * direct_upper_body_kp_scale_);
+          motor_command_tmp.kd.at(mujoco_idx) =
+            static_cast<float>(motor_command_tmp.kd.at(mujoco_idx) * direct_upper_body_kd_scale_);
+          if (std::abs(action_scale) > 1e-9) {
+            last_action[action_idx] = (q_target - default_angles[mujoco_idx]) / action_scale;
+          }
+        }
+      }
+      ApplyWaistAxisLocks(motor_command_tmp);
+
+      if (validate_first_policy_command_) {
+        const auto continuity =
+            control_start_safety::CheckFirstCommandContinuity(
+                held_targets_before_control_,
+                motor_command_tmp.q_target);
+        if (!continuity.valid) {
+          std::cerr
+              << "✗ Error: first policy command failed startup continuity gate: "
+              << "motor=" << continuity.motor_index
+              << " delta=" << continuity.delta_rad
+              << " rad (limit "
+              << control_start_safety::kMaxFirstCommandDeltaRad
+              << " rad). Held command remains active; stopping safely."
+              << std::endl;
+          return false;
+        }
+        validate_first_policy_command_ = false;
+        std::cout
+            << "[ControlStart] First policy command passed "
+            << control_start_safety::kMaxFirstCommandDeltaRad
+            << " rad hard continuity gate"
+            << std::endl;
+      }
+
+      if (!ApplyLeftShoulderBackOffset(motor_command_tmp)) {
+        return false;
+      }
+
+      const bool startup_blend_active =
+          startup_blend_ticks_remaining_ > 0;
+      if (startup_blend_active) {
+        // The hard held-target continuity gate belongs only to the first
+        // policy command. Planner targets evolve while this one-second blend
+        // is running and may legitimately move farther than the initial
+        // threshold from the held pose. Reapplying the first-command gate on
+        // every tick falsely stopped a healthy handoff before support release.
+        // BlendCommandFromHeld still rejects non-finite data and guarantees
+        // that the command actually sent starts at the held pose and reaches
+        // the live target on the final tick.
+        const std::size_t completed_ticks =
+            control_start_safety::kStartupBlendTicks -
+            startup_blend_ticks_remaining_ + 1;
+        const auto blend = control_start_safety::BlendCommandFromHeld(
+            held_targets_before_control_,
+            motor_command_tmp.q_target,
+            completed_ticks);
+        if (!blend.valid) {
+          std::cerr
+              << "✗ Error: invalid startup command blend at motor="
+              << blend.motor_index
+              << "; held command remains active; stopping safely."
+              << std::endl;
+          return false;
+        }
+
+        // The observation's last_action must describe the command actually
+        // sent, not the pre-blend network output.
+        UpdateLastActionFromMotorCommand(motor_command_tmp);
+
+        if (startup_blend_ticks_remaining_ ==
+            control_start_safety::kStartupBlendTicks) {
+          std::cout
+              << "[ControlStart] Bumpless policy handoff active for "
+              << control_start_safety::kStartupBlendTicks
+              << " ticks (held target -> live policy target)"
+              << std::endl;
+        }
+        --startup_blend_ticks_remaining_;
+        if (startup_blend_ticks_remaining_ == 0) {
+          std::cout
+              << "[ControlStart] Bumpless policy handoff complete"
+              << std::endl;
+        }
+      }
+
+      if (!ApplyLowerBodyImpactDamper(
+              motor_command_tmp, !startup_blend_active)) {
+        return false;
+      }
+
+      if (!ApplyLowerBodyBrakingPrioritySlew(
+              motor_command_tmp, !startup_blend_active)) {
+        return false;
+      }
+
+      if (!ApplyLowerBodyEnergyGovernor(
+              motor_command_tmp, !startup_blend_active)) {
+        return false;
+      }
+
+      motor_command_buffer_.SetData(motor_command_tmp);
+      return true;
+    }
+
+    /**
+     * @brief Advance the playback cursor and blend planner output.
+     *
+     * Called at the end of each control tick.  Two cases:
+     *
+     * 1. **Planner active**: Checks if a new planner animation is available.
+     *    If so, blends it into the existing planner_motion_ using a linear
+     *    cross-fade over 8 frames.  Then advances current_frame_ by 1.
+     *
+     * 2. **Reference-motion mode**: Advances current_frame_ by 1.  Clamps or
+     *    resets to 0 when the motion ends (except for "streamed" motions,
+     *    which hold the last valid frame while waiting for new data).
+     *
+     * @return True on success.
+     */
+    bool CurrentFrameAdvancement(bool advance_frame = true) {
+      // get current motion and frame from planner when planner is enabled and initialized
+      std::lock_guard<std::mutex> motion_lock(current_motion_mutex_);
+      if (planner_ && planner_->planner_state_.enabled && planner_->planner_state_.initialized) {
+        std::lock_guard<std::mutex> planner_lock(planner_->planner_motion_mutex_);
+        
+        // Check if the planner thread has finished generating a valid animation:
+        if (planner_->motion_available_ && planner_->planner_motion_50hz_.timesteps > 0) {
+          
+          const auto &planner_motion_gen = planner_->planner_motion_50hz_;
+          planner_->motion_available_ = false;
+
+          // special case if this is the first time we're receiving a planner motion:
+          bool is_the_first_time = false;
+          bool success = false;
+          if(planner_motion_->timesteps == 0)
+          {
+            // step through the frames and copy the animation over:
+            for(int f = 0; f < planner_motion_gen.timesteps; ++f)
+            {
+              std::copy(
+                planner_motion_gen.JointPositions(f),
+                planner_motion_gen.JointPositions(f) + planner_motion_gen.GetNumJoints(),
+                planner_motion_->JointPositions(f)
+              );
+
+              std::copy(
+                planner_motion_gen.JointVelocities(f),
+                planner_motion_gen.JointVelocities(f) + planner_motion_gen.GetNumJoints(),
+                planner_motion_->JointVelocities(f)
+              );
+
+              planner_motion_->BodyPositions(f)[0] = planner_motion_gen.BodyPositions(f)[0];
+              planner_motion_->BodyQuaternions(f)[0] = planner_motion_gen.BodyQuaternions(f)[0];
+            }
+            planner_motion_->timesteps = planner_motion_gen.timesteps;
+            success = true;
+            is_the_first_time = true;
+          }
+          else
+          {
+
+            auto fgen = planner_->gen_frame_;
+
+            // Ok, a new planner animation is available. We want to do these things:
+            //  * rebase the old planner_motion_ so current_frame_ is at frame 0
+            //  * fade in the new planner animation, starting at frame fgen - current_frame_
+            //    (or frame 0 if fgen < current_frame_)
+
+            // The newly generated animation starts at frame fgen - current_frame_ on this
+            // new timeline, so the total length of the animation will be this:
+            auto new_anim_length = fgen - current_frame_ + planner_motion_gen.timesteps;
+
+            // guess we've got to sit this out if things arrived so late that we don't have any frames
+            // we can copy over...
+            if(new_anim_length > 0)
+            {
+              // We want to insert a region where the old animation is blended with the new one
+              // using a linearly decaying weight. If current_frame_ > fgen, this needs to start
+              // immediately, otherwise it should start at at frame fgen - current_frame_:
+              auto blend_start_frame = std::max(0, fgen - current_frame_);
+
+              // choosing 8 for the width of the blend region because this is about the size of the
+              // context we use for conditioning the planner model
+              const int blend_num_frames = 8;
+
+              // step through the frames and blend the animations:
+              for(int f = 0; f < new_anim_length; ++f)
+              {
+                // corresponding frames in the old animation and the new one from the
+                // planner that we're blending in:
+                int f_old = f + current_frame_;
+                int f_new = f_old - fgen;
+
+                // clamp to valid ranges:
+                f_old = std::clamp(f_old, 0, planner_motion_->timesteps - 1);
+                f_new = std::clamp(f_new, 0, planner_motion_gen.timesteps - 1);
+                
+                // calculate linearly decaying blend weight:
+                double w_new = double(f - blend_start_frame) / blend_num_frames;
+                w_new = std::clamp(w_new, 0.0, 1.0);
+                double w_old = 1.0 - w_new;
+
+                // blend joint_positions + joint_velocities:
+                for(size_t j=0; j < planner_motion_->GetNumJoints(); ++j)
+                {
+                  planner_motion_->JointPositions(f)[j] = 
+                    w_old * planner_motion_->JointPositions(f_old)[j] +
+                    w_new * planner_motion_gen.JointPositions(f_new)[j];
+                  planner_motion_->JointVelocities(f)[j] = 
+                      w_old * planner_motion_->JointVelocities(f_old)[j] +
+                      w_new * planner_motion_gen.JointVelocities(f_new)[j];
+                }
+
+                // blend the global xyz position:
+                for(int j=0; j < 3; ++j)
+                {
+                  planner_motion_->BodyPositions(f)[0][j] = 
+                      w_old * planner_motion_->BodyPositions(f_old)[0][j] +
+                      w_new * planner_motion_gen.BodyPositions(f_new)[0][j];
+                }
+                
+                // blend the global rotation quaternion using a slerp:
+                std::array<double, 4> q0 = planner_motion_->BodyQuaternions(f_old)[0];
+                std::array<double, 4> q1 = planner_motion_gen.BodyQuaternions(f_new)[0];
+                planner_motion_->BodyQuaternions(f)[0] = quat_slerp_d(q0, q1, w_new);
+              }
+
+              // set the new timestep count and reset the current frame to 0:
+              planner_motion_->timesteps = new_anim_length;
+              success = true;
+            }
+          }
+
+          if(success)
+          {
+            if(planner_motion_file_)
+            {
+              // log the motion that we just copied/blended over:
+              for(int frame = 0; frame < planner_motion_->timesteps; frame++) {
+                (*planner_motion_file_) << planner_motion_->BodyPositions(frame)[0][0] << ",";
+                (*planner_motion_file_) << planner_motion_->BodyPositions(frame)[0][1] << ",";
+                (*planner_motion_file_) << planner_motion_->BodyPositions(frame)[0][2] << ",";
+
+                (*planner_motion_file_) << planner_motion_->BodyQuaternions(frame)[0][0] << ",";
+                (*planner_motion_file_) << planner_motion_->BodyQuaternions(frame)[0][1] << ",";
+                (*planner_motion_file_) << planner_motion_->BodyQuaternions(frame)[0][2] << ",";
+                (*planner_motion_file_) << planner_motion_->BodyQuaternions(frame)[0][3] << ",";
+
+                for(int i = 0; i < 29; i++) {
+                  (*planner_motion_file_) << planner_motion_->JointPositions(frame)[isaaclab_to_mujoco[i]] << ",";
+                }
+
+                (*planner_motion_file_) << std::endl;
+              }
+
+              // insert a blank line to separate motions:
+              (*planner_motion_file_) << std::endl;
+            }
+
+            // switch the current motion to planner_motion:
+            current_frame_ = 0;
+            // Assign shared_ptr directly - planner_motion_ is already a shared_ptr
+            current_motion_ = planner_motion_;
+            idle_readapt_stored_ = false;
+            if(is_the_first_time) {
+              reinitialize_heading_ = true;
+            }
+          }
+        }
+          
+        // Frame advancement at control frequency (50Hz) for smooth playback
+        if (advance_frame && current_motion_->timesteps > 0 && operator_state.play) {
+          int new_frame = current_frame_ + 1;
+            if (new_frame >= current_motion_->timesteps) {
+              new_frame = current_motion_->timesteps - 1; // Clamp to last frame
+              // Error-based readaptation in idle mode with double-threshold state machine.
+              // IDLE: do nothing. ADAPTING: blend toward robot state. RECOVERING: blend toward planner target.
+              auto movement_state_data = movement_state_buffer_.GetDataWithTime().data;
+              if(movement_state_data && movement_state_data->locomotion_mode == static_cast<int>(LocomotionMode::IDLE)) {
+                auto low_state = low_state_buffer_.GetDataWithTime().data;
+                if (low_state) {
+                  auto motor_state = low_state->motor_state();
+
+                  // Store original planner targets on first entry
+                  if (!idle_readapt_stored_) {
+                    for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
+                      idle_readapt_original_targets_[idx] = planner_motion_->JointPositions(new_frame)[idx];
+                    }
+                    idle_readapt_stored_ = true;
+                    idle_readapt_state_ = IdleReadaptState::IDLE;
+                  }
+
+                  // Compute average error across all lower-body joints
+                  double total_error = 0.0;
+                  for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
+                    total_error += std::abs(planner_motion_->JointPositions(new_frame)[idx]
+                                            - motor_state[mujoco_to_isaaclab[idx]].q());
+                  }
+                  double avg_error = total_error / static_cast<double>(lower_body_joint_isaaclab_order_in_isaaclab_index.size());
+
+                  // State transitions
+                  switch (idle_readapt_state_) {
+                    case IdleReadaptState::IDLE:
+                      if (avg_error > kAdaptTrigger) {
+                        idle_readapt_state_ = IdleReadaptState::ADAPTING;
+                      } else if (avg_error < kRecoverTrigger) {
+                        idle_readapt_state_ = IdleReadaptState::RECOVERING;
+                      }
+                      break;
+                    case IdleReadaptState::ADAPTING:
+                      if (avg_error < kAdaptStop) {
+                        idle_readapt_state_ = IdleReadaptState::IDLE;
+                      }
+                      break;
+                    case IdleReadaptState::RECOVERING:
+                      if (avg_error > kAdaptTrigger) {
+                        idle_readapt_state_ = IdleReadaptState::ADAPTING;
+                      }
+                      break;
+                  }
+
+                  // Apply blend based on current state
+                  if (idle_readapt_state_ == IdleReadaptState::ADAPTING) {
+                    for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
+                      double actual = motor_state[mujoco_to_isaaclab[idx]].q();
+                      planner_motion_->JointPositions(new_frame)[idx] =
+                          0.98 * planner_motion_->JointPositions(new_frame)[idx] + 0.02 * actual;
+                    }
+                  } else if (idle_readapt_state_ == IdleReadaptState::RECOVERING) {
+                    for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
+                      planner_motion_->JointPositions(new_frame)[idx] =
+                          0.98 * planner_motion_->JointPositions(new_frame)[idx] + 0.02 * idle_readapt_original_targets_[idx];
+                    }
+                  }
+                  // IDLE state: do nothing
+                }
+              }
+            }
+          current_frame_ = new_frame;
+        }
+      }
+
+      // Update motion frame playback for non-planner motion
+      bool use_planner_motion = (current_motion_ && current_motion_ == planner_motion_);
+      if (advance_frame && !use_planner_motion && current_motion_ &&
+          current_motion_->timesteps > 0 && operator_state.play) {
+        if (current_motion_->name == "streamed") {
+          // ZMQ streamed motions are sliding windows. Advance the local playback
+          // cursor so StreamedMotionMerger can move the global playback frame,
+          // but keep enough future frames for encoder observations.
+          current_frame_++;
+          const int required_lookahead = std::max(1, saved_frame_for_observation_window_);
+          const int max_streamed_frame =
+              std::max(0, static_cast<int>(current_motion_->timesteps) - required_lookahead);
+          if (current_frame_ > max_streamed_frame) {
+            current_frame_ = max_streamed_frame;
+          }
+        } else {
+          // Update display motion current frame
+          current_frame_++;
+          // Check if motion completed (reached the end)
+          if (current_frame_ >= current_motion_->timesteps) {
+            operator_state.play = false;
+            if (current_motion_ ->name != "temporary_motion") {
+              std::cout << "______________________________________________________" << std::endl;
+              std::cout << "Motion index: " << motion_reader_.current_motion_index_ << " : " << current_motion_->name << " completed." << std::endl;
+              std::cout << "______________________________________________________" << std::endl;
+            } else {
+              std::cout << "Temporary motion completed." << std::endl;
+            }
+            current_frame_ = 0; // Reset to beginning
+            // Total reset: both base quaternion and delta heading
+            reinitialize_heading_ = true;
+            std::cout << "Reset to frame 0." << std::endl;
+          }
+        }
+      }
+      return true;
+    }
+
+    /**
+     * @brief Input thread body (100 Hz).
+     *
+     * 1. Calls input_interface_->update() to poll keyboard / gamepad / network.
+     * 2. Forwards raw gamepad data from LowState to the active interface.
+     * 3. Calls input_interface_->handle_input() to translate flags into
+     *    system-state changes (motion switching, planner commands, etc.).
+     * 4. Optionally records / plays back input state for offline replay.
+     */
+    void Input() {
+      if (operator_state.stop) { return; }
+      
+      // Update input interface (poll for new data)
+      input_interface_->update();
+      
+      // Handle input using the interface - input handler updates everything directly
+      const std::shared_ptr<const LowState_> low_state_data = low_state_buffer_.GetDataWithTime().data;
+      std::array<double, 4> current_quat = {0.0, 0.0, 0.0, 1.0};
+      if(low_state_data) {
+        current_quat = float_to_double<4>(low_state_data->imu_state().quaternion());
+      }
+      
+      // Update gamepad data if using gamepad interface (or manager)
+      if (auto gamepad = dynamic_cast<unitree::common::Gamepad*>(input_interface_.get())) {
+        if(low_state_data) {
+          memcpy(gamepad->gamepad_data.buff, &low_state_data->wireless_remote()[0], 40);
+        }else{
+          for(int i = 0; i < 40; i++) {
+            gamepad->gamepad_data.buff[i] = 0;
+          }
+        }
+      }
+      else if (auto manager = dynamic_cast<InterfaceManager*>(input_interface_.get())) {
+        if (low_state_data) {
+          manager->UpdateGamepadRemoteData(&low_state_data->wireless_remote()[0], 40);
+        } else {
+          uint8_t zeros[40] = {0};
+          manager->UpdateGamepadRemoteData(zeros, 40);
+        }
+      }
+      else if (auto gamepad_mgr = dynamic_cast<GamepadManager*>(input_interface_.get())) {
+        if (low_state_data) {
+          gamepad_mgr->UpdateGamepadRemoteData(&low_state_data->wireless_remote()[0], 40);
+        } else {
+          uint8_t zeros[40] = {0};
+          gamepad_mgr->UpdateGamepadRemoteData(zeros, 40);
+        }
+      }
+    
+     
+      bool has_planner = static_cast<bool>(planner_);
+      
+      if (has_planner) {
+        input_interface_->handle_input(motion_reader_, current_motion_, current_frame_, operator_state,
+                                      reinitialize_heading_, heading_state_buffer_, has_planner, planner_->planner_state_, movement_state_buffer_, current_motion_mutex_, report_temperature_);
+      } else {
+        PlannerState planner_state{false, false};
+        input_interface_->handle_input(motion_reader_, current_motion_, current_frame_, operator_state,
+                                      reinitialize_heading_, heading_state_buffer_, has_planner, planner_state, movement_state_buffer_, current_motion_mutex_, report_temperature_);
+      }
+
+      if (playback_input_file_ && program_state_ == ProgramState::CONTROL) {
+        std::string line;
+        PlannerState ps{false, false};
+        auto &planner_state = has_planner ? planner_->planner_state_ : ps;
+        if (std::getline(*playback_input_file_, line)) {
+
+          MovementState movement_state;
+          std::istringstream iss(line);
+          std::string token;
+          std::getline(iss, token, ',');
+          motion_reader_.current_motion_index_ = std::stoi(token);
+          std::getline(iss, token, ',');
+          //current_frame_ = std::stoi(token);
+          std::getline(iss, token, ',');
+          operator_state.play = std::stoi(token);
+          std::getline(iss, token, ',');
+          operator_state.start = std::stoi(token);
+          std::getline(iss, token, ',');
+          operator_state.stop = std::stoi(token);
+          std::getline(iss, token, ',');
+          planner_state.enabled = std::stoi(token);
+          std::getline(iss, token, ',');
+          planner_state.initialized = std::stoi(token);
+          std::getline(iss, token, ',');
+          movement_state.locomotion_mode = std::stoi(token);
+          std::getline(iss, token, ',');
+          movement_state.movement_direction[0] = std::stof(token);
+          std::getline(iss, token, ',');
+          movement_state.movement_direction[1] = std::stof(token);
+          std::getline(iss, token, ',');
+          movement_state.movement_direction[2] = std::stof(token);
+          std::getline(iss, token, ',');
+          movement_state.facing_direction[0] = std::stof(token);
+          std::getline(iss, token, ',');
+          movement_state.facing_direction[1] = std::stof(token);
+          std::getline(iss, token, ',');
+          movement_state.facing_direction[2] = std::stof(token);
+          std::getline(iss, token, ',');
+          movement_state.movement_speed = std::stof(token);
+          movement_state_buffer_.SetData(movement_state);
+
+          if(!(has_planner && planner_state.enabled && planner_state.initialized)) {
+            std::lock_guard<std::mutex> lock(current_motion_mutex_);
+            current_motion_ = motion_reader_.GetMotionShared(motion_reader_.current_motion_index_);
+          }
+        }
+      }
+
+      if (record_input_file_ && program_state_ == ProgramState::CONTROL) {
+        auto movement_state_data = movement_state_buffer_.GetDataWithTime();
+        PlannerState ps{false, false};
+        const auto &planner_state = has_planner ? planner_->planner_state_ : ps;
+        (*record_input_file_) << motion_reader_.current_motion_index_ << ",";
+        (*record_input_file_) << current_frame_ << ",";
+        (*record_input_file_) << operator_state.play << ",";
+        (*record_input_file_) << operator_state.start << ",";
+        (*record_input_file_) << operator_state.stop << ",";
+
+        (*record_input_file_) << planner_state.enabled << ",";
+        (*record_input_file_) << planner_state.initialized << ",";
+        
+        (*record_input_file_) << movement_state_data.data->locomotion_mode << ",";
+        (*record_input_file_) << movement_state_data.data->movement_direction[0] << ",";
+        (*record_input_file_) << movement_state_data.data->movement_direction[1] << ",";
+        (*record_input_file_) << movement_state_data.data->movement_direction[2] << ",";
+        (*record_input_file_) << movement_state_data.data->facing_direction[0] << ",";
+        (*record_input_file_) << movement_state_data.data->facing_direction[1] << ",";
+        (*record_input_file_) << movement_state_data.data->facing_direction[2] << ",";
+        (*record_input_file_) << movement_state_data.data->movement_speed << ",";
+        (*record_input_file_) << movement_state_data.data->height << ",";
+        (*record_input_file_) << std::endl;
+      }
+
+    }
+
+    /**
+     * @brief Planner thread body (10 Hz).
+     *
+     * When the planner is enabled:
+     *  - First call: initialises the planner with the robot's current pose
+     *    (base quaternion + joint positions) and runs an initial inference.
+     *  - Subsequent calls: reads the latest MovementState from the
+     *    movement_state_buffer_, decides whether a replan is needed (mode
+     *    change, direction change, or periodic timer), and if so calls
+     *    UpdatePlanning() which runs TensorRT inference and produces a new
+     *    30 Hz trajectory (resampled to 50 Hz by the base class).
+     *
+     * Replan intervals vary by locomotion type:
+     *  - Running: every 0.1 s
+     *  - Crawling: every 0.2 s
+     *  - Boxing: every 1.0 s
+     *  - Default: every 1.0 s
+     *
+     * The generated animation is stored in planner_->planner_motion_50hz_
+     * and picked up by CurrentFrameAdvancement() in the control thread.
+     */
+    void Planner() {
+      if (operator_state.stop) { return; }
+      auto low_state_data = low_state_buffer_.GetDataWithTime();
+      const std::shared_ptr<const LowState_> ls = low_state_data.data;
+      
+      if (planner_ && planner_->planner_state_.enabled) {
+        if (ls) {
+          if (!planner_->planner_state_.initialized) {
+            try {
+              std::cout << "Initializing planner..." << std::endl;
+              planner_motion_->timesteps = 0;
+              std::cout << "Setting planner_motion encode mode to " << initial_encoder_mode_ << std::endl;
+              planner_motion_->SetEncodeMode(initial_encoder_mode_);
+              // Get base quaternion and joint positions from robot state
+              std::array<double, 4> base_quat = float_to_double<4>(ls->imu_state().quaternion());
+              std::array<double, 29> joint_positions;
+              for (int i = 0; i < G1_NUM_MOTOR; i++) {
+                joint_positions[i] = ls->motor_state()[i].q();
+              }
+              // Initialize planner with robot state
+              if(!planner_->Initialize(base_quat, joint_positions)) {
+                throw std::runtime_error("Error when initializing planner");
+              }
+
+              std::cout << "Planner initialized successfully!" << std::endl;
+              
+              // Start recording session for planner motion (if enabled)
+              if (enable_motion_recording_) {
+                if (planner_motion_recorder_.IsActive()) {
+                  planner_motion_recorder_.Finalize();
+                }
+                planner_motion_recorder_.StartSession("planner_motion");
+              }
+              
+            } catch (const std::exception& e) {
+              std::cout << "✗ Error initializing planner: " << e.what() << std::endl;
+              std::cout << "Disabling planner to prevent further errors..." << std::endl;
+              planner_->planner_state_.enabled = false;
+              planner_->planner_state_.initialized = false;
+              planner_motion_->timesteps = 0;
+              // reset operator state and current motion and frame
+              {
+                std::lock_guard<std::mutex> lock(current_motion_mutex_);
+                operator_state.play = false;
+                current_frame_ = 0;
+                current_motion_ = motion_reader_.GetMotionShared(motion_reader_.current_motion_index_);
+              }
+              // Finalize recording if initialization failed
+              if (planner_motion_recorder_.IsActive()) {
+                planner_motion_recorder_.Finalize();
+              }
+              
+              return;
+            }
+          } 
+          else {
+            if (planner_motion_->timesteps == 0) {
+              std::cout << "Planner() no data in planner_motion_, returning. If control loop is started, this should only happen once when planner is initialized. If control loop is not started, this should keep returning until control loop is started." << std::endl;
+              return;
+            }
+            bool need_replan = false;
+
+            // bool of different reason to replan
+            bool time_to_replan = false;
+            bool facing_direction_changed = false;
+            bool height_changed = false;
+            bool movement_mode_changed = false;
+            bool movement_speed_changed = false;
+            bool movement_direction_changed = false;
+            bool under_static_motion_mode = is_static_motion_mode(static_cast<LocomotionMode>(last_movement_state_.locomotion_mode));
+
+            // Read current movement mode from thread-safe buffer
+            auto movement_state_data = movement_state_buffer_.GetDataWithTime();
+
+            if (movement_state_data.data) {
+              // bool of checking if facing direction is changed
+              facing_direction_changed = movement_state_data.data->facing_direction[0] != last_movement_state_.facing_direction[0] || 
+                                          movement_state_data.data->facing_direction[1] != last_movement_state_.facing_direction[1] || 
+                                          movement_state_data.data->facing_direction[2] != last_movement_state_.facing_direction[2];
+              // bool of checking if height is changed
+              height_changed = movement_state_data.data->height != last_movement_state_.height;
+              // bool of checking if movement mode is changed
+              movement_mode_changed = movement_state_data.data->locomotion_mode != last_movement_state_.locomotion_mode;
+              // bool of checking if movement speed is changed
+              movement_speed_changed = movement_state_data.data->movement_speed != last_movement_state_.movement_speed;
+              // bool of checking if movement direction is changed
+              movement_direction_changed = movement_state_data.data->movement_direction[0] != last_movement_state_.movement_direction[0] || 
+                                          movement_state_data.data->movement_direction[1] != last_movement_state_.movement_direction[1] || 
+                                          movement_state_data.data->movement_direction[2] != last_movement_state_.movement_direction[2];
+              // bool of checking if the last movement value is under the static motion mode
+              under_static_motion_mode = is_static_motion_mode(static_cast<LocomotionMode>(movement_state_data.data->locomotion_mode));
+            }
+            bool is_running = movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RUN);
+            bool is_boxing = movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::LEFT_PUNCH) ||
+                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RIGHT_PUNCH) ||
+                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RANDOM_PUNCH) ||
+                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::LEFT_HOOK) ||
+                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RIGHT_HOOK);
+            bool is_crawling = movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::CRAWLING);
+            // increment replan interval counter
+            replan_interval_counter_ += planner_dt_;
+            // check if need to replan
+            if(is_running) {
+              if(replan_interval_counter_ >= replan_interval_running_) {
+                // reset replan interval counter
+                replan_interval_counter_ = 0.0f;
+                // set need to replan to true
+                time_to_replan = true;
+              }
+            } else if(is_crawling) {
+              if(replan_interval_counter_ >= replan_interval_crawling_) {
+                // reset replan interval counter
+                replan_interval_counter_ = 0.0f;
+                // set need to replan to true
+                time_to_replan = true;
+              }
+            } else if(is_boxing) {
+              if(replan_interval_counter_ >= replan_interval_boxing_) {
+                // reset replan interval counter
+                replan_interval_counter_ = 0.0f;
+                // set need to replan to true
+                time_to_replan = true;
+              }
+            } else {
+              // ONBOARD_SLOW_WALK_UNIFORMITY: preserve the trained encoder window.
+              const bool uniform_slow_walk =
+                  movement_state_data.data->locomotion_mode == 1 &&
+                  movement_state_data.data->movement_speed > 0.0f;
+              if(replan_interval_counter_ >= (uniform_slow_walk ? 0.5f : replan_interval_)) {
+                // reset replan interval counter
+                replan_interval_counter_ = 0.0f;
+                // set need to replan to true
+                time_to_replan = true;
+              }
+            }
+            
+            if (movement_mode_changed || facing_direction_changed || height_changed) {
+              need_replan = true;
+            } else if (!under_static_motion_mode && (movement_speed_changed || movement_direction_changed || (time_to_replan && movement_state_data.data->movement_speed != 0))) {
+              need_replan = true;
+            }
+
+            if (!need_replan) {
+              // no need to replan, return
+              return;
+            }
+
+            auto gather_input_start_time = std::chrono::steady_clock::now(); 
+            
+            int current_mode = static_cast<int>(LocomotionMode::IDLE);
+            std::array<float, 3> movement_direction = {0.0f, 0.0f, 0.0f};
+            std::array<float, 3> facing_direction = {1.0f, 0.0f, 0.0f};  // Default forward
+            float movement_speed = -1.0f;
+            float target_height = -1.0f;
+            
+            if (movement_state_data.data) {
+              current_mode = movement_state_data.data->locomotion_mode;
+              movement_direction[0] = movement_state_data.data->movement_direction[0];
+              movement_direction[1] = movement_state_data.data->movement_direction[1]; 
+              movement_direction[2] = movement_state_data.data->movement_direction[2];
+              facing_direction[0] = movement_state_data.data->facing_direction[0];
+              facing_direction[1] = movement_state_data.data->facing_direction[1];
+              facing_direction[2] = movement_state_data.data->facing_direction[2];
+              movement_speed = movement_state_data.data->movement_speed;
+              target_height = movement_state_data.data->height;
+
+              // Update last movement state for next iteration comparison (update here to avoid missing the update)
+              last_movement_state_.locomotion_mode = movement_state_data.data->locomotion_mode;
+              last_movement_state_.movement_direction = movement_state_data.data->movement_direction;
+              last_movement_state_.facing_direction = movement_state_data.data->facing_direction;
+              last_movement_state_.movement_speed = movement_state_data.data->movement_speed;
+              last_movement_state_.height = movement_state_data.data->height;
+            }
+            
+            try {
+              // Update planning with current movement parameters
+
+              // gotta make sure planner_motion actually has data...
+              if(!planner_->UpdatePlanning(
+                current_frame_,
+                planner_motion_,
+                current_mode,
+                movement_speed,
+                target_height,
+                movement_direction,
+                facing_direction
+              )) {
+                throw std::runtime_error("Error when updating planner");
+              }
+              
+            } catch (const std::exception& e) {
+              std::cout << "✗ Error during planning update: " << e.what() << std::endl;
+              std::cout << "Disabling planner to prevent further errors..." << std::endl;
+              planner_->planner_state_.enabled = false;
+              planner_->planner_state_.initialized = false;
+              planner_motion_->timesteps = 0;
+              // reset operator state and current motion and frame
+              {
+                std::lock_guard<std::mutex> lock(current_motion_mutex_);
+                operator_state.play = false;
+                current_frame_ = 0;
+                current_motion_ = motion_reader_.GetMotionShared(motion_reader_.current_motion_index_);
+              }
+              // Finalize recording if planning update failed
+              if (planner_motion_recorder_.IsActive()) {
+                planner_motion_recorder_.Finalize();
+              }
+              
+              return;
+            }
+          }
+        }
+      } else if (planner_ && !planner_->planner_state_.enabled) {
+        // since the planner is disabled, we make sure to reset initialized and timesteps
+        planner_->planner_state_.initialized = false;
+        
+        // Finalize planner motion recording when planner is disabled
+        if (planner_motion_recorder_.IsActive()) {
+          planner_motion_recorder_.Finalize();
+        }
+        
+        return;
+      }
+    }
+
+    bool PlannerMotionIsActiveForControlStart() {
+      std::lock_guard<std::mutex> lock(current_motion_mutex_);
+      return current_motion_ && current_motion_ == planner_motion_ &&
+             current_motion_->name == "planner_motion" &&
+             current_motion_->timesteps > 0;
+    }
+
+    void ReportControlStartGatePhase(
+        control_start_safety::GatePhase phase) {
+      if (phase == last_reported_start_gate_phase_) {
+        return;
+      }
+      last_reported_start_gate_phase_ = phase;
+      std::cout << "[ControlStart] "
+                << control_start_safety::PhaseName(phase);
+      if (phase ==
+          control_start_safety::GatePhase::WarmingMeasuredHistory) {
+        std::cout << " (need "
+                  << control_start_safety::kRequiredMeasuredHistorySamples
+                  << " fresh 50 Hz samples)";
+      }
+      std::cout << std::endl;
+    }
+
+    /**
+     * @brief Prepare a planner-backed start without running the control policy.
+     *
+     * ZMQ planner startup happens concurrently with this 50 Hz thread.  Keep
+     * the command writer on InitControl's standing target while we install the
+     * first generated planner motion and fill the observation history with
+     * measured samples.  This prevents the preloaded reference motion from
+     * leaking into the first policy tick.
+     */
+    bool PreparePlannerControlStart() {
+      if (!input_interface_->RequiresPlannerForControlStart()) {
+        control_start_gate_.Reset();
+        ReportControlStartGatePhase(
+            control_start_safety::GatePhase::Idle);
+        return true;
+      }
+
+      if (!planner_) {
+        std::cerr
+            << "[ControlStart] ERROR: planner-backed startup requested "
+            << "without a planner model" << std::endl;
+        operator_state.stop = true;
+        return false;
+      }
+
+      // WAIT_FOR_CONTROL must never advance the newly installed planner
+      // motion. The input thread may set play=true after observing the motion,
+      // so CurrentFrameAdvancement(false) also disables advancement internally.
+      {
+        std::lock_guard<std::mutex> lock(current_motion_mutex_);
+        operator_state.play = false;
+      }
+
+      if (planner_->planner_state_.enabled &&
+          planner_->planner_state_.initialized &&
+          !PlannerMotionIsActiveForControlStart()) {
+        if (!CurrentFrameAdvancement(/*advance_frame=*/false)) {
+          std::cerr
+              << "[ControlStart] ERROR: failed to install planner motion"
+              << std::endl;
+          operator_state.stop = true;
+          return false;
+        }
+      }
+
+      control_start_safety::GateInput gate_input{
+          .start_requested = operator_state.start,
+          .planner_required = true,
+          .planner_enabled = planner_->planner_state_.enabled,
+          .planner_initialized = planner_->planner_state_.initialized,
+          .planner_motion_active = PlannerMotionIsActiveForControlStart(),
+          .measured_history_samples =
+              state_logger_ ? state_logger_->size() : 0,
+      };
+      auto phase = control_start_gate_.Update(gate_input);
+      ReportControlStartGatePhase(phase);
+
+      if (phase ==
+          control_start_safety::GatePhase::WarmingMeasuredHistory) {
+        if (!GatherRobotStateToLogger()) {
+          std::cerr
+              << "[ControlStart] ERROR: could not gather measured startup "
+              << "history; refusing to enter CONTROL" << std::endl;
+          operator_state.stop = true;
+          return false;
+        }
+        gate_input.measured_history_samples = state_logger_->size();
+        phase = control_start_gate_.Update(gate_input);
+        ReportControlStartGatePhase(phase);
+      }
+
+      if (phase != control_start_safety::GatePhase::Ready) {
+        return false;
+      }
+
+      const auto held_command =
+          motor_command_buffer_.GetDataWithTime().data;
+      if (!held_command) {
+        std::cerr
+            << "[ControlStart] ERROR: no held InitControl command is "
+            << "available; refusing to enter CONTROL" << std::endl;
+        operator_state.stop = true;
+        return false;
+      }
+      held_targets_before_control_ = held_command->q_target;
+      validate_first_policy_command_ = true;
+      startup_blend_ticks_remaining_ =
+          control_start_safety::kStartupBlendTicks;
+      {
+        std::lock_guard<std::mutex> lock(current_motion_mutex_);
+        operator_state.play = true;
+      }
+      return true;
+    }
+
+    /**
+     * @brief Control thread body (50 Hz) — the main real-time control loop.
+     *
+     * State machine:
+     *  - INIT: ramps the robot to the default standing pose (InitControl).
+     *  - WAIT_FOR_CONTROL: idle, waiting for operator "start" signal.
+     *  - CONTROL: each tick performs the full pipeline:
+     *    1. GatherRobotStateToLogger — read IMU + joints, log to StateLogger.
+     *    2. GatherInputInterfaceData — snapshot VR / hand / token data.
+     *    3. GatherObservations — fill the policy observation vector.
+     *    4. LogPostState — append encoder token to the latest log entry.
+     *    5. CreatePolicyCommand — run TensorRT policy, produce MotorCommand.
+     *    6. Update Dex3 hands (max-close ratio + joint targets).
+     *    7. Publish state to all output interfaces (ZMQ / ROS2).
+     *    8. Handle motion recording (streamed + planner).
+     *    9. CurrentFrameAdvancement — advance playback cursor, blend planner.
+     *    10. Periodic timing log every 50 ticks (~1 s).
+     */
+    void Control() {
+      if (operator_state.stop) { return; }
+
+      switch (program_state_) {
+        case ProgramState::INIT:
+          if (!InitControl()) {
+            static int init_wait_report_count = 0;
+            if (init_wait_report_count++ % 50 == 0) {
+              std::cout << "[INIT] Waiting for valid, fault-free robot state" << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          }
+          // Re-publish robot_config so late-joining subscribers can receive it
+          // before the policy is activated (ZMQ PUB has no persistence).
+          for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
+          break;
+
+        case ProgramState::WAIT_FOR_CONTROL:
+          if (!CheckSafety()) {
+            std::cout << "[ERROR] Safety check failed, cannot start control." << std::endl;
+            operator_state.stop = true;
+            break;
+          }
+
+          // Re-publish robot_config so late-joining subscribers can receive it
+          // before the policy is activated (ZMQ PUB has no persistence).
+          for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
+          if (!operator_state.start) {
+            control_start_gate_.Reset();
+            ReportControlStartGatePhase(
+                control_start_safety::GatePhase::Idle);
+            break;
+          }
+          if (operator_state.start) {
+            if (!PreparePlannerControlStart()) {
+              break;
+            }
+            InitializeWaistLockTargets();
+            // Warn if starting control in token mode without tokens, but allow it
+            if (initial_encoder_mode_ == -1 && !first_token_received_) {
+              static int warn_count = 0;
+              if (warn_count % 50 == 0) {  // Warn every ~1 second
+                std::cout << "⚠⚠⚠ [Token Safety] WARNING: Starting control before tokens arrive! "
+                          << "Robot will use zero tokens until tokens start streaming." << std::endl;
+              }
+              warn_count++;
+            }
+            std::cout
+                << "[ControlStart] CONTROL armed after startup gates passed"
+                << std::endl;
+            program_state_ = ProgramState::CONTROL;
+          }
+          break;
+
+        case ProgramState::CONTROL: {
+          if (!CheckSafety()) {
+            std::cout << "[ERROR] Safety check failed, stopping control." << std::endl;
+            operator_state.stop = true;
+            break;
+          }
+
+          // NEW: Get data with timestamps for loop timing analysis
+          auto obs_start_time = std::chrono::steady_clock::now();
+          // Increment independent logging counter every control iteration
+          logging_counter_++;
+
+          if (!GatherRobotStateToLogger()) {
+            std::cout << "✗ Error: Failed to gather robot state to logger in the middle of the control loop!" << std::endl;
+            operator_state.stop = true;
+            std::cout << "Stopping control system." << std::endl;
+            return;
+          }
+
+          // Handle temperature report request (F key)
+          if (report_temperature_) {
+            report_temperature_ = false;
+            const auto ls = used_low_state_data_.data;
+            if (ls) {
+              static const char* joint_names[] = {
+                "Left Hip Pitch", "Left Hip Roll", "Left Hip Yaw", "Left Knee",
+                "Left Ankle Pitch", "Left Ankle Roll", "Right Hip Pitch", "Right Hip Roll",
+                "Right Hip Yaw", "Right Knee", "Right Ankle Pitch", "Right Ankle Roll",
+                "Waist Yaw", "Waist Roll", "Waist Pitch",
+                "Left Shoulder Pitch", "Left Shoulder Roll", "Left Shoulder Yaw", "Left Elbow",
+                "Left Wrist Roll", "Left Wrist Pitch", "Left Wrist Yaw",
+                "Right Shoulder Pitch", "Right Shoulder Roll", "Right Shoulder Yaw", "Right Elbow",
+                "Right Wrist Roll", "Right Wrist Pitch", "Right Wrist Yaw",
+              };
+
+              // Print full report to console with joint names
+              std::cout << "\n[Temperature Report] Motor temperatures (winding / driver):" << std::endl;
+              std::array<std::pair<int16_t, int>, G1_NUM_MOTOR> max_temps;
+              for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+                auto temp = ls->motor_state()[i].temperature();
+                std::cout << "  " << std::setw(2) << i << " " << std::setw(22) << std::left
+                          << joint_names[i] << std::right << ": "
+                          << std::setw(4) << temp[0] << " / " << std::setw(4) << temp[1] << std::endl;
+                max_temps[i] = {std::max(temp[0], temp[1]), i};
+              }
+              std::cout << std::endl;
+
+              // TTS: top 3 hottest motors
+              std::sort(max_temps.begin(), max_temps.end(),
+                        [](const auto& a, const auto& b) { return a.first > b.first; });
+              std::string tts = "Hottest motors: ";
+              for (int k = 0; k < 3 && k < G1_NUM_MOTOR; ++k) {
+                auto [temp_val, idx] = max_temps[k];
+                if (k > 0) tts += ", ";
+                tts += std::string(joint_names[idx]) + " " + std::to_string(temp_val);
+              }
+              pending_tts_ = tts;
+            }
+          }
+
+          if (!GatherInputInterfaceData()) {
+            return;
+          }
+
+          
+          // Lock mutex for observation gathering and output sending to ensure consistency
+          // This ensures all observations use the same snapshot of current_motion_ and current_frame_
+          int current_frame_copy;
+          int current_encoder_mode_copy;
+          bool current_play_copy;
+          std::shared_ptr<const MotionSequence> current_motion_copy = nullptr;
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex_);
+            current_frame_copy = current_frame_;
+            current_motion_copy = current_motion_;
+            current_encoder_mode_copy = current_motion_copy->GetEncodeMode();
+            current_play_copy = operator_state.play;
+
+            // reset saved frame for observation window before gathering observations so that we can get the latest value
+            saved_frame_for_observation_window_ = 0;
+
+            // Update heading state (handles reinitialize_heading_ and frame-0 init)
+            // Must run before any orientation observation functions
+            UpdateHeadingState();
+
+            // Gather all observations using modular functions
+            // This may update token_state_data_ with encoder output (if encoder is used)
+            if (!GatherObservations()) {
+              std::cout << "✗ Error: Failed to gather observations in the middle of the control loop!" << std::endl;
+              std::cout << "Stopping control system." << std::endl;
+              operator_state.stop = true;
+              return;
+            }
+          } // Release lock after all observation-dependent operations
+
+          // Log post-state data (token state) to the most recent state logger entry
+          // This must be called after GatherObservations() which populates token_state_data_
+          if (state_logger_) {
+            std::string motion_name = current_motion_copy ? current_motion_copy->name : "";
+            if (!state_logger_->LogPostState(std::span(token_state_data_), current_encoder_mode_copy, motion_name, current_play_copy)) {
+              std::cerr << "[WARNING] Failed to log token state to state logger" << std::endl;
+            }
+          }
+
+          auto obs_end_time = std::chrono::steady_clock::now();
+
+          if (!CreatePolicyCommand()) {
+            std::cout << "✗ Error: Failed to create policy command in the middle of the control loop!" << std::endl;
+            std::cout << "Stopping control system." << std::endl;
+            operator_state.stop = true;
+            return;
+          }
+          auto motor_command_end_time = std::chrono::steady_clock::now();
+
+          // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
+          /* hand_type=none -> dummy ops are no-op */ {
+            hands_->SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
+
+            // set hand poses (use buffered data for consistency)
+            hands_->setAllJointsCommand(true, left_hand_joint_buffer_);
+            hands_->setAllJointsCommand(false, right_hand_joint_buffer_);
+          }
+
+          // Update last hand actions for logging (use buffered data)
+          for (int i = 0; i < 7; ++i) {
+            last_left_hand_action[i] = left_hand_joint_buffer_[i];
+            last_right_hand_action[i] = right_hand_joint_buffer_[i];
+          }
+          
+          auto hand_joint_end_time = std::chrono::steady_clock::now();
+
+          // Publish output data (state logger data, robot config, command/motion data) to all output interfaces
+          for (auto& output_interface : output_interfaces_) {
+            if (output_interface) {
+              output_interface->publish(
+                vr_3point_position_buffer_, vr_3point_orientation_buffer_, vr_3point_compliance_buffer_,
+                left_hand_joint_buffer_, right_hand_joint_buffer_, init_ref_data_root_rot_array_,
+                heading_state_buffer_, current_motion_copy, current_frame_copy, last_action
+              );
+            }
+          }
+
+          // Handle recording of streamed motion (if enabled)
+          if (enable_motion_recording_) {
+            if (current_motion_copy && current_motion_copy->name == "streamed") {
+              // Start recording session when streamed starts at frame 0
+              if (current_frame_copy == 0 && !zmq_motion_recorder_.IsActive()) {
+                zmq_motion_recorder_.StartSession("streamed");
+              }
+              
+              // Write current frame if recording is active
+              if (zmq_motion_recorder_.IsActive() && operator_state.play) {
+                zmq_motion_recorder_.WriteFrame(current_motion_copy, current_frame_copy);
+              }
+            } else {
+              // Finalize recording when switching away from streamed
+              if (zmq_motion_recorder_.IsActive()) {
+                zmq_motion_recorder_.Finalize();
+              }
+            }
+            
+            // Handle recording of planner_motion (closed-loop result)
+            if (current_motion_copy && current_motion_copy == planner_motion_) {
+              // Write current frame if recording is active
+              if (planner_motion_recorder_.IsActive() && operator_state.play) {
+                planner_motion_recorder_.WriteFrame(current_motion_copy, current_frame_copy);
+              }
+            }
+          }
+
+          // Write target motion to file
+          if (target_motion_file_) {
+            (*target_motion_file_) << current_motion_copy->BodyPositions(current_frame_copy)[0][0] << ",";
+            (*target_motion_file_) << current_motion_copy->BodyPositions(current_frame_copy)[0][1] << ",";
+            (*target_motion_file_) << current_motion_copy->BodyPositions(current_frame_copy)[0][2] << ",";
+
+            (*target_motion_file_) << current_motion_copy->BodyQuaternions(current_frame_copy)[0][0] << ",";
+            (*target_motion_file_) << current_motion_copy->BodyQuaternions(current_frame_copy)[0][1] << ",";
+            (*target_motion_file_) << current_motion_copy->BodyQuaternions(current_frame_copy)[0][2] << ",";
+            (*target_motion_file_) << current_motion_copy->BodyQuaternions(current_frame_copy)[0][3] << ",";
+
+            for(int i = 0; i < 29; i++) {
+              (*target_motion_file_) << current_motion_copy->JointPositions(current_frame_copy)[isaaclab_to_mujoco[i]] << ",";
+            }
+
+            (*target_motion_file_) << std::endl;
+          }
+
+          if(policy_input_file_)
+          {
+            // dump neural network inputs to a log file:
+            for(auto d : obs_buffer_)
+            {
+              (*policy_input_file_) << d << ",";
+            }
+            (*policy_input_file_) << std::endl;
+          }
+
+          if (!CurrentFrameAdvancement()) {
+            std::cout << "✗ Error: Failed to advance current frame in the middle of the control loop!" << std::endl;
+            std::cout << "Stopping control system." << std::endl;
+            operator_state.stop = true;
+            return;
+          }
+
+          // Loop timing log disabled for cleaner output
+          // To re-enable: uncomment the block below
+          /*
+          if (logging_counter_ % 500 == 0) {
+            auto control_loop_end_time = std::chrono::steady_clock::now();
+            auto obs_duration = std::chrono::duration_cast<std::chrono::microseconds>(obs_end_time - obs_start_time);
+            auto policy_duration = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_end_time);
+            auto motor_command_duration = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_start_time);
+            auto post_hand_joint_duration = std::chrono::duration_cast<std::chrono::microseconds>(control_loop_end_time - hand_joint_end_time);
+
+            std::cout << "Loop timing - LowState age: " << used_low_state_data_.GetAgeMs() << "ms"
+                      << ", Streaming data mean delay: " << streaming_data_delay_rolling_stats_.mean() << "ms"
+                      << ", Streaming data std delay: " << streaming_data_delay_rolling_stats_.stddev() << "ms"
+                      << ", IMU age: " << used_imu_torso_data_.GetAgeMs() << "ms"
+                      << ", Obs: " << obs_duration.count() << "us"
+                      << ", Policy: " << policy_duration.count() << "us"
+                      << ", Obs 2 Motor Command: " << motor_command_duration.count() << "us"
+                      << ", Post processing: " << post_hand_joint_duration.count() << "us";
+
+            if (planner_ && planner_->planner_state_.enabled && planner_->planner_state_.initialized) {
+              std::cout << ", Planner - Gather Input: " << planner_->last_timing_.gather_input_duration.count() << "us"
+                        << ", Model: " << planner_->last_timing_.model_duration.count() << "us"
+                        << ", Convert50Hz: " << planner_->last_timing_.extract_duration.count() << "us"
+                        << ", Total: " << planner_->last_timing_.total_duration.count() << "us";
+            }
+
+            if (has_vr_3point_compliance_obs_) {
+              std::cout << " | Compliance [L,R,H]: ["
+                        << vr_3point_compliance_buffer_[0] << ", "
+                        << vr_3point_compliance_buffer_[1] << ", "
+                        << vr_3point_compliance_buffer_[2] << "]";
+            }
+
+            std::cout << " | HandCloseRatio: " << hands_->GetMaxCloseRatio();
+
+            std::cout << std::endl;
+          }
+          */
+          break;
+        }
+      }
+    }
+};
+
+/**
+ * @brief Entry point: parse CLI arguments and run the G1 deployment application.
+ *
+ * Required positional arguments:
+ *   1. network_interface – DDS network interface (e.g. "eth0")
+ *   2. policy_file       – Path to the ONNX policy model
+ *   3. motion_data_path  – Directory of pre-loaded reference motions
+ *
+ * All other arguments are optional flags (see --help for full list).
+ * The main loop sleeps until the operator issues a stop signal or ROS2 shuts down.
+ */
+int main(int argc, char const* argv[]) {
+  std::cout << "[DEBUG] Program starting..." << std::endl;
+  if (argc < 4) {
+    std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
+              << std::endl;
+    std::cout << "  network_interface: network interface for DDS communication" << std::endl;
+    std::cout << "  policy_file: path to ONNX policy file" << std::endl;
+    std::cout << "  motion_data_path: path to motion data directory (e.g., reference/bones_072925_test/)" << std::endl;
+    std::cout << "\nOptions:" << std::endl;
+    std::cout << "  --planner-file <path>: specify planner file (optional)" << std::endl;
+    std::cout << "  --input-type <keyboard|gamepad|gamepad_manager|manager|zmq|zmq_manager";
+#if HAS_ROS2
+    std::cout << "|ros2";
+#endif
+    std::cout << ">: input interface type (default: keyboard)" << std::endl;
+    std::cout << "  --output-type <zmq|all";
+#if HAS_ROS2
+    std::cout << "|ros2";
+#endif
+    std::cout << ">: output interface type (default: zmq, 'all' creates all available)" << std::endl;
+    std::cout << "  --target-motion-logfile <path>: write target motion to a csv file if provided" << std::endl;
+    std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
+    std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
+    std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
+    std::cout << "  --joint-measured-speed-limit <rad/s>: stop real control when abs(measured dq)" << std::endl;
+    std::cout << "                                   exceeds this hard limit (default: 10)" << std::endl;
+    std::cout << "  --enable-lower-body-energy-governor: reduce only out-of-envelope positive" << std::endl;
+    std::cout << "                                   leg-joint energy; braking remains immediate" << std::endl;
+    std::cout << "  --lower-body-energy-governor-scale <value>: positive power/work envelope" << std::endl;
+    std::cout << "                                   multiplier (default: 1.0; requires enable flag)" << std::endl;
+    std::cout << "  --lower-body-energy-governor-tremor-gated: activate the envelope only after" << std::endl;
+    std::cout << "                                   same-joint opposite velocity innovations" << std::endl;
+    std::cout << "  --lower-body-tremor-trigger-threshold <rad/s>: per-20-ms innovation threshold" << std::endl;
+    std::cout << "                                   minimum on each side (default: 3.0)" << std::endl;
+    std::cout << "  --lower-body-tremor-peak-to-peak-threshold <rad/s>: three-frame reversal" << std::endl;
+    std::cout << "                                   magnitude threshold (default: 9.0)" << std::endl;
+    std::cout << "  --lower-body-tremor-recovery-damping <Nm/(rad/s)>: dissipative knee/ankle" << std::endl;
+    std::cout << "                                   damping while the gate is active (default: 0)" << std::endl;
+    std::cout << "  --lower-body-tremor-hold-ms <ms>: gated recovery interval (default: 1000)" << std::endl;
+    std::cout << "  --enable-lower-body-braking-priority-slew: after a calibrated impact," << std::endl;
+    std::cout << "                                   limit only energy-adding knee/ankle target jumps" << std::endl;
+    std::cout << "  --lower-body-braking-priority-slew-max-step <rad>: maximum energy-adding" << std::endl;
+    std::cout << "                                   target change per 20-ms tick (default: 0.13)" << std::endl;
+    std::cout << "  --lower-body-braking-priority-slew-hold-ms <20..10000>: recovery window" << std::endl;
+    std::cout << "                                   (default: 1000; requires enable flag)" << std::endl;
+    std::cout << "  --enable-lower-body-observation-guard: repair isolated, uncommanded" << std::endl;
+    std::cout << "                                   knee/ankle dq in policy history only" << std::endl;
+    std::cout << "  --lower-body-observation-guard-hold-ms <20..2000>: bounded repair window" << std::endl;
+    std::cout << "                                   (default: 20; requires enable flag)" << std::endl;
+    std::cout << "  --lower-body-observation-guard-alpha <0..1>: policy-dq low-pass alpha" << std::endl;
+    std::cout << "                                   (default: 0; requires enable flag)" << std::endl;
+    std::cout << "  --lower-body-observation-guard-max-policy-dq-step <rad/s>: recursively" << std::endl;
+    std::cout << "                                   clip policy-dq innovation (0 disables; calibrated: 3.25)" << std::endl;
+    std::cout << "  --lower-body-observation-guard-max-position-dq-residual <rad/s>: during" << std::endl;
+    std::cout << "                                   an event window, keep q-derived motion and bound only dq disagreement" << std::endl;
+    std::cout << "  --lower-body-observation-guard-continuous-innovation-clip: apply the" << std::endl;
+    std::cout << "                                   innovation bound independently every tick" << std::endl;
+    std::cout << "  --lower-body-observation-guard-repair-until-caught-up: after a qualified" << std::endl;
+    std::cout << "                                   event, clip its joint until raw dq is reachable" << std::endl;
+    std::cout << "  --lower-body-observation-guard-all-monitored: filter all six knees/ankles" << std::endl;
+    std::cout << "                                   during the repair window" << std::endl;
+    std::cout << "  --lower-body-observation-guard-both-ankle-rolls: filter only the left/right" << std::endl;
+    std::cout << "                                   ankle-roll pair during the repair window" << std::endl;
+    std::cout << "  --lower-body-observation-guard-ankle-roll-trigger-only: trigger only from" << std::endl;
+    std::cout << "                                   the saved real capture's ankle-roll signature" << std::endl;
+    std::cout << "  --lower-body-observation-guard-fixed-window: do not extend the bounded" << std::endl;
+    std::cout << "                                   repair window when it detects another spike" << std::endl;
+    std::cout << "  --enable-lower-body-impact-damper: after a calibrated uncommanded impact," << std::endl;
+    std::cout << "                                   add short, local, decaying knee/ankle Kd" << std::endl;
+    std::cout << "  --lower-body-impact-damper-extra-kd <Nm/(rad/s)>: peak added damping" << std::endl;
+    std::cout << "                                   (default: 3.0; requires enable flag)" << std::endl;
+    std::cout << "  --lower-body-impact-damper-hold-ms <20..500>: decay duration" << std::endl;
+    std::cout << "                                   (default: 100; requires enable flag)" << std::endl;
+    std::cout << "  --lower-body-impact-damper-all-monitored: damp all six knees/ankles" << std::endl;
+    std::cout << "                                   after any calibrated lower-leg event" << std::endl;
+    std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
+    std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
+    std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
+    std::cout << "  --policy-precision <16|32>: specify precision to run the policy model at (default: 32)" << std::endl;
+    std::cout << "  --zmq-host <host>: ZMQ server host (default: localhost)" << std::endl;
+    std::cout << "  --zmq-port <port>: ZMQ server port (default: 5556)" << std::endl;
+    std::cout << "  --zmq-topic <topic>: ZMQ topic/prefix (default: pose)" << std::endl;
+    std::cout << "  --zmq-conflate: enable ZMQ CONFLATE (default: disabled)" << std::endl;
+    std::cout << "  --zmq-verbose: enable ZMQ subscriber verbose logs" << std::endl;
+    std::cout << "  --zmq-out-port <port>: ZMQ port for output (default: 5557)" << std::endl;
+    std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
+    std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
+    std::cout << "  --enable-csv-logs: enable writing CSV logs (default: OFF)" << std::endl;
+    std::cout << "  --enable-motion-recording: enable motion recording for ZMQ/planner (default: OFF)" << std::endl;
+    std::cout << "  --set-compliance <value>: set initial VR 3-point compliance (0.01=rigid, 0.5=compliant; default: [0.5, 0.5, 0.0])" << std::endl;
+    std::cout << "                                 Can specify 1 value (both hands) or 3 values (left_wrist,right_wrist,head)" << std::endl;
+    std::cout << "                                 Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1" << std::endl;
+    std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
+    std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
+    std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --zmq-robot-ip <ip>: robot IP for ZMQ bridge (default: G1_WBC_DEFAULT_WIRELESS_ROBOT_IP)" << std::endl;
+    std::cout << "  --zmq-robot-state-port <port>: robot/mock state SUB port (default: 5560)" << std::endl;
+    std::cout << "  --zmq-robot-cmd-port <port>: robot/mock command PUB port (default: 5561)" << std::endl;
+    std::cout << "  --zmq-robot-lowcmd-udp-port <port>: compact real-robot LowCmd UDP port" << std::endl;
+    std::cout << "                                        (0 disables; simulation default: 0)" << std::endl;
+    std::cout << "  --hand-type <none|dex3|brainco>: pick hand driver (default: dex3)" << std::endl;
+    std::cout << "                                   none    = dummy (no hardware)" << std::endl;
+    std::cout << "                                   dex3    = Unitree Dex3-1 7-DOF (default)" << std::endl;
+    std::cout << "                                   brainco = BrainCo Revo2 6-DOF staged open/clamp/curl" << std::endl;
+    std::cout << "  --hand-close-threshold <0..1>: BrainCo normalized mean closure threshold (default: 0.3)" << std::endl;
+    std::cout << "                                   score > threshold requests staged closure; otherwise opens" << std::endl;
+    std::cout << "  --brainco-clamp-ms <0..60000>: hold [0.5,0.25,0.5,0.5,0.5,0.5] before" << std::endl;
+    std::cout << "                                   full BrainCo curl (default: 300; 0 disables staging)" << std::endl;
+    std::cout << "                                   --brainco-pregrasp-ms remains a deprecated alias" << std::endl;
+    std::cout << "  --brainco-feedback-grace-ms <0..60000>: keep last measured BrainCo state during a" << std::endl;
+    std::cout << "                                   transient feedback outage before stopping (default: 2000)" << std::endl;
+    std::cout << "  --lock-waist-axes <none|yaw|roll|pitch[,..]>: hold selected waist axes at" << std::endl;
+    std::cout << "                                   nominal standing angles after Init Done" << std::endl;
+    std::cout << "  --waist-lock-kp <value>: position gain for locked waist axes (default: 250)" << std::endl;
+    std::cout << "  --waist-lock-kd <value>: damping gain for locked waist axes (default: 5)" << std::endl;
+    std::cout << "  --left-shoulder-back-offset-deg <0..90>: add rearward left-shoulder pitch" << std::endl;
+    std::cout << "                                   after policy/direct-arm output (default: 0)" << std::endl;
+    std::cout << "  --direct-upper-body-control: directly track streamed waist+arm joint targets" << std::endl;
+    std::cout << "  --direct-upper-body-arm-only: keep SONIC baseline waist and directly track streamed arm targets only" << std::endl;
+    std::cout << "  --direct-upper-body-kp-scale <value>: PD Kp multiplier for direct waist+arm targets" << std::endl;
+    std::cout << "  --direct-upper-body-kd-scale <value>: PD Kd multiplier for direct waist+arm targets" << std::endl;
+    std::cout << "  --no-hands / --disable-hands: deprecated, equivalent to --hand-type none" << std::endl;
+    std::cout << "\nExamples:" << std::endl;
+    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
+    std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
+    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad --planner-file policy/planner.onnx" << std::endl;
+    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
+    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq --zmq-host 192.168.1.2 --zmq-port 5556 --zmq-topic pose --zmq-conflate" << std::endl;
+    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
+#if HAS_ROS2
+    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type ros2 --planner-file policy/planner.onnx" << std::endl;
+#endif
+    exit(0);
+  }
+  std::cout << "[DEBUG] Arguments validated..." << std::endl;
+  std::string networkInterface = argv[1];
+  std::string modelFile = argv[2];
+  std::string motionDataPath = argv[3];
+  std::string plannerFile = "";
+
+  // Parse optional arguments
+  bool disableCrcCheck = false;\
+  std::string obsConfigPath = "";
+  std::string encoderFile = "";
+  std::string targetMotionLogfile = "";
+  std::string plannerMotionLogfile = "";
+  std::string policyInputLogfile = "";
+  std::string recordInputFile = "";
+  std::string playbackInputFile = "";
+  std::string inputType = "keyboard"; // Default to keyboard
+  std::string outputType = "zmq"; // Default to zmq
+  bool plannerFp16 = false;
+  bool policyFp16 = false;
+  std::string logsDir = "";
+  bool enableCsvLogs = false;
+  std::string zmq_host = "localhost";
+  int zmq_port = 5556;
+  std::string zmq_topic = "pose";
+  bool zmq_conflate = false;  // default off; enable with --zmq-conflate
+  bool zmq_verbose = false;
+  bool enableMotionRecording = false;  // default off; enable with --enable-motion-recording
+  int zmq_out_port = 5557;
+  std::string zmq_out_topic = "g1_debug";
+  std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
+  double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  const char* configuredZmqRobotIp = std::getenv("G1_WBC_DEFAULT_WIRELESS_ROBOT_IP");
+  std::string zmqRobotIp = configuredZmqRobotIp != nullptr ? configuredZmqRobotIp : "";
+  int zmqRobotStatePort = 5560;
+  int zmqRobotCmdPort = 5561;
+  int zmqRobotLowcmdUdpPort = 0;
+  std::string handType = "dex3";  // none / dex3 / brainco
+  double handCloseThreshold = 0.3;
+  int braincoClampMs = 300;
+  int braincoFeedbackGraceMs = 2000;
+  std::array<bool, 3> waistLockAxes = {false, false, false};
+  double waistLockKp = 250.0;
+  double waistLockKd = 5.0;
+  double leftShoulderBackOffsetDeg = 0.0;
+  bool directUpperBodyControl = false;
+  bool directUpperBodyArmOnly = false;
+  bool directUpperBodySkipWrist = false;
+  double directUpperBodyKpScale = 1.0;
+  double directUpperBodyKdScale = 1.0;
+  double jointMeasuredSpeedLimit =
+      joint_velocity_safety::kDefaultMeasuredSpeedLimitRadS;
+  bool lowerBodyEnergyGovernorEnabled = false;
+  double lowerBodyEnergyGovernorScale = 1.0;
+  bool lowerBodyEnergyGovernorTremorGated = false;
+  double lowerBodyTremorTriggerThreshold =
+      lower_body_energy_governor::kDefaultTremorTriggerThresholdRadS;
+  double lowerBodyTremorPeakToPeakThreshold =
+      lower_body_energy_governor::kDefaultTremorPeakToPeakThresholdRadS;
+  double lowerBodyTremorRecoveryDamping = 0.0;
+  int lowerBodyTremorHoldMs = static_cast<int>(
+      lower_body_energy_governor::kDefaultTremorHoldTicks * 20);
+  bool lowerBodyBrakingPrioritySlewEnabled = false;
+  double lowerBodyBrakingPrioritySlewMaxStep =
+      lower_body_braking_priority_slew::
+          kDefaultMaxPositivePowerTargetStepRad;
+  int lowerBodyBrakingPrioritySlewHoldMs = static_cast<int>(
+      lower_body_braking_priority_slew::kDefaultHoldTicks * 20);
+  bool lowerBodyObservationGuardEnabled = false;
+  int lowerBodyObservationGuardHoldMs = static_cast<int>(
+      lower_body_observation_guard::kDefaultRepairHoldTicks * 20);
+  double lowerBodyObservationGuardAlpha =
+      lower_body_observation_guard::kDefaultRepairLowPassAlpha;
+  double lowerBodyObservationGuardMaxPolicyDqStep =
+      lower_body_observation_guard::kDefaultRepairMaxPolicyDqStepRadS;
+  double lowerBodyObservationGuardMaxPositionDqResidual =
+      lower_body_observation_guard::
+          kDefaultRepairMaxPositionDqResidualRadS;
+  bool lowerBodyObservationGuardContinuousInnovationClip = false;
+  bool lowerBodyObservationGuardRepairUntilCaughtUp = false;
+  bool lowerBodyObservationGuardAllMonitored = false;
+  bool lowerBodyObservationGuardBothAnkleRolls = false;
+  bool lowerBodyObservationGuardAnkleRollTriggerOnly = false;
+  bool lowerBodyObservationGuardFixedWindow = false;
+  bool lowerBodyImpactDamperEnabled = false;
+  double lowerBodyImpactDamperExtraKd =
+      lower_body_impact_damper::kDefaultExtraKdNmPerRadS;
+  int lowerBodyImpactDamperHoldMs = static_cast<int>(
+      lower_body_impact_damper::kDefaultHoldTicks * 20);
+  bool lowerBodyImpactDamperAllMonitored = false;
+  for (int i = 4; i < argc; i++) {
+    if (std::string(argv[i]) == "--disable-crc-check") {
+      disableCrcCheck = true;
+      std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--joint-measured-speed-limit") {
+      const std::string option = "--joint-measured-speed-limit";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires a positive finite rad/s value" << std::endl;
+        exit(1);
+      }
+      try {
+        const double value = waist_lock::ParsePositiveFinite(
+            argv[i + 1], option.c_str());
+        jointMeasuredSpeedLimit = value;
+        std::cout << "[INFO] " << option << " = " << value
+                  << " rad/s" << std::endl;
+      } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        exit(1);
+      }
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--enable-lower-body-energy-governor") {
+      lowerBodyEnergyGovernorEnabled = true;
+      std::cout << "[INFO] Lower-body braking-priority energy governor "
+                << "enabled" << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-energy-governor-scale") {
+      const std::string option =
+          "--lower-body-energy-governor-scale";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires a positive finite value" << std::endl;
+        exit(1);
+      }
+      try {
+        lowerBodyEnergyGovernorScale = waist_lock::ParsePositiveFinite(
+            argv[i + 1], option.c_str());
+        std::cout << "[INFO] " << option << " = "
+                  << lowerBodyEnergyGovernorScale << std::endl;
+      } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        exit(1);
+      }
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-energy-governor-tremor-gated") {
+      lowerBodyEnergyGovernorTremorGated = true;
+      std::cout << "[INFO] Lower-body energy governor tremor gate enabled"
+                << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-tremor-trigger-threshold") {
+      const std::string option = "--lower-body-tremor-trigger-threshold";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires a positive finite value" << std::endl;
+        exit(1);
+      }
+      try {
+        lowerBodyTremorTriggerThreshold = waist_lock::ParsePositiveFinite(
+            argv[i + 1], option.c_str());
+      } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyTremorTriggerThreshold << " rad/s per tick"
+                << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-tremor-peak-to-peak-threshold") {
+      const std::string option =
+          "--lower-body-tremor-peak-to-peak-threshold";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires a positive finite value" << std::endl;
+        exit(1);
+      }
+      try {
+        lowerBodyTremorPeakToPeakThreshold =
+            waist_lock::ParsePositiveFinite(argv[i + 1], option.c_str());
+      } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyTremorPeakToPeakThreshold << " rad/s"
+                << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-tremor-recovery-damping") {
+      const std::string option =
+          "--lower-body-tremor-recovery-damping";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires a positive finite value" << std::endl;
+        exit(1);
+      }
+      try {
+        lowerBodyTremorRecoveryDamping =
+            waist_lock::ParsePositiveFinite(argv[i + 1], option.c_str());
+      } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyTremorRecoveryDamping << " Nm/(rad/s)"
+                << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-tremor-hold-ms") {
+      const std::string option = "--lower-body-tremor-hold-ms";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires an integer within [20,10000]" << std::endl;
+        exit(1);
+      }
+      try {
+        std::size_t parsed = 0;
+        const int value = std::stoi(argv[i + 1], &parsed);
+        if (parsed != std::string(argv[i + 1]).size() || value < 20 ||
+            value > 10000) {
+          throw std::out_of_range("outside [20,10000]");
+        }
+        lowerBodyTremorHoldMs = value;
+      } catch (...) {
+        std::cerr << "Error: " << option
+                  << " must be an integer within [20,10000] (got: "
+                  << argv[i + 1] << ")" << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyTremorHoldMs << " ms" << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--enable-lower-body-braking-priority-slew") {
+      lowerBodyBrakingPrioritySlewEnabled = true;
+      std::cout
+          << "[INFO] Lower-body event-gated braking-priority target slew "
+          << "enabled" << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-braking-priority-slew-max-step") {
+      const std::string option =
+          "--lower-body-braking-priority-slew-max-step";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires a positive finite radian value" << std::endl;
+        exit(1);
+      }
+      try {
+        lowerBodyBrakingPrioritySlewMaxStep =
+            waist_lock::ParsePositiveFinite(argv[i + 1], option.c_str());
+      } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyBrakingPrioritySlewMaxStep << " rad"
+                << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-braking-priority-slew-hold-ms") {
+      const std::string option =
+          "--lower-body-braking-priority-slew-hold-ms";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires an integer within [20,10000]" << std::endl;
+        exit(1);
+      }
+      try {
+        std::size_t parsed = 0;
+        const int value = std::stoi(argv[i + 1], &parsed);
+        if (parsed != std::string(argv[i + 1]).size() || value < 20 ||
+            value > 10000) {
+          throw std::out_of_range("outside [20,10000]");
+        }
+        lowerBodyBrakingPrioritySlewHoldMs = value;
+      } catch (...) {
+        std::cerr << "Error: " << option
+                  << " must be an integer within [20,10000] (got: "
+                  << argv[i + 1] << ")" << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyBrakingPrioritySlewHoldMs << " ms"
+                << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--enable-lower-body-observation-guard") {
+      lowerBodyObservationGuardEnabled = true;
+      std::cout
+          << "[INFO] Lower-body policy-observation spike repair enabled"
+          << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-observation-guard-hold-ms") {
+      const std::string option =
+          "--lower-body-observation-guard-hold-ms";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires an integer within [20,2000]" << std::endl;
+        exit(1);
+      }
+      try {
+        std::size_t parsed = 0;
+        const int value = std::stoi(argv[i + 1], &parsed);
+        if (parsed != std::string(argv[i + 1]).size() || value < 20 ||
+            value > 2000) {
+          throw std::out_of_range("outside [20,2000]");
+        }
+        lowerBodyObservationGuardHoldMs = value;
+      } catch (...) {
+        std::cerr << "Error: " << option
+                  << " must be an integer within [20,2000] (got: "
+                  << argv[i + 1] << ")" << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyObservationGuardHoldMs << " ms" << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-observation-guard-alpha") {
+      const std::string option =
+          "--lower-body-observation-guard-alpha";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires a finite value within [0,1]" << std::endl;
+        exit(1);
+      }
+      try {
+        std::size_t parsed = 0;
+        const std::string text = argv[i + 1];
+        const double value = std::stod(text, &parsed);
+        if (parsed != text.size() || !std::isfinite(value) || value < 0.0 ||
+            value > 1.0) {
+          throw std::out_of_range("outside [0,1]");
+        }
+        lowerBodyObservationGuardAlpha = value;
+      } catch (...) {
+        std::cerr << "Error: " << option
+                  << " must be a finite value within [0,1] (got: "
+                  << argv[i + 1] << ")" << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyObservationGuardAlpha << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-observation-guard-max-policy-dq-step") {
+      const std::string option =
+          "--lower-body-observation-guard-max-policy-dq-step";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires a finite value within [0,20]" << std::endl;
+        exit(1);
+      }
+      try {
+        std::size_t parsed = 0;
+        const std::string text = argv[i + 1];
+        const double value = std::stod(text, &parsed);
+        if (parsed != text.size() || !std::isfinite(value) || value < 0.0 ||
+            value > 20.0) {
+          throw std::out_of_range("outside [0,20]");
+        }
+        lowerBodyObservationGuardMaxPolicyDqStep = value;
+      } catch (...) {
+        std::cerr << "Error: " << option
+                  << " must be a finite value within [0,20] (got: "
+                  << argv[i + 1] << ")" << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyObservationGuardMaxPolicyDqStep << " rad/s"
+                << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-observation-guard-continuous-innovation-clip") {
+      lowerBodyObservationGuardContinuousInnovationClip = true;
+      std::cout << "[INFO] Lower-body observation innovation clip applies "
+                   "independently every policy tick" << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-observation-guard-max-position-dq-residual") {
+      const std::string option =
+          "--lower-body-observation-guard-max-position-dq-residual";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires a finite value within [0,20]" << std::endl;
+        exit(1);
+      }
+      try {
+        std::size_t parsed = 0;
+        const std::string text = argv[i + 1];
+        const double value = std::stod(text, &parsed);
+        if (parsed != text.size() || !std::isfinite(value) || value < 0.0 ||
+            value > 20.0) {
+          throw std::out_of_range("outside [0,20]");
+        }
+        lowerBodyObservationGuardMaxPositionDqResidual = value;
+      } catch (...) {
+        std::cerr << "Error: " << option
+                  << " must be a finite value within [0,20] (got: "
+                  << argv[i + 1] << ")" << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyObservationGuardMaxPositionDqResidual
+                << " rad/s" << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-observation-guard-repair-until-caught-up") {
+      lowerBodyObservationGuardRepairUntilCaughtUp = true;
+      std::cout << "[INFO] Lower-body event-local observation repair stays "
+                   "active only until policy dq catches raw dq" << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-observation-guard-all-monitored") {
+      lowerBodyObservationGuardAllMonitored = true;
+      std::cout << "[INFO] Lower-body observation repair covers all six "
+                   "monitored knee/ankle joints" << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-observation-guard-both-ankle-rolls") {
+      lowerBodyObservationGuardBothAnkleRolls = true;
+      std::cout << "[INFO] Lower-body observation repair covers both "
+                   "ankle-roll joints" << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-observation-guard-ankle-roll-trigger-only") {
+      lowerBodyObservationGuardAnkleRollTriggerOnly = true;
+      std::cout << "[INFO] Lower-body observation guard trigger restricted "
+                   "to ankle-roll joints" << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-observation-guard-fixed-window") {
+      lowerBodyObservationGuardFixedWindow = true;
+      std::cout << "[INFO] Lower-body observation repair window will not "
+                   "extend on retrigger" << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--enable-lower-body-impact-damper") {
+      lowerBodyImpactDamperEnabled = true;
+      std::cout
+          << "[INFO] Lower-body localized transient impact damping enabled"
+          << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-impact-damper-extra-kd") {
+      const std::string option =
+          "--lower-body-impact-damper-extra-kd";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires a positive finite value" << std::endl;
+        exit(1);
+      }
+      try {
+        lowerBodyImpactDamperExtraKd = waist_lock::ParsePositiveFinite(
+            argv[i + 1], option.c_str());
+      } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyImpactDamperExtraKd << " Nm/(rad/s)"
+                << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-impact-damper-hold-ms") {
+      const std::string option =
+          "--lower-body-impact-damper-hold-ms";
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option
+                  << " requires an integer within [20,500]" << std::endl;
+        exit(1);
+      }
+      try {
+        std::size_t parsed = 0;
+        const int value = std::stoi(argv[i + 1], &parsed);
+        if (parsed != std::string(argv[i + 1]).size() || value < 20 ||
+            value > 500) {
+          throw std::out_of_range("outside [20,500]");
+        }
+        lowerBodyImpactDamperHoldMs = value;
+      } catch (...) {
+        std::cerr << "Error: " << option
+                  << " must be an integer within [20,500] (got: "
+                  << argv[i + 1] << ")" << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] " << option << " = "
+                << lowerBodyImpactDamperHoldMs << " ms" << std::endl;
+      i++;
+    } else if (std::string(argv[i]) ==
+               "--lower-body-impact-damper-all-monitored") {
+      lowerBodyImpactDamperAllMonitored = true;
+      std::cout << "[INFO] Lower-body impact damping covers all six "
+                   "monitored knee/ankle joints" << std::endl;
+    } else if (std::string(argv[i]) == "--obs-config") {
+      if (i + 1 < argc) {
+        obsConfigPath = argv[i + 1];
+        std::cout << "[INFO] Using observation config: " << obsConfigPath << std::endl;
+        i++; // Skip the next argument since it's the config path
+      } else {
+        std::cerr << "Error: --obs-config requires a path argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--encoder-file") {
+      if (i + 1 < argc) {
+        encoderFile = argv[i + 1];
+        std::cout << "[INFO] Using encoder file: " << encoderFile << std::endl;
+        i++; // Skip the next argument since it's the encoder file path
+      } else {
+        std::cerr << "Error: --encoder-file requires a path argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--planner-file") {
+      if (i + 1 < argc) {
+        plannerFile = argv[i + 1];
+        std::cout << "[INFO] Using planner file: " << plannerFile << std::endl;
+        i++; // Skip the next argument since it's the planner path
+      } else {
+        std::cerr << "Error: --planner-file requires a path argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--target-motion-logfile") {
+      if (i + 1 < argc) {
+        targetMotionLogfile = argv[i + 1];
+        std::cout << "[INFO] Using target motion logfile: " << targetMotionLogfile << std::endl;
+        i++; // Skip the next argument since it's the target motion logfile
+      }
+    } else if (std::string(argv[i]) == "--planner-motion-logfile") {
+      if (i + 1 < argc) {
+        plannerMotionLogfile = argv[i + 1];
+        std::cout << "[INFO] Using planner motion logfile: " << plannerMotionLogfile << std::endl;
+        i++; // Skip the next argument since it's the planner motion logfile
+      }
+    } else if (std::string(argv[i]) == "--policy-input-logfile") {
+      if (i + 1 < argc) {
+        policyInputLogfile = argv[i + 1];
+        std::cout << "[INFO] Using policy input logfile: " << policyInputLogfile << std::endl;
+        i++; // Skip the next argument since it's the policy input logfile
+      }
+    } else if (std::string(argv[i]) == "--input-type") {
+      if (i + 1 < argc) {
+        inputType = argv[i + 1];
+        // Validate input type based on what's available
+        bool valid_input = (inputType == "keyboard" || inputType == "gamepad" || inputType == "gamepad_manager" || inputType == "zmq" || inputType == "zmq_manager" || inputType == "manager");
+#if HAS_ROS2
+        valid_input = valid_input || (inputType == "ros2");
+#endif
+        if (!valid_input) {
+          std::cerr << "Error: --input-type must be 'keyboard', 'gamepad', 'gamepad_manager', 'manager', 'zmq', or 'zmq_manager'";
+#if HAS_ROS2
+          std::cerr << ", or 'ros2'";
+#endif
+          std::cerr << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] Using input type: " << inputType << std::endl;
+        i++; // Skip the next argument since it's the input type
+      } else {
+        std::cerr << "Error: --input-type requires a type argument (keyboard, gamepad, gamepad_manager, manager, zmq, zmq_manager";
+#if HAS_ROS2
+        std::cerr << ", or ros2";
+#endif
+        std::cerr << ")" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--output-type") {
+      if (i + 1 < argc) {
+        outputType = argv[i + 1];
+        bool valid_output = (outputType == "zmq" || outputType == "all");
+#if HAS_ROS2
+        valid_output = valid_output || (outputType == "ros2");
+#endif
+        if (!valid_output) {
+          std::cerr << "Error: --output-type must be 'zmq', 'all'";
+#if HAS_ROS2
+          std::cerr << ", or 'ros2'";
+#endif
+          std::cerr << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] Using output type: " << outputType << std::endl;
+        i++; // Skip the next argument since it's the output type
+      } else {
+        std::cerr << "Error: --output-type requires a type argument (zmq, all";
+#if HAS_ROS2
+        std::cerr << ", or ros2";
+#endif
+        std::cerr << ")" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--zmq-out-port") {
+      if (i + 1 < argc) { zmq_out_port = std::stoi(argv[i + 1]); i++; }
+    } else if (std::string(argv[i]) == "--zmq-out-topic") {
+      if (i + 1 < argc) { zmq_out_topic = argv[i + 1]; i++; }
+    } else if (std::string(argv[i]) == "--record-input-file") {
+      if (i + 1 < argc) {
+        recordInputFile = argv[i + 1];
+        std::cout << "[INFO] Recording input to logfile: " << recordInputFile << std::endl;
+        i++; // Skip the next argument since it's the input logfile
+      }
+    } else if (std::string(argv[i]) == "--playback-input-file") {
+      if (i + 1 < argc) {
+        playbackInputFile = argv[i + 1];
+        std::cout << "[INFO] Playing input from logfile: " << playbackInputFile << std::endl;
+        i++; // Skip the next argument since it's the input logfile
+      }
+    } else if (std::string(argv[i]) == "--planner-precision") {
+      if (i + 1 < argc) {
+        if(argv[i+1] == std::string("16"))
+        {
+          plannerFp16 = true;
+        }
+        else if(argv[i+1] == std::string("32"))
+        {
+          plannerFp16 = false;
+        }
+        else{
+          throw std::runtime_error("invalid --planner-precision (should be 16 or 32): " + std::string(argv[i+1]));
+        }
+        std::cout << "[INFO] Planner precision: " << argv[i+1] << std::endl;
+        i++; // Skip the next argument since it's the input logfile
+      }
+    } else if (std::string(argv[i]) == "--policy-precision") {
+      std::cerr << "--policy-precision" << std::endl;
+      if (i + 1 < argc) {
+        if(argv[i+1] == std::string("16"))
+        {
+          policyFp16 = true;
+        }
+        else if(argv[i+1] == std::string("32"))
+        {
+          policyFp16 = false;
+        }
+        else{
+          throw std::runtime_error("invalid --policy-precision (should be 16 or 32): " + std::string(argv[i+1]));
+        }
+        std::cout << "[INFO] Policy precision: " << argv[i+1] << std::endl;
+        i++; // Skip the next argument since it's the input logfile
+      }
+      else{
+        std::cerr << "old and weak" << std::endl;
+      }
+    } else if (std::string(argv[i]) == "--enable-csv-logs") {
+      enableCsvLogs = true;
+      std::cout << "[INFO] CSV logging enabled" << std::endl;
+    } else if (std::string(argv[i]) == "--logs-dir") {
+      if (i + 1 < argc) {
+        logsDir = argv[i + 1];
+        std::cout << "[INFO] Using logs directory: " << logsDir << std::endl;
+        i++; // Skip next arg (the path)
+      } else {
+        std::cerr << "Error: --logs-dir requires a path argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--zmq-host") {
+      if (i + 1 < argc) { zmq_host = argv[i + 1]; i++; }
+    } else if (std::string(argv[i]) == "--zmq-port") {
+      if (i + 1 < argc) { zmq_port = std::stoi(argv[i + 1]); i++; }
+    } else if (std::string(argv[i]) == "--zmq-topic") {
+      if (i + 1 < argc) { zmq_topic = argv[i + 1]; i++; }
+    } else if (std::string(argv[i]) == "--zmq-conflate") {
+      zmq_conflate = true;
+    } else if (std::string(argv[i]) == "--zmq-verbose") {
+      zmq_verbose = true;
+    } else if (std::string(argv[i]) == "--enable-motion-recording") {
+      enableMotionRecording = true;
+      std::cout << "[INFO] Motion recording enabled" << std::endl;
+    } else if (std::string(argv[i]) == "--set-compliance") {
+      if (i + 1 < argc) {
+        // Parse compliance values (can be 1 or 3 values)
+        std::string compliance_str = argv[i + 1];
+        std::vector<double> values;
+        std::stringstream ss(compliance_str);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+          try {
+            values.push_back(std::stod(token));
+          } catch (...) {
+            std::cerr << "Error: Invalid compliance value: " << token << std::endl;
+            exit(1);
+          }
+        }
+        if (values.size() == 1) {
+          initial_compliance = {values[0], values[0], 0.0};
+          std::cout << "[INFO] Initial VR 3-point compliance set to: [" << values[0] 
+                    << ", " << values[0] << ", 0.0]" << std::endl;
+        } else if (values.size() == 3) {
+          initial_compliance = {values[0], values[1], values[2]};
+          std::cout << "[INFO] Initial VR 3-point compliance set to: ["
+                    << values[0] << ", " << values[1] << ", " << values[2] << "]" << std::endl;
+        } else {
+          std::cerr << "Error: --set-compliance requires 1 or 3 comma-separated values" << std::endl;
+          exit(1);
+        }
+        i++; // Skip the next argument since it's the compliance value
+      } else {
+        std::cerr << "Error: --set-compliance requires a value argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--max-close-ratio") {
+      if (i + 1 < argc) {
+        try {
+          initial_max_close_ratio = std::stod(argv[i + 1]);
+          // Validate range [0.2, 1.0]
+          if (initial_max_close_ratio < 0.2 || initial_max_close_ratio > 1.0) {
+            std::cerr << "Error: --max-close-ratio must be between 0.2 and 1.0" << std::endl;
+            exit(1);
+          }
+          std::cout << "[INFO] Initial hand max close ratio set to: " << initial_max_close_ratio 
+                    << " (0.2 = limited, 1.0 = full closure)" << std::endl;
+        } catch (...) {
+          std::cerr << "Error: Invalid max close ratio value: " << argv[i + 1] << std::endl;
+          exit(1);
+        }
+        i++; // Skip the next argument since it's the ratio value
+      } else {
+        std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--use-zmq-bridge") {
+      // Deprecated: ZMQ bridge is now the only path. Accept the flag for
+      // backward compat with existing scripts but otherwise ignore it.
+      std::cout << "[WARN] --use-zmq-bridge is deprecated (ZMQ bridge is the only path now)" << std::endl;
+    } else if (std::string(argv[i]) == "--zmq-robot-ip") {
+      if (i + 1 < argc) {
+        zmqRobotIp = argv[i + 1];
+        std::cout << "[INFO] ZMQ bridge robot IP: " << zmqRobotIp << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --zmq-robot-ip requires an IP address argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--zmq-robot-state-port" ||
+               std::string(argv[i]) == "--zmq-robot-cmd-port" ||
+               std::string(argv[i]) == "--zmq-robot-lowcmd-udp-port") {
+      const std::string option = argv[i];
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << option << " requires a port argument" << std::endl;
+        exit(1);
+      }
+      try {
+        std::size_t parsed = 0;
+        const int value = std::stoi(argv[i + 1], &parsed);
+        const bool udp_option =
+            option == "--zmq-robot-lowcmd-udp-port";
+        if (parsed != std::string(argv[i + 1]).size() ||
+            value < (udp_option ? 0 : 1) || value > 65535) {
+          throw std::out_of_range(
+              udp_option
+                  ? "port outside [0, 65535]"
+                  : "port outside [1, 65535]");
+        }
+        if (option == "--zmq-robot-state-port") {
+          zmqRobotStatePort = value;
+        } else if (option == "--zmq-robot-cmd-port") {
+          zmqRobotCmdPort = value;
+        } else {
+          zmqRobotLowcmdUdpPort = value;
+        }
+        std::cout << "[INFO] " << option << " = " << value << std::endl;
+      } catch (...) {
+        std::cerr << "Error: " << option
+                  << " must be an integer within "
+                  << (option == "--zmq-robot-lowcmd-udp-port"
+                          ? "[0, 65535]"
+                          : "[1, 65535]")
+                  << " (got: "
+                  << argv[i + 1] << ")" << std::endl;
+        exit(1);
+      }
+      i++;
+    } else if (std::string(argv[i]) == "--hand-type") {
+      if (i + 1 < argc) {
+        handType = argv[i + 1];
+        if (handType != "none" && handType != "dex3" && handType != "brainco") {
+          std::cerr << "Error: --hand-type must be none|dex3|brainco (got: " << handType << ")" << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] hand_type = " << handType << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --hand-type requires an argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--hand-close-threshold") {
+      if (i + 1 < argc) {
+        try {
+          std::size_t parsed = 0;
+          handCloseThreshold = std::stod(argv[i + 1], &parsed);
+          if (parsed != std::string(argv[i + 1]).size() ||
+              !brainco_hand_safety::IsThresholdValid(handCloseThreshold)) {
+            throw std::invalid_argument("outside [0, 1]");
+          }
+        } catch (...) {
+          std::cerr << "Error: --hand-close-threshold must be a finite value in [0, 1] (got: "
+                    << argv[i + 1] << ")" << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] BrainCo hand close threshold = "
+                  << handCloseThreshold << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --hand-close-threshold requires a value" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--brainco-feedback-grace-ms") {
+      if (i + 1 < argc) {
+        try {
+          std::size_t parsed = 0;
+          const int value = std::stoi(argv[i + 1], &parsed);
+          if (parsed != std::string(argv[i + 1]).size() ||
+              value < 0 || value > 60000) {
+            throw std::out_of_range("outside [0, 60000]");
+          }
+          braincoFeedbackGraceMs = value;
+        } catch (...) {
+          std::cerr << "Error: --brainco-feedback-grace-ms must be an integer within "
+                    << "[0, 60000] (got: " << argv[i + 1] << ")" << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] BrainCo feedback grace = "
+                  << braincoFeedbackGraceMs << " ms" << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --brainco-feedback-grace-ms requires a value" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--brainco-clamp-ms" ||
+               std::string(argv[i]) == "--brainco-pregrasp-ms") {
+      const bool deprecated_pregrasp_option =
+          std::string(argv[i]) == "--brainco-pregrasp-ms";
+      if (i + 1 < argc) {
+        try {
+          std::size_t parsed = 0;
+          const int value = std::stoi(argv[i + 1], &parsed);
+          if (parsed != std::string(argv[i + 1]).size() ||
+              value < 0 || value > 60000) {
+            throw std::out_of_range("outside [0, 60000]");
+          }
+          braincoClampMs = value;
+        } catch (...) {
+          std::cerr << "Error: " << argv[i] << " must be an integer within "
+                    << "[0, 60000] (got: " << argv[i + 1] << ")" << std::endl;
+          exit(1);
+        }
+        if (deprecated_pregrasp_option) {
+          std::cerr << "[WARN] --brainco-pregrasp-ms is deprecated; use "
+                    << "--brainco-clamp-ms" << std::endl;
+        }
+        std::cout << "[INFO] BrainCo clamp duration = "
+                  << braincoClampMs << " ms" << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: " << argv[i] << " requires a value" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--lock-waist-axes") {
+      if (i + 1 < argc) {
+        try {
+          waistLockAxes = waist_lock::ParseAxes(argv[i + 1]);
+        } catch (const std::exception& e) {
+          std::cerr << "Error: --lock-waist-axes " << e.what() << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] Waist axis lock request: "
+                  << waist_lock::Describe(waistLockAxes) << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --lock-waist-axes requires none, yaw, roll, pitch, or a comma-separated list" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--waist-lock-kp" ||
+               std::string(argv[i]) == "--waist-lock-kd") {
+      const std::string option = argv[i];
+      if (i + 1 < argc) {
+        try {
+          const double value = waist_lock::ParsePositiveFinite(argv[i + 1], option.c_str());
+          if (option == "--waist-lock-kp") {
+            waistLockKp = value;
+          } else {
+            waistLockKd = value;
+          }
+          std::cout << "[INFO] " << option << " = " << value << std::endl;
+        } catch (const std::exception& e) {
+          std::cerr << "Error: " << e.what() << std::endl;
+          exit(1);
+        }
+        i++;
+      } else {
+        std::cerr << "Error: " << option << " requires a positive finite value" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--left-shoulder-back-offset-deg") {
+      if (i + 1 < argc) {
+        try {
+          std::size_t parsed = 0;
+          leftShoulderBackOffsetDeg = std::stod(argv[i + 1], &parsed);
+          if (parsed != std::string(argv[i + 1]).size() ||
+              !left_shoulder_back_offset::IsValidOffsetDeg(
+                  leftShoulderBackOffsetDeg)) {
+            throw std::invalid_argument("outside [0, 90]");
+          }
+        } catch (...) {
+          std::cerr
+              << "Error: --left-shoulder-back-offset-deg must be a finite "
+              << "value within [0, 90] (got: " << argv[i + 1] << ")"
+              << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] Left shoulder rearward pitch offset = "
+                  << leftShoulderBackOffsetDeg << " deg" << std::endl;
+        i++;
+      } else {
+        std::cerr
+            << "Error: --left-shoulder-back-offset-deg requires a value"
+            << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--no-hands" || std::string(argv[i]) == "--disable-hands") {
+      handType = "none";
+      std::cout << "[INFO] --no-hands is deprecated, using --hand-type none" << std::endl;
+    } else if (std::string(argv[i]) == "--direct-upper-body-control") {
+      directUpperBodyControl = true;
+      std::cout << "[INFO] Direct upper-body motor target override enabled" << std::endl;
+    } else if (std::string(argv[i]) == "--direct-upper-body-arm-only") {
+      directUpperBodyArmOnly = true;
+      std::cout << "[INFO] Direct upper-body override mode: arms only; waist follows SONIC baseline" << std::endl;
+    } else if (std::string(argv[i]) == "--direct-upper-body-skip-wrist") {
+      directUpperBodySkipWrist = true;
+      std::cout << "[INFO] Direct upper-body override mode: wrist follows SONIC baseline" << std::endl;
+    } else if (std::string(argv[i]) == "--direct-upper-body-kp-scale") {
+      if (i + 1 < argc) {
+        directUpperBodyKpScale = std::stod(argv[i + 1]);
+        std::cout << "[INFO] Direct upper-body Kp scale: " << directUpperBodyKpScale << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --direct-upper-body-kp-scale requires a value" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--direct-upper-body-kd-scale") {
+      if (i + 1 < argc) {
+        directUpperBodyKdScale = std::stod(argv[i + 1]);
+        std::cout << "[INFO] Direct upper-body Kd scale: " << directUpperBodyKdScale << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --direct-upper-body-kd-scale requires a value" << std::endl;
+        exit(1);
+      }
+    }
+  }
+
+  std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
+  G1Deploy custom(
+    networkInterface,
+    modelFile,
+    motionDataPath,
+    disableCrcCheck,
+    obsConfigPath,
+    encoderFile,
+    plannerFile,
+    targetMotionLogfile,
+    plannerMotionLogfile,
+    policyInputLogfile,
+    inputType,
+    outputType,
+    recordInputFile,
+    playbackInputFile,
+    plannerFp16,
+    policyFp16,
+    logsDir,
+    enableCsvLogs,
+    zmq_host,
+    zmq_port,
+    zmq_topic,
+    zmq_conflate,
+    zmq_verbose,
+    zmq_out_port,
+    zmq_out_topic,
+    enableMotionRecording,
+    initial_compliance,
+    initial_max_close_ratio,
+    zmqRobotIp,
+    zmqRobotStatePort,
+    zmqRobotCmdPort,
+    zmqRobotLowcmdUdpPort,
+    handType,
+    handCloseThreshold,
+    braincoClampMs,
+    braincoFeedbackGraceMs,
+    directUpperBodyControl,
+    directUpperBodyArmOnly,
+    directUpperBodySkipWrist,
+    directUpperBodyKpScale,
+    directUpperBodyKdScale,
+    waistLockAxes,
+    waistLockKp,
+    waistLockKd,
+    leftShoulderBackOffsetDeg,
+    jointMeasuredSpeedLimit,
+    lowerBodyEnergyGovernorEnabled,
+    lowerBodyEnergyGovernorScale,
+    lowerBodyEnergyGovernorTremorGated,
+    lowerBodyTremorTriggerThreshold,
+    lowerBodyTremorPeakToPeakThreshold,
+    lowerBodyTremorRecoveryDamping,
+    static_cast<std::size_t>((lowerBodyTremorHoldMs + 19) / 20),
+    lowerBodyBrakingPrioritySlewEnabled,
+    lowerBodyBrakingPrioritySlewMaxStep,
+    static_cast<std::size_t>(
+        (lowerBodyBrakingPrioritySlewHoldMs + 19) / 20),
+    lowerBodyObservationGuardEnabled,
+    static_cast<std::size_t>((lowerBodyObservationGuardHoldMs + 19) / 20),
+    lowerBodyObservationGuardAlpha,
+    lowerBodyObservationGuardMaxPolicyDqStep,
+    lowerBodyObservationGuardMaxPositionDqResidual,
+    lowerBodyObservationGuardContinuousInnovationClip,
+    lowerBodyObservationGuardRepairUntilCaughtUp,
+    lowerBodyObservationGuardAllMonitored,
+    lowerBodyObservationGuardBothAnkleRolls,
+    lowerBodyObservationGuardAnkleRollTriggerOnly,
+    lowerBodyObservationGuardFixedWindow,
+    lowerBodyImpactDamperEnabled,
+    lowerBodyImpactDamperExtraKd,
+    static_cast<std::size_t>((lowerBodyImpactDamperHoldMs + 19) / 20),
+    lowerBodyImpactDamperAllMonitored
+  );
+  std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
+  
+  // Main application loop - check both operator_state.stop and ROS2 status if using ROS2
+#if HAS_ROS2
+  if (inputType == "ros2") {
+    while (!custom.operator_state.stop && rclcpp::ok()) { 
+      sleep(0.02); 
+    }
+    if (!rclcpp::ok()) {
+      std::cout << "[INFO] ROS2 shutdown detected (Ctrl+C)" << std::endl;
+    }
+  } else {
+    while (!custom.operator_state.stop) { sleep(0.02); }
+  }
+#else
+  while (!custom.operator_state.stop) { sleep(0.02); }
+#endif
+  
+  std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;
+  custom.Stop();
+  std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
+  sleep(0.5);
+  std::cout << "[DEBUG] Program exiting normally..." << std::endl;
+  return 0;
+}

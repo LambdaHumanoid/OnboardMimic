@@ -1,0 +1,16 @@
+{
+  "sonic_reference": "45c03facbf848e0c743091b7d9c17952096ff908",
+  "sdk_commit": "8941e1dbbf4313fe83846f82984eaa8c992690bf",
+  "artifacts": [
+    {
+      "file": "XRoboToolkit-PC-Service-headless_1.0.0.0_arm64.deb",
+      "url": "https://github.com/XR-Robotics/XRoboToolkit-PC-Service/releases/download/v1.0.0/XRoboToolkit-PC-Service-headless_1.0.0.0_arm64.deb",
+      "sha256": "532c605dfa1a02b05b7c285b856c91771c78623cded30ef5b16ea371de49ed5f"
+    },
+    {
+      "file": "xrt-python-8941e1d.tar.gz",
+      "url": "https://api.github.com/repos/XR-Robotics/XRoboToolkit-PC-Service-Pybind/tarball/8941e1dbbf4313fe83846f82984eaa8c992690bf",
+      "sha256": "1364044ea6db39093501d14c9b4c6e6829f1ed775da4303250daf3748c02c353"
+    }
+  ]
+}

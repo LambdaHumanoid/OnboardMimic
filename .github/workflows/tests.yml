@@ -1,0 +1,25 @@
+name: Offline tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - run: python -m pip install numpy==1.24.4 scipy==1.10.1 pyzmq==25.1.2 msgpack==1.0.8
+      - run: bash scripts/test.sh
+      - name: Native bridge watchdog, owner lock and reference comparison (no ROS or robot)
+        run: |
+          cmake -S onboardmimic/robots/unitree_g1/native_bridge -B /tmp/bridge-core -DBUILD_ROS_BRIDGE=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/bridge-core
+          ctest --test-dir /tmp/bridge-core --output-on-failure
+          python onboardmimic/robots/unitree_g1/native_bridge/differential_test.py --reference onboardmimic/robots/unitree_g1/bridge/lowcmd_transport.py --binary /tmp/bridge-core/core_test
+      - run: sudo apt-get update && sudo apt-get install -y libgtest-dev
+      - name: Native safety tests (no GPU or robot)
+        run: |
+          g++ -std=c++20 -O2 -ffast-math onboardmimic/backends/sonic/deploy/src/g1/g1_deploy_onnx_ref/unit_tests/test_control_start_safety.cpp onboardmimic/backends/sonic/deploy/src/g1/g1_deploy_onnx_ref/unit_tests/test_joint_velocity_safety.cpp -lgtest -lgtest_main -pthread -o /tmp/safety-tests
+          /tmp/safety-tests

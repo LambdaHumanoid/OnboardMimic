@@ -1,0 +1,29 @@
+{
+  "upstream": {
+    "url": "https://github.com/NVlabs/GR00T-WholeBodyControl",
+    "structure_reference_commit": "45c03facbf848e0c743091b7d9c17952096ff908",
+    "note": "Layout reference only; deployment source is our tested deployment snapshot, not this exact upstream revision."
+  },
+  "unitree_sdk2": {
+    "url": "https://github.com/unitreerobotics/unitree_sdk2.git",
+    "revision": "72cd48045a15480a463f751ec1b24c8267d5106b"
+  },
+  "models": {
+    "repo": "nvidia/GEAR-SONIC",
+    "revision": "6733128a3d8a523b1418b06bca3cdf61c8b0987f",
+    "files": {
+      "model_encoder.onnx": {
+        "destination": "policy/release/model_encoder.onnx",
+        "sha256": "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
+      },
+      "model_decoder.onnx": {
+        "destination": "policy/release/model_decoder.onnx",
+        "sha256": "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed"
+      },
+      "planner_sonic.onnx": {
+        "destination": "planner/target_vel/V2/planner_sonic.onnx",
+        "sha256": "39b553e197f62f077975ba38512bc04781a3fc37c2af7c6756e04629f760edea"
+      }
+    }
+  }
+}

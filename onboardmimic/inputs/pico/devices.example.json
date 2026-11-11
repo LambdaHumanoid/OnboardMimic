@@ -1,0 +1,11 @@
+{
+  "headset": "PICO 4 Ultra",
+  "max_age_ms": 250,
+  "roles": {
+    "left_wrist": "",
+    "right_wrist": "",
+    "waist": "",
+    "left_ankle": "",
+    "right_ankle": ""
+  }
+}
