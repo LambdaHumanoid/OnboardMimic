@@ -3,6 +3,9 @@
 Local testing on 2026-11-12. **These results are not JP6 hardware acceptance.**
 本地测试日期：2026-11-12。**以下结果不等于 JP6 实机验收。**
 
+[CI: Python3.8 + 3.10 and native tests](https://github.com/LambdaHumanoid/OnboardMimic/actions/runs/43210990842) passed for `e586a25`.
+[CI：Python3.8 / 3.10 及原生测试](https://github.com/LambdaHumanoid/OnboardMimic/actions/runs/43210990842)已在 `e586a25` 通过。
+
 ## Test environment / 测试环境
 
 Ubuntu 22.04.5 x86-64, Python3.10.12, RTX5090D, CUDA12.9,
@@ -20,7 +23,7 @@ CUDA12.6.68 头文件；未在 Jetson 上链接或执行。桌面引擎不能直
 
 | Check / 检查 | Result / 结果 |
 |---|---|
-| Python offline suite / Python 离线测试 | 211 tests passed on Python3.10 / 211 项通过 |
+| Python offline suite / Python 离线测试 | 211 tests passed on Python3.8 and 3.10 / 两个版本各 211 项通过 |
 | Native safety / 原生安全逻辑 | 16 tests passed / 16 项通过 |
 | Watchdog and writer ownership / 看门狗与控制权 | 2 native tests + 20,000 independent reference transitions passed / 通过 |
 | TensorRT8/10 dispatch / API 分支 | Mocked API and integer-buffer tests passed / 模拟 API 与整数缓冲区测试通过 |
@@ -33,6 +36,15 @@ CUDA12.6.68 头文件；未在 Jetson 上链接或执行。桌面引擎不能直
 | Python and C++ GPU benchmark / GPU 压力测试 | Each ran 60 s at policy50Hz/planner10Hz, no deadline misses / 各运行 60 秒，无周期超时 |
 | Source-validation workflow / 源码验证流程 | Complete desktop diagnostic passed; marked host-only, ineligible for Jetson setup / 桌面诊断通过，不用于放行 Jetson 安装 |
 | Console / 控制台 | Desktop keyboard/release-stop, bilingual labels and mobile load passed with a mock backend / 模拟后台下键盘、松开停止、双语及手机加载通过 |
+
+The extended C++ run lasted 300 seconds: 15,000 policy cycles and 3,000 planner
+cycles, with zero deadline misses. Policy completion p99/max were 2.03/8.25 ms;
+planner completion p99/max were 5.12/8.58 ms. These are desktop GPU measurements,
+including host scheduling, not Jetson performance claims.
+
+扩展 C++ 压力测试持续 300 秒：15,000 次策略周期、3,000 次规划周期，无周期超时。
+策略完成时间 p99/最大值为 2.03/8.25 ms，规划器为 5.12/8.58 ms。
+这些是包含主机调度的桌面 GPU 测量值，不代表 Jetson 性能。
 
 ### Closed-loop simulation / 闭环仿真
 
