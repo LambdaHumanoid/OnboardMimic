@@ -70,7 +70,7 @@ To remove PICO from this deployment, after backup and stop run `sudo systemctl d
 
 ## 3. Install in a new directory
 
-For the supported G1 / JP5 configuration, download and extract the complete [v0.1.0 package set](PREBUILT.md) in the new directory, then install without changing services:
+For the supported G1 / JP5 configuration, download and extract the complete [v0.1.1 package set](PREBUILT.md) in the new directory, then install without changing services:
 
 ```bash
 python3 scripts/setup.py --yes --install-only --pico

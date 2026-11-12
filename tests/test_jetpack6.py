@@ -191,7 +191,7 @@ class CommunityInstallerTests(unittest.TestCase):
     def test_supported_patch_versions_and_carrier_name(self):
         from onboardmimic.backends.sonic.platforms import source_environment_errors
         facts=SourceValidationTests().facts()
-        for l4t,trt in [('36.3.0','10.0.1'),('36.4.3','10.3.0'),('36.4.4','10.3.0.30')]:
+        for l4t,trt in [('36.3.0','10.0.1'),('36.4.3','10.3.0'),('36.4.4','10.3.0.30'),('36.4.7','10.3.0.30')]:
             self.assertEqual(source_environment_errors(dict(facts,l4t=l4t,tensorrt=trt,board='Custom G1 carrier')),[])
         self.assertTrue(source_environment_errors(dict(facts,board='Other board',gpu='Other GPU')))
 
@@ -231,3 +231,56 @@ class CommunityInstallerTests(unittest.TestCase):
         with patch.object(module,'basic_environment',return_value=dict(arch='x86_64',ubuntu='22.04',l4t='')), patch.object(v,'environment') as runtime, patch.object(module,'run') as run:
             with self.assertRaisesRegex(RuntimeError,'Requires JetPack 6'):module.main([])
             runtime.assert_not_called();run.assert_not_called()
+
+class FreshJP6InstallationTests(unittest.TestCase):
+    """Exercise the real bootstrap through the installer, without apt/GPU access."""
+    def test_missing_components_are_repaired_before_runtime_probe(self):
+        from scripts import install_tensorrt as trt
+        from onboardmimic.backends.sonic import source_validation as validation
+        module = CommunityInstallerTests().module()
+        facts = dict(SourceValidationTests().facts(), l4t='36.4.7')
+        version = '10.3.0.30-1+cuda12.5'
+        complete = {name: version for name in trt.packages('jp6', True)}
+        for before in ({}, {k:v for k,v in complete.items() if k != 'python3-libnvinfer'},
+                       {k:v for k,v in complete.items() if k in trt.packages('jp6', False)}):
+            events = []
+            with self.subTest(installed=list(before)), contextlib.ExitStack() as stack:
+                def patched(obj, name, **kwargs):
+                    return stack.enter_context(patch.object(obj, name, **kwargs))
+                patched(module, 'basic_environment', return_value=facts)
+                patched(module.os, 'geteuid', return_value=1000)
+                patched(module, 'require_idle')
+                patched(trt, 'target_profile', return_value=('jp6', 'r36.4'))
+                patched(trt, 'installed_packages', side_effect=[before, complete])
+                patched(trt, 'require_idle')
+                apt = patched(trt, 'run', side_effect=lambda *a, **k: events.append('apt'))
+                patched(trt, 'available_versions', return_value={version})
+                patched(trt.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='', stderr=''))
+                patched(trt, 'verify', side_effect=lambda *a: events.append('verified'))
+                patched(validation, 'environment', side_effect=lambda: (events.append('runtime'), facts)[1])
+                steps = patched(module, 'run', side_effect=lambda *a, **k: events.append('stage'))
+                patched(module.shutil, 'which', return_value='/usr/bin/docker')
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                self.assertEqual(module.main([]), 0)
+                specs = [v for v in apt.call_args_list[-1].args[0] if '=' in v]
+                self.assertEqual(set(specs), {k+'='+version for k in complete if k not in before})
+                self.assertLess(events.index('verified'), events.index('runtime'))
+                self.assertLess(events.index('runtime'), events.index('stage'))
+                self.assertIn('--pico', steps.call_args.args[0])
+                self.assertIn('--configure-only', steps.call_args.args[0])
+
+    def test_conflicting_runtime_stops_before_build_or_configuration(self):
+        from scripts import install_tensorrt as trt
+        from onboardmimic.backends.sonic import source_validation as validation
+        module = CommunityInstallerTests().module()
+        with patch.object(module, 'basic_environment', return_value=SourceValidationTests().facts()), \
+             patch.object(module.os, 'geteuid', return_value=1000), \
+             patch.object(trt, 'target_profile', return_value=('jp6', 'r36.4')), \
+             patch.object(trt, 'installed_packages', return_value={'libnvinfer8':'8.6.2-1'}), \
+             patch.object(trt, 'run') as apt, patch.object(module, 'run') as stages, \
+             patch.object(validation, 'environment') as probe:
+            with self.assertRaisesRegex(RuntimeError, 'conflicts'):
+                module.main([])
+            apt.assert_not_called()
+            stages.assert_not_called()
+            probe.assert_not_called()

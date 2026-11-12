@@ -20,9 +20,13 @@ SONIC is our first onboard controller. Run it on your G1’s own Jetson: keep th
 
 https://github.com/user-attachments/assets/6afc6f3e-d37e-4cd0-8d34-da85d1bc39bf
 
-[🚀 Get started](#get-started) · [📦 Download v0.1.0](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.0) · [🤝 Community](#community) · [🎮 Console](#consoles) · [🧩 Architecture](docs/ARCHITECTURE.md)
+[🚀 Get started](#get-started) · [📦 Download v0.1.1](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1) · [🤝 Community](#community) · [🎮 Console](#consoles) · [🧩 Architecture](docs/ARCHITECTURE.md)
 
 ## 📰 News
+
+- **[v0.1.1](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1) · Easier JP5 installation.** Automatic TensorRT dependency installation, broader JP5 compatibility, and improved controller detection.
+
+> **v0.1.1 · JP5 安装更省心。** 自动补装 TensorRT 依赖，放宽 JP5 兼容检测，完善控制进程识别。
 
 - **v0.1.0 · First aboard: SONIC.** [Prebuilt packages](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.0) for G1 / JetPack 5, with bilingual desktop/mobile consoles for **Planner walking** and optional **PICO Pose** teleoperation. [Setup and controls](docs/CONTROL_EXTENSIONS.md).
 
@@ -68,15 +72,19 @@ SONIC is our first onboard controller, with **SuperMimic planned as the next bac
 | System / 系统 | JetPack 5 · Ubuntu 20.04 · L4T **35.3.1** |
 | GPU software / GPU 软件 | CUDA **11.4** · TensorRT **8.5.2** |
 
-**Start with your coding agent:** give it this repository and ask it to check your hardware/software versions, download the v0.1.0 packages, follow the installation guide, configure communication, and open the console. For manual setup:
+**JetPack 6 users:** use the [JP6 source installer](docs/JETPACK6.md) on this branch. The downloadable v0.1.1 archives below are for **JetPack 5 only**.
 
-1. Download the three archives and checksums from [v0.1.0](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.0), then follow the [package guide](docs/PREBUILT.md) to verify and extract them.
+> **JetPack 6 用户：**请使用本分支的 [JP6 源码安装入口](docs/JETPACK6.md)。下面的 v0.1.1 压缩包仅用于 **JetPack 5**。
+
+**Start with your coding agent:** give it this repository and ask it to check your hardware/software versions, download the v0.1.1 packages, follow the installation guide, configure communication, and open the console. For manual setup:
+
+1. Download the three archives and checksums from [v0.1.1](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1), then follow the [package guide](docs/PREBUILT.md) to verify and extract them.
 2. Run **`python3 scripts/setup.py`** in `OnboardMimic/`. The wizard installs dependencies, checks inference, configures communication and opens the idle console. Choose LAN access for phones; PICO is optional.
 3. Open the console: **Connect services → Prepare posture → Start controller.** Installing or opening the page does not start SONIC.
 
-> **直接把仓库交给你的 coding agent。** 让它先核对软硬件版本，再下载 v0.1.0 安装包，按指南完成安装、通信配置和控制台启动。手动安装：
+> **直接把仓库交给你的 coding agent。** 让它先核对软硬件版本，再下载 v0.1.1 安装包，按指南完成安装、通信配置和控制台启动。手动安装：
 >
-> 1. 从 [v0.1.0](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.0) 下载三个压缩包和校验值，按[预编译安装指南](docs/PREBUILT_zh.md)校验并解压。
+> 1. 从 [v0.1.1](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1) 下载三个压缩包和校验值，按[预编译安装指南](docs/PREBUILT_zh.md)校验并解压。
 > 2. 在 `OnboardMimic/` 中运行 **`python3 scripts/setup.py`**。向导安装依赖、检查推理、配置通信并启动空闲控制台；手机访问选择 LAN，PICO 可选。
 > 3. 打开控制台，手动执行 **连接服务 → 准备姿态 → 启动控制器**。安装或打开页面不会启动 SONIC。
 

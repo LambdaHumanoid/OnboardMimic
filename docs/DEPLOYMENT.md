@@ -8,9 +8,9 @@ Target: G1 29-DOF body, Orin NX 16 GB, JetPack 5 / L4T 35.3.1, CUDA 11.4 and Ten
 
 ## 1. Install
 
-For the supported G1 / JP5 configuration, use the v0.1.0 prebuilt packages:
+For the supported G1 / JP5 configuration, use the v0.1.1 prebuilt packages:
 
-- **Prebuilt (recommended):** download the complete [v0.1.0 package set](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.0). Its `python3 scripts/setup.py` wizard completes steps 2 and 3. See the [package guide](PREBUILT.md) for the required file set.
+- **Prebuilt (recommended):** download the complete [v0.1.1 package set](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1). Its `python3 scripts/setup.py` wizard completes steps 2 and 3. See the [package guide](PREBUILT.md) for the required file set.
 - **Source:** follow the [source build guide](SOURCE_BUILD.md), including dependencies, models, compilation, engines and tests, then continue to step 2. Run native and model builds sequentially.
 
 Installation installs `python3-venv` and updates pip inside the venv; network and sudo access are required. It does not upgrade JetPack or start motion control. Missing ROS2 dependencies are repaired with `bash install_scripts/install_ros_dependencies.sh`. Steps 2 and 3 are for source builds or manual configuration.

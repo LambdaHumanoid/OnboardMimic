@@ -71,6 +71,29 @@ matching G1 scene and rejects execution outside an isolated network namespace.
 三项均未出现非有限数值、控制器退出或仿真摔倒。测试脚本为
 `tests/simulation/sonic_rollout.py`，需另行提供匹配的 G1 场景；脚本拒绝在非隔离网络中运行。
 
+## Installation follow-up / 安装流程补充验证
+
+The updated branch passed 229 Python tests on Python 3.10. Installer integration
+coverage includes L4T36.4.7, an absent TensorRT stack, missing Python bindings,
+missing build components, and rejection of an incompatible installed TensorRT.
+The tests exercise the real bootstrap logic with apt/GPU calls mocked, and check
+that dependency repair precedes runtime inspection and service configuration.
+
+更新后的分支在 Python3.10 下通过 229 项测试。安装入口覆盖 L4T36.4.7、完全缺少
+TensorRT、缺少 Python 绑定、缺少编译组件，以及拒绝已有不兼容 TensorRT 的情况。
+测试调用实际补装逻辑，模拟 apt/GPU 操作，并检查先补齐依赖、再检测运行库和配置服务。
+
+Separately, APT resolved the missing-stack, missing-bindings and missing-development
+cases using NVIDIA's official r36.4 ARM64 package index and a synthetic Ubuntu22.04
+installed-package database. All three plans passed: TensorRT10.3.0.30 components
+were selected without removals or upgrades to existing packages. This was resolver
+simulation only, not an ARM64 package installation or Jetson inference test.
+
+另用 NVIDIA 官方 r36.4 ARM64 软件包索引及模拟的 Ubuntu22.04 已安装软件包数据库，
+执行 APT 依赖解析。完全缺失、缺少绑定、缺少编译组件三种情况均通过，选用
+TensorRT10.3.0.30，计划不包含卸载或升级已有包。这是依赖解析模拟，未实际安装
+ARM64 软件包，也不代表 Jetson 推理测试。
+
 ## Limits and open checks / 边界与待测项目
 
 - JP6 ARM64 final linking/loading, actual Jetson TensorRT10.3 numerics and timing,

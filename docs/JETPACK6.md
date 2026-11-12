@@ -6,11 +6,11 @@ Branch / 分支：`feature/jetpack6`。JP6 hardware testing is pending / 尚待 
 
 For G1 with an Orin NX 16 GB, Ubuntu22.04 / JetPack6 (L4T36.x), CUDA12 and
 TensorRT10. JP6.2 is the preferred starting point. JP6.0 with TensorRT8.6 is not yet
-covered. Use the source installer below, not the JP5 v0.1.0 prebuilt archives.
+covered. Use the source installer below, not the JP5 v0.1.1 prebuilt archives.
 
 适用于 G1 的 Orin NX 16GB、Ubuntu22.04 / JetPack6（L4T36.x）、CUDA12、TensorRT10，
 建议优先使用 JP6.2。JP6.0 / TensorRT8.6 暂不支持。请使用下面的源码安装入口，
-不要下载 JP5 的 v0.1.0 预编译包。
+不要下载 JP5 的 v0.1.1 预编译包。
 
 ```bash
 git clone --branch feature/jetpack6 https://github.com/LambdaHumanoid/OnboardMimic.git OnboardMimic-jp6
@@ -44,6 +44,20 @@ label. Missing TensorRT10 libraries, system Python bindings and build tools are 
 
 使用系统 Python，避免 Conda 遮蔽 JetPack 运行库。检测允许 L4T36.x / TensorRT10.x
 的小版本差异，不要求载板名称完全一致。缺少的 TensorRT10 运行库、系统 Python 绑定和编译工具会在验证前从对应 NVIDIA Jetson 源自动安装；已有匹配版本保留。版本冲突或 CUDA 本身缺失仍会在长时间编译前明确报错。
+
+### Example supported installation target / 安装目标示例
+
+Orin NX 16 GB + Ubuntu22.04 + L4T36.4.7 + CUDA12.6, with TensorRT not yet
+installed, is accepted by the installer. The installer obtains TensorRT10 from
+the matching Jetson repository and builds engines on that Jetson. An existing
+ROS2 Humble installation can be reused; Unitree messages use a separate workspace.
+The repository must be reachable from the device. This is an installation target,
+not a claim that JP6 hardware acceptance has already been completed.
+
+Orin NX 16GB + Ubuntu22.04 + L4T36.4.7 + CUDA12.6、尚未安装 TensorRT 的配置
+可使用此安装入口。脚本从匹配的 Jetson 软件源补齐 TensorRT10，并在本机生成引擎。
+已有 ROS2 Humble 可以复用，宇树消息包使用独立工作空间；设备需能访问软件源。
+这是安装支持范围说明，不表示已经完成 JP6 真机验收。
 
 ## Tell us three things / 社区反馈三件事就够了
 
