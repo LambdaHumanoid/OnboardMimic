@@ -24,6 +24,10 @@ https://github.com/user-attachments/assets/6afc6f3e-d37e-4cd0-8d34-da85d1bc39bf
 
 > **v0.1.1 · JP5 安装更省心。** 自动补装 TensorRT 依赖，放宽 JP5 兼容检测，完善控制进程识别。
 
+- **v0.1.0 · First aboard: SONIC.** [Prebuilt packages](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.0) for G1 / JetPack 5, with bilingual desktop/mobile consoles for **Planner walking** and optional **PICO Pose** teleoperation. [Setup and controls](docs/CONTROL_EXTENSIONS.md).
+
+> **v0.1.0 · 首个板载控制器：SONIC。** 提供面向 G1 / JP5 的预编译安装包，配套中英文电脑和手机控制台，支持 **Planner 行走**与可选 **PICO Pose 全身遥操**。[安装与控制说明](docs/CONTROL_EXTENSIONS_zh.md)。
+
 ## 📝 TODO
 
 - [ ] **Integrate SuperMimic as an onboard backend. / 接入 SuperMimic 板载后端。**
