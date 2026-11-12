@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 [[ "$(uname -m)" == aarch64 ]] || { echo 'Run this installer on the Jetson (aarch64).'; exit 1; }
 [[ -f /etc/nv_tegra_release ]] || { echo 'JetPack 5 Jetson environment required.'; exit 1; }
+/usr/bin/python3 "$root/scripts/install_tensorrt.py" --profile jp5 --development
 sudo apt-get update
 sudo apt-get install -y g++-10 cmake git curl libmsgpack-dev nlohmann-json3-dev libzmq3-dev libgtest-dev libeigen3-dev zlib1g-dev pkg-config python3-venv python3-dev
 python3 -m venv --system-site-packages "$root/.venv"

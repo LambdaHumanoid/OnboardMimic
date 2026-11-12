@@ -15,6 +15,7 @@ set +u
 source "$ROS_SETUP"
 source "$UNITREE_ROS_SETUP"
 set -u
+/usr/bin/python3 scripts/install_tensorrt.py --profile jp5
 sudo apt-get update
 sudo apt-get install -y libzmq5 python3-venv
 # Packaged libraries + platform CUDA are used for validation subprocesses.

@@ -91,3 +91,17 @@ Model and engine identities are checked against the release manifest. Packaging 
 Library, model and source licenses are included. CUDA, TensorRT, ROS2, Unitree message packages and the Python SDK use the target environment; no system image is redistributed.
 
 For an existing deployment, use [upgrade and rollback](UPGRADE.md) rather than overwriting its directory. Packages include the native command bridge, state receiver and `bridge_build_report.json`; ROS2 Foxy and the Unitree message workspace come from the target environment. See [native bridge details](NATIVE_BRIDGE.md).
+
+## Automatic TensorRT installation
+
+The updated installer detects JetPack first and installs missing **TensorRT 8.5.2** libraries and system Python bindings for JP5. Matching installations are preserved; existing packages are not automatically upgraded or downgraded. Network access to the corresponding NVIDIA Jetson apt source is required. Conflicting versions or missing repositories produce an actionable error.
+
+Previously downloaded v0.1.0 archives do not change with the source repository. From the extracted `OnboardMimic/` directory, run the repair once before the existing wizard; no model or engine download is needed:
+
+```bash
+curl -fL https://raw.githubusercontent.com/LambdaHumanoid/OnboardMimic/main/scripts/install_tensorrt.py -o scripts/install_tensorrt.py
+/usr/bin/python3 scripts/install_tensorrt.py --profile jp5
+python3 scripts/setup.py
+```
+
+Add `--check` for inspection only, or `--development` to include headers and `trtexec` for source builds. This tool installs TensorRT only: it does not flash the device, switch JetPack or start motor control. If CUDA itself is missing, install the CUDA components matching the existing JetPack first.

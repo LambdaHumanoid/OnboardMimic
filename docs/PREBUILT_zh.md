@@ -94,3 +94,17 @@ ARM64 程序从当前原生源码重新交叉编译，使用 GCC 10.5 和 JP5 / 
 已有旧部署时按[升级与回退](UPGRADE_zh.md)迁移服务，勿覆盖原目录。
 
 包内包含原生指令桥接、状态接收器及 `bridge_build_report.json`。ROS2 Foxy 和宇树消息工作空间由目标环境提供；技术细节见[原生桥接说明](NATIVE_BRIDGE.md)。
+
+## TensorRT 自动补齐
+
+新版安装脚本会先识别 JetPack；JP5 缺少 TensorRT 时自动补齐 **8.5.2** 运行库与系统 Python 绑定。已有匹配版本保留，不自动升级或降级。软件源需可联网访问；版本冲突或对应 NVIDIA 源缺失时会说明原因。
+
+已经下载的 v0.1.0 安装包不会随仓库代码更新。可在解压后的 `OnboardMimic/` 目录执行一次补装，再运行原来的安装向导，无需重新下载模型和引擎：
+
+```bash
+curl -fL https://raw.githubusercontent.com/LambdaHumanoid/OnboardMimic/main/scripts/install_tensorrt.py -o scripts/install_tensorrt.py
+/usr/bin/python3 scripts/install_tensorrt.py --profile jp5
+python3 scripts/setup.py
+```
+
+添加 `--check` 可只检查缺失组件；源码编译用户添加 `--development` 补齐头文件与 `trtexec`。该工具只补齐 TensorRT，不刷机、不切换 JetPack、不启动运动控制。CUDA 本身缺失时仍需安装当前 JetPack 对应的 CUDA 组件。
