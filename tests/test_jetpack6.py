@@ -181,3 +181,52 @@ class TimingGateTests(unittest.TestCase):
         for bad in (dict(n=100,over_budget=1,max_ms=21),dict(n=0,over_budget=0,max_ms=0),dict(n=100,over_budget=0,max_ms=float('nan'))):
             report['results']['encoder_decoder']['completion_from_deadline']=bad
             with self.assertRaises(RuntimeError):check_timing(report)
+
+class CommunityInstallerTests(unittest.TestCase):
+    def module(self):
+        spec=importlib.util.spec_from_file_location('jp6_installer',ROOT/'scripts/install_jp6.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        return module
+
+    def test_supported_patch_versions_and_carrier_name(self):
+        from onboardmimic.backends.sonic.platforms import source_environment_errors
+        facts=SourceValidationTests().facts()
+        for l4t,trt in [('36.3.0','10.0.1'),('36.4.3','10.3.0'),('36.4.4','10.3.0.30')]:
+            self.assertEqual(source_environment_errors(dict(facts,l4t=l4t,tensorrt=trt,board='Custom G1 carrier')),[])
+        self.assertTrue(source_environment_errors(dict(facts,board='Other board',gpu='Other GPU')))
+
+    def test_install_order_and_pose_dependencies(self):
+        module=self.module()
+        with patch.object(module.shutil,'which',return_value=None):
+            steps=module.install_steps(Path('/tmp/new-ws'),True,False)
+        commands=[[str(v) for v in command] for command,_ in steps]
+        text=[' '.join(c) for c in commands]
+        self.assertTrue(any('pico/requirements.txt' in c for c in text))
+        self.assertIn(['sudo','apt-get','install','-y','docker.io'],commands)
+        self.assertIn('--inference',commands[-2])
+        self.assertIn('--source',commands[-1]);self.assertIn('--pico',commands[-1])
+        self.assertEqual(steps[-1][1]['ROS_SETUP'],'/opt/ros/humble/setup.bash')
+        self.assertEqual(steps[-1][1]['UNITREE_ROS_SETUP'],'/tmp/new-ws/install/setup.bash')
+        self.assertFalse(any('start_sonic' in c or 'prepare_posture' in c for c in text))
+        with patch.object(module.shutil,'which',return_value='/usr/bin/docker'):
+            planner=module.install_steps(Path('/tmp/ws'),False,True)
+        self.assertIn('--no-pico',planner[-1][0]);self.assertIn('--upgrade',planner[-1][0])
+        self.assertFalse(any('pico/requirements.txt' in str(c) for c,_ in planner))
+
+    def test_check_is_read_only_and_failed_step_stops_setup(self):
+        module=self.module()
+        from onboardmimic.backends.sonic import source_validation as v
+        facts=SourceValidationTests().facts()
+        with patch.object(module,'basic_environment',return_value=facts), patch.object(v,'environment',return_value=facts), patch.object(module,'run') as run, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(module.main(['--check']),0)
+            run.assert_not_called()
+        with patch.object(module,'basic_environment',return_value=facts), patch.object(v,'environment',return_value=facts), patch.object(module.os,'geteuid',return_value=1000), patch.object(module,'require_idle'), patch.object(module,'run',side_effect=RuntimeError('build failed')) as run, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError,'build failed'):module.main(['--no-pico'])
+            self.assertEqual(run.call_count,1)
+
+    def test_wrong_platform_stops_before_runtime_or_install(self):
+        module=self.module()
+        from onboardmimic.backends.sonic import source_validation as v
+        with patch.object(module,'basic_environment',return_value=dict(arch='x86_64',ubuntu='22.04',l4t='')), patch.object(v,'environment') as runtime, patch.object(module,'run') as run:
+            with self.assertRaisesRegex(RuntimeError,'Requires JetPack 6'):module.main([])
+            runtime.assert_not_called();run.assert_not_called()

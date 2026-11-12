@@ -11,7 +11,9 @@ def source_environment_errors(facts):
     errors = []
     if facts.get('arch') != 'aarch64':
         errors.append('Target source installation requires aarch64 Jetson')
-    if 'Orin NX' not in facts.get('board', '') or facts.get('memory_kib', 0) < 12*1024*1024:
+    # Carrier boards may report a vendor name instead of the compute module.
+    orin = 'Orin NX' in facts.get('board', '') or 'orin' in facts.get('gpu', '').lower()
+    if not orin or facts.get('memory_kib', 0) < 12*1024*1024:
         errors.append('Target is Orin NX 16 GB')
     ubuntu, l4t = facts.get('ubuntu', ''), facts.get('l4t', '')
     trt, cuda = facts.get('tensorrt', ''), facts.get('cuda_runtime', 0)

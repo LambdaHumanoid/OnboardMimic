@@ -11,8 +11,8 @@ case "$VERSION_ID" in
   *) echo 'Source build supports Ubuntu 20.04 / 22.04 only.'; exit 1 ;;
 esac
 sudo apt-get update
-sudo apt-get install -y "$compiler" cmake git curl libmsgpack-dev libboost-dev nlohmann-json3-dev libzmq3-dev libgtest-dev libeigen3-dev zlib1g-dev pkg-config python3-venv python3-dev
-python3 -m venv --system-site-packages "$root/.venv"
+sudo apt-get install -y "$compiler" cmake git curl libmsgpack-dev libboost-dev nlohmann-json3-dev libzmq3-dev libgtest-dev libeigen3-dev zlib1g-dev pkg-config python3-venv python3-dev libnvinfer-dev libnvonnxparsers-dev libnvinfer-bin
+/usr/bin/python3 -m venv --system-site-packages "$root/.venv"
 # Upgrade only the isolated environment; retain Python 3.8 compatibility.
 "$root/.venv/bin/python" -m pip install --upgrade pip==25.0.1
 "$root/.venv/bin/python" -m pip install -r "$root/requirements.txt"

@@ -1,114 +1,74 @@
-# JetPack 6 — v1.1 development / v1.1 开发
+# JetPack 6 — v1.1 community preview / v1.1 社区测试
 
-**Development branch: `feature/jetpack6`. Target-device acceptance is still pending.**
-**开发分支：`feature/jetpack6`。尚待 JP6 目标设备验收。**
+Branch / 分支：`feature/jetpack6`。JP6 hardware testing is pending / 尚待 JP6 真机测试。
 
-v1.1 adds a JP6 source-build path while retaining JP5 support. The released
-v0.1.0 archives remain JP5-only; do not install those binaries or engine caches on JP6.
+## Install / 安装
 
-v1.1 增加 JP6 源码构建路径，同时保留 JP5 支持。已发布的 v0.1.0 安装包仍仅适用于
-JP5；请勿在 JP6 上复用其二进制或引擎缓存。
+For G1 with an Orin NX 16 GB, Ubuntu22.04 / JetPack6 (L4T36.x), CUDA12 and
+TensorRT10. JP6.2 is the preferred starting point. JP6.0 with TensorRT8.6 is not yet
+covered. Use the source installer below, not the JP5 v0.1.0 prebuilt archives.
 
-## Target / 目标环境
-
-G1 29-DOF, Orin NX 16 GB, Ubuntu 22.04 / L4T 36.x, CUDA 12.x,
-TensorRT 10.x and ROS2 Humble. Start community testing with JP6.2 / CUDA12.6 /
-TensorRT10.3. JP6.0 / TensorRT8.6 is outside this development target.
-
-G1 29 自由度、Orin NX 16 GB、Ubuntu 22.04 / L4T 36.x、CUDA 12.x、
-TensorRT 10.x、ROS2 Humble。社区测试优先使用 JP6.2 / CUDA12.6 / TensorRT10.3；
-JP6.0 / TensorRT8.6 暂不在目标范围内。
-
-The source installer keeps GCC10 for the pinned Unitree SDK. Humble uses its own
-CycloneDDS packages; never overlay a Foxy workspace. Generate engines on the target
-Jetson. A desktop GPU, even with matching Ubuntu, is not an equivalent JP6 device.
-
-源码构建保留 GCC10，以兼容固定版本的 Unitree SDK。Humble 使用自身的 CycloneDDS
-依赖，不叠加 Foxy 工作空间。引擎必须在目标 Jetson 上生成；相同 Ubuntu 的桌面
-GPU 不等同于 JP6 设备。
-
-## Build and inspect / 构建与检查
-
-Use a fresh checkout and workspace. Stop motor control locally and reliably support
-the robot before installation. These build/check commands do not start motor output.
-Do not upgrade JetPack on a working robot just to try this branch.
-
-使用新的源码目录与工作空间。安装前由现场人员停止运动控制，并可靠支撑机器人。
-下列构建与检查命令不会启动运动输出。不要仅为测试本分支而升级在用机器人的 JetPack。
+适用于 G1 的 Orin NX 16GB、Ubuntu22.04 / JetPack6（L4T36.x）、CUDA12、TensorRT10，
+建议优先使用 JP6.2。JP6.0 / TensorRT8.6 暂不支持。请使用下面的源码安装入口，
+不要下载 JP5 的 v0.1.0 预编译包。
 
 ```bash
 git clone --branch feature/jetpack6 https://github.com/LambdaHumanoid/OnboardMimic.git OnboardMimic-jp6
 cd OnboardMimic-jp6
-bash install_scripts/install_orin.sh
-bash install_scripts/install_ros_dependencies.sh --workspace "$HOME/.local/share/onboardmimic/ros2_jp6_ws"
-export ROS_SETUP=/opt/ros/humble/setup.bash
-export UNITREE_ROS_SETUP="$HOME/.local/share/onboardmimic/ros2_jp6_ws/install/setup.bash"
-bash onboardmimic/backends/sonic/deploy/build_orin.sh
-bash onboardmimic/robots/unitree_g1/native_bridge/build.sh
-bash onboardmimic/backends/sonic/deploy/onboard/build_models.sh
-PYTHON=.venv/bin/python bash scripts/test.sh --core
-.venv/bin/python scripts/validate_source.py --inference --benchmark-seconds 60
+bash install_scripts/install_jp6.sh --check
+bash install_scripts/install_jp6.sh
 ```
 
-`var/source-validation.json` records environment versions, file hashes, library
-loading, numerical checks and timing. Running without `--inference` only inspects
-software/GPU information. `--host-test` permits desktop diagnostics but **cannot
-qualify a Jetson installation**. A failed check replaces any earlier success report.
-The inference check refuses to run while a recognized controller/bridge is active.
+`--check` only checks the actual platform/runtime versions. Installation then
+handles dependencies, ROS2 Humble, native programs, model download, engine
+compilation, automatic software checks, PICO and console setup. It prints the
+console URL at the end. Preparation and SONIC start remain manual.
 
-`var/source-validation.json` 记录环境版本、文件哈希、动态库加载、数值检查与时延。
-不加 `--inference` 时只检查软件/GPU 信息。`--host-test` 允许桌面诊断，但**不能作为
-Jetson 安装验证依据**。检查失败会覆盖旧的成功报告；检测到在运行的控制器或桥接时，
-推理检查拒绝执行。
+`--check` 只检测实际平台和运行库版本。安装脚本随后自动完成依赖安装、ROS2 Humble、
+原生程序编译、模型下载、引擎生成、软件检查、PICO 和控制台配置，最后显示控制台地址。
+准备姿态和启动 SONIC 仍由用户手动操作。
 
-## Configure the console / 配置控制台
+Run as the normal robot user. The script requests sudo when needed; do not run the
+whole command with sudo. Before installation, stop existing motion control with
+reliable support on site. The installer does not stop another controller for you.
 
-After target software checks pass, configure the idle console and API:
-目标设备软件检查通过后，配置待机控制台与后台接口：
+请以机器人普通用户运行，脚本需要时会调用 sudo，不要给整条命令加 sudo。
+安装前请在现场可靠支撑机器人并停止现有运动控制；安装脚本不会替你停止其他控制器。
 
-```bash
-.venv/bin/python scripts/setup.py --source --configure-only --access lan --no-pico
-```
+- Planner only / 只安装 Planner：`bash install_scripts/install_jp6.sh --no-pico`
+- Update stopped existing services / 更新已停止的现有服务：add / 添加 `--upgrade`，see / 参见 [upgrade guide / 升级指南](UPGRADE.md).
 
-The wizard checks the report against the current environment and artifact hashes,
-then prints the console address. Preparation and SONIC start remain manual.
-For an existing installation, follow [upgrade precautions](UPGRADE.md) and use
-`--upgrade`; do not run two control stacks together. Re-run validation after changing
-source, models, binaries or runtime dependencies.
+System Python is used so Conda does not hide JetPack libraries. Detection accepts
+L4T36.x / TensorRT10.x patch versions and does not require a specific carrier-board
+label. Unsupported combinations or missing SDK components produce an error before
+lengthy builds; they are not silently treated as compatible.
 
-向导核对报告中的环境和文件哈希，然后显示控制台地址。准备姿态与启动 SONIC 仍需
-手动触发。已有部署请先阅读[升级说明](UPGRADE_zh.md)，并使用 `--upgrade`；不要
-同时运行两套控制系统。源码、模型、二进制或运行依赖变化后需重新验证。
+使用系统 Python，避免 Conda 遮蔽 JetPack 运行库。检测允许 L4T36.x / TensorRT10.x
+的小版本差异，不要求载板名称完全一致。不支持的组合或缺少 SDK 组件会在长时间编译前
+给出错误，不会仅为通过检测而忽略真实不兼容。
 
-PICO is optional. Follow [PICO setup](CONTROL_EXTENSIONS.md) to build the ARM64 receiver and install
-mapping dependencies, then use `--pico` instead of `--no-pico`. JP6 PICO end-to-end
-acceptance is pending too; Planner checks do not qualify Pose mode.
+## Tell us three things / 社区反馈三件事就够了
 
-PICO 为可选功能。按 [PICO 指南](CONTROL_EXTENSIONS_zh.md)构建 ARM64 接收器并安装映射依赖，再将
-`--no-pico` 换为 `--pico`。JP6 的 PICO 端到端验收也待完成，Planner 检查不能替代 Pose。
+1. **Installation:** did installation finish, and can you open the console?
+2. **Planner:** can you start it and control standing, walking and turning normally?
+3. **PICO Pose:** can it start and follow your movements normally?
 
-## Community acceptance / 社区验收
+1. **能装上：**安装是否完成，控制台能否打开。
+2. **Planner 能用：**能否启动，站立、行走和转向是否正常。
+3. **PICO Pose 能用：**能否启动，动作跟随是否正常。
 
-Please share the commit (`git rev-parse HEAD`), hardware/JetPack versions,
-`var/source-validation.json` and `var/source-check-logs/`. Inspect logs for personal
-paths/network details before posting. Do not share console credentials or tokens.
+No benchmark report, reboot campaign or long-duration test is required from
+volunteers. Just tell us your JetPack version and these three results. If something
+fails, send the error text or a screenshot; we will help investigate.
 
-请提供提交号（`git rev-parse HEAD`）、硬件/JetPack 版本、`var/source-validation.json`
-与 `var/source-check-logs/`。公开日志前检查个人路径与网络信息，不要分享控制台密码或令牌。
+不要求志愿者提交性能报告、反复重启或做长时间压力测试。告诉我们 JetPack 版本和
+上述三项结果即可。遇到问题时，把报错文字或截图发给我们，我们协助排查。
 
-1. Clean install: native libraries, engine generation, numerical checks and inference timing.
-2. Console/API, restart and reboot: no automatic preparation or policy start.
-3. On site with support: state feedback, preparation and emergency stop; check joint pose/sound.
-4. With appropriate protection and space: Planner stand/walk/turn, stop and restart.
-5. With calibrated PICO: tracking/reference agreement before motion, then Pose and tracking-loss behavior.
-6. Sustained onboard load: thermal throttling, timing tails, memory, DDS feedback and disconnect handling.
+Automatic diagnostic files are saved in `var/source-validation.json` and
+`var/source-check-logs/`; share them only if needed, after checking for private
+information. Maintainer test evidence and remaining technical checks are in
+[JP6 validation](JP6_VALIDATION.md), not additional volunteer requirements.
 
-1. 全新安装：动态库、引擎生成、数值检查与推理时延。
-2. 控制台/API、服务重启与开机自启：不得自动回正或启动策略。
-3. 现场可靠支撑：状态反馈、准备姿态与急停，观察关节姿态和声音。
-4. 具备防护与活动空间：Planner 站立、行走、转向、停止及重新启动。
-5. PICO 标定后：先核对人体追踪与参考动作，再测试 Pose 和追踪丢失行为。
-6. 板载持续负载：降频、长尾时延、内存、DDS 反馈与断连处理。
-
-See [local evidence and limits](JP6_VALIDATION.md). There is no JP6 release archive yet.
-详见[本地测试结果与边界](JP6_VALIDATION.md)。目前尚未提供 JP6 正式安装包。
+自动诊断结果位于 `var/source-validation.json` 与 `var/source-check-logs/`，需要排查时
+再提供，分享前检查私人信息。[本地验证记录](JP6_VALIDATION.md)中的完整技术检查由
+维护者负责，不是额外要求社区用户执行的任务。
