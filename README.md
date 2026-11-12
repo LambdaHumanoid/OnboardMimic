@@ -1,3 +1,7 @@
+> **v1.1 development:** JetPack 6 source-build testing is on this branch. See the [JP6 guide](docs/JETPACK6.md). JP6 hardware acceptance is pending.
+>
+> **v1.1 开发分支：**正在测试 JP6 源码部署，详见 [JP6 指南](docs/JETPACK6.md)。尚待 JP6 实机验收。
+
 ![OnboardMimic: Bring great controllers onboard. A bilingual onboard controller platform cartoon.](docs/assets/onboardmimic-platform-bilingual.png)
 
 # OnboardMimic

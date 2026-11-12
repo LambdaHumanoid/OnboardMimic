@@ -296,7 +296,7 @@ public:
     cudaStreamEndCapture(cuda_stream_, &cuda_graph_);
     cudaStreamSynchronize(cuda_stream_);
     
-    cudaGraphInstantiate(&cuda_graph_exec_, cuda_graph_, NULL, NULL, 0);
+    cudaGraphInstantiateWithFlags(&cuda_graph_exec_, cuda_graph_, 0);
     
     graph_captured_ = true;
     std::cout << "✓ Control policy CUDA graph captured successfully!" << std::endl;

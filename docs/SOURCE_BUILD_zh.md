@@ -1,5 +1,7 @@
 # 使用 G1 + SONIC 配置构建 OnboardMimic
 
+> v1.1 的 JP6 开发流程见 [JetPack 6](JETPACK6.md)。下文 JP5 步骤针对已发布基线。
+
 [English](SOURCE_BUILD.md) · 简体中文
 
 > 对于支持的 G1 / JP5 配置，优先使用 [v0.1.0 预编译包](PREBUILT_zh.md)。本指南用于修改或重新构建控制器和引擎。

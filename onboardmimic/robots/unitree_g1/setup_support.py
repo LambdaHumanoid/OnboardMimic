@@ -111,10 +111,20 @@ def env_value(value):
     return '"'+str(value).replace('\\', '\\\\').replace('"', '\\"')+'"'
 
 
+def ros_distribution(release=None):
+    from onboardmimic.core.host_platform import os_release
+    release = os_release() if release is None else release
+    if release.get('ID') != 'ubuntu' or release.get('VERSION_ID') not in ('20.04', '22.04'):
+        raise ValueError('ROS auto-discovery supports Ubuntu 20.04 / 22.04; supply --ros-setup explicitly')
+    return 'humble' if release['VERSION_ID'] == '22.04' else 'foxy'
+
+
 def find_ros(config, ros=None, workspace=None, home=None):
     home = home or Path.home()
     existing = read_env(config/'bridge.env')
-    ros = ros or os.environ.get('ROS_SETUP') or existing.get('ROS_SETUP') or '/opt/ros/foxy/setup.bash'
+    ros = ros or os.environ.get('ROS_SETUP') or existing.get('ROS_SETUP')
+    if not ros:
+        ros = '/opt/ros/'+ros_distribution()+'/setup.bash'
     explicit = workspace or os.environ.get('UNITREE_ROS_SETUP') or existing.get('UNITREE_ROS_SETUP')
     if explicit and not str(explicit).startswith('/path/to/'):
         candidates = [Path(explicit).expanduser()]

@@ -116,6 +116,7 @@ def main(argv=None):
     mode.add_argument('--check', action='store_true', help='Read-only discovery / 只读检查')
     mode.add_argument('--install-only', action='store_true', help='Install/validate package without service changes / 仅安装验证，不改服务')
     mode.add_argument('--configure-only', action='store_true', help='Configure an already validated package / 配置已验证安装包')
+    parser.add_argument('--source', action='store_true', help='Configure a locally built, software-validated source checkout / 配置本机构建且通过软件验证的源码')
     parser.add_argument('--yes', action='store_true', help='Noninteractive; defaults to local access, no PICO / 非交互，默认仅本机访问、不启用 PICO')
     parser.add_argument('--access', choices=('local', 'lan'))
     pico = parser.add_mutually_exclusive_group()
@@ -138,7 +139,12 @@ def main(argv=None):
         return
     if os.geteuid() == 0:
         raise RuntimeError('Run as the robot user, without sudo / 请以机器人普通用户执行，不要 sudo 整个向导')
-    if not (ROOT/'prebuilt_manifest.json').is_file():
+    if args.source:
+        if not args.configure_only:
+            raise RuntimeError('Use --source --configure-only after scripts/validate_source.py --inference / 先完成源码软件验收')
+        from .source_validation import verify_report
+        verify_report(ROOT)
+    elif not (ROOT/'prebuilt_manifest.json').is_file():
         raise RuntimeError('Extract all three release archives first / 请先解压同一版本的三个预编译包；源码安装见 docs/SOURCE_BUILD.md')
     require_idle()
     # The lock prevents two installers touching the same user's services/config.

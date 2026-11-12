@@ -272,7 +272,7 @@ private:
         cudaStreamEndCapture(cuda_stream_, &graph_);
         cudaStreamSynchronize(cuda_stream_);
         
-        cudaGraphInstantiate(&graphExec_, graph_, NULL, NULL, 0);
+        cudaGraphInstantiateWithFlags(&graphExec_, graph_, 0);
 
         // Log tensor information for debugging
         std::vector<std::string> inputNames = inference_engine_->GetInputTensorNames();

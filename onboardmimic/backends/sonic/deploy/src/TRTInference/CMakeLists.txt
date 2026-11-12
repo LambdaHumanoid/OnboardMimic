@@ -28,8 +28,8 @@ endif()
 
 target_include_directories(TRTInference
     PRIVATE ${PROJECT_SOURCE_DIR}/src
-    PRIVATE ${TensorRT_INCLUDE_DIRS}
-    PRIVATE ${CUDA_INCLUDES})
+    PUBLIC ${TensorRT_INCLUDE_DIRS}
+    PUBLIC ${CUDA_INCLUDES})
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(TRTInference PRIVATE -Wno-deprecated-declarations -std=c++20)

@@ -1,5 +1,7 @@
 # Build OnboardMimic with the G1 + SONIC profile
 
+> For the v1.1 JP6 development workflow, use [JetPack 6](JETPACK6.md). The JP5 instructions below target the released baseline.
+
 English · [简体中文](SOURCE_BUILD_zh.md)
 
 > For the supported G1 / JP5 configuration, start with the [v0.1.0 prebuilt packages](PREBUILT.md). This guide is for modifying or rebuilding the controller and engines.

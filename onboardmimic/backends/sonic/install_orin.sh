@@ -3,9 +3,15 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 [[ "$(uname -m)" == aarch64 ]] || { echo 'Run this installer on the Jetson (aarch64).'; exit 1; }
-[[ -f /etc/nv_tegra_release ]] || { echo 'JetPack 5 Jetson environment required.'; exit 1; }
+[[ -f /etc/nv_tegra_release ]] || { echo 'Jetson environment required.'; exit 1; }
+source /etc/os-release
+case "$VERSION_ID" in
+  20.04) compiler=g++-10 ;;
+  22.04) compiler=g++-10 ;;
+  *) echo 'Source build supports Ubuntu 20.04 / 22.04 only.'; exit 1 ;;
+esac
 sudo apt-get update
-sudo apt-get install -y g++-10 cmake git curl libmsgpack-dev nlohmann-json3-dev libzmq3-dev libgtest-dev libeigen3-dev zlib1g-dev pkg-config python3-venv python3-dev
+sudo apt-get install -y "$compiler" cmake git curl libmsgpack-dev libboost-dev nlohmann-json3-dev libzmq3-dev libgtest-dev libeigen3-dev zlib1g-dev pkg-config python3-venv python3-dev
 python3 -m venv --system-site-packages "$root/.venv"
 # Upgrade only the isolated environment; retain Python 3.8 compatibility.
 "$root/.venv/bin/python" -m pip install --upgrade pip==25.0.1
