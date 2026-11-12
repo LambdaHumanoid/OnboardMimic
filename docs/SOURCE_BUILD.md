@@ -2,7 +2,7 @@
 
 English · [简体中文](SOURCE_BUILD_zh.md)
 
-> For the supported G1 / JP5 configuration, start with the [v0.1.0 prebuilt packages](PREBUILT.md). This guide is for modifying or rebuilding the controller and engines.
+> For the supported G1 / JP5 configuration, start with the [v0.1.1 prebuilt packages](PREBUILT.md). This guide is for modifying or rebuilding the controller and engines.
 
 Use the supported G1 / JetPack 5 platform described in the [deployment guide](DEPLOYMENT.md). Run native and model builds sequentially. Installation and offline validation do not start robot control.
 

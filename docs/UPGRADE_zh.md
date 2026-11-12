@@ -70,7 +70,7 @@ sudo systemctl stop onboardmimic-pico-receiver.service
 
 ## 3. 在新目录安装
 
-对于支持的 G1 / JP5 配置，在新目录下载并解压完整的 [v0.1.0 安装包](PREBUILT_zh.md)，再执行下方安装命令，不更改服务。
+对于支持的 G1 / JP5 配置，在新目录下载并解压完整的 [v0.1.1 安装包](PREBUILT_zh.md)，再执行下方安装命令，不更改服务。
 
 ```bash
 python3 scripts/setup.py --yes --install-only --pico

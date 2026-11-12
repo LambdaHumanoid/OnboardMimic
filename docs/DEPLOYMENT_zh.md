@@ -8,9 +8,9 @@
 
 ## 1. 完成安装
 
-上述 G1 / JP5 配置优先使用 v0.1.0 预编译包：
+上述 G1 / JP5 配置优先使用 v0.1.1 预编译包：
 
-- **预编译包（推荐）**：下载完整的 [v0.1.0 安装包](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.0)；安装向导 `python3 scripts/setup.py` 会完成下面第 2、3 步。所需文件集合见[安装包说明](PREBUILT_zh.md)。
+- **预编译包（推荐）**：下载完整的 [v0.1.1 安装包](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1)；安装向导 `python3 scripts/setup.py` 会完成下面第 2、3 步。所需文件集合见[安装包说明](PREBUILT_zh.md)。
 - **源码构建**：按[源码构建指南](SOURCE_BUILD_zh.md)安装、下载模型、编译和构建引擎，通过测试后进入第 2 步。编译与模型构建顺序执行。
 
 安装脚本会安装 `python3-venv` 并在虚拟环境内更新 pip；需要联网和 sudo 权限。它不升级 JetPack，不启动运动控制器。向导缺少 ROS2 依赖时会给出 `bash install_scripts/install_ros_dependencies.sh` 修复命令。第 2、3 步为源码构建或手动配置用户保留。

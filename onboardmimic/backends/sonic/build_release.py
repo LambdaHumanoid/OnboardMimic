@@ -54,7 +54,7 @@ def main():
     p.add_argument('--snapshot',type=Path,required=True,help='Audited SONIC model/engine snapshot directory')
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--patchelf',required=True)
-    p.add_argument('--version',default='v0.1.0')
+    p.add_argument('--version',default='v0.1.1')
     p.add_argument('--native-binary',type=Path,required=True,help='Freshly built ARM64 controller; never executed by this script')
     p.add_argument('--build-report',type=Path,required=True,help='Source and binary hashes plus toolchain provenance')
     p.add_argument('--bridge-build',type=Path,required=True,help='Fresh ARM64 native bridge binaries')

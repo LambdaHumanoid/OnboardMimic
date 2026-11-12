@@ -12,7 +12,7 @@ python3 scripts/build_prebuilt_release.py \
   --bridge-build /PATH/TO/ARM64_BRIDGE_BINARIES \
   --bridge-report /PATH/TO/bridge_build_report.json \
   --patchelf /PATH/TO/patchelf \
-  --version v0.1.0 --output /PATH/TO/EMPTY/OUTPUT
+  --version v0.1.1 --output /PATH/TO/EMPTY/OUTPUT
 ```
 
 `native_build_report.json` 记录 `architecture: aarch64`、`binary_sha256`、`native_source_hashes`（须匹配 `onboardmimic/backends/sonic/native_source_manifest.json`）、`method`、`built_at_utc`，以及链接的 Unitree SDK/DDS 和 ONNX Runtime 库的 `runtime_library_sha256`。还应记录编译器、sysroot 版本及相关验证细节。打包器拒绝源码/哈希不一致或非 AArch64 的二进制。构建报告说明制品的构建方式，不替代目标设备验证。
@@ -23,7 +23,7 @@ python3 scripts/build_prebuilt_release.py \
 
 快照提供未经修改的原始模型、转换后的 planner、严格 FP32 引擎、24 组 planner 验证报告、ONNX Runtime 1.16.3 和固定版本的 Unitree DDS 库。原生控制器二进制由单独的构建产物提供。快照中的 SDK 库必须与新控制器链接时使用的库一致。
 
-输出文件使用 `OnboardMimic-v0.1.0-{runtime,models,engines}.tar.gz` 命名，解压到 `OnboardMimic/`。包内包含文件哈希、源码提交、原生构建报告，并分别记录重新编译的原生代码与复用引擎的来源。添加 OnboardMimic 下载链接前，先发布匹配的源码标签和已验证的完整安装包。
+输出文件使用 `OnboardMimic-v0.1.1-{runtime,models,engines}.tar.gz` 命名，解压到 `OnboardMimic/`。包内包含文件哈希、源码提交、原生构建报告，并分别记录重新编译的原生代码与复用引擎的来源。添加 OnboardMimic 下载链接前，先发布匹配的源码标签和已验证的完整安装包。
 
 源码标签、运行包和链接的指南必须描述同一版本。在清单中记录源码版本，保持包内与独立清单一致，将全部安装制品哈希写入 SHA256SUMS。将运行包、清单、校验值和 Release 说明作为一致的整体发布，再重新下载并验证已上传文件。保留原生构建来源和模型身份记录。
 

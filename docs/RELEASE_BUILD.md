@@ -14,7 +14,7 @@ python3 scripts/build_prebuilt_release.py \
   --bridge-build /PATH/TO/ARM64_BRIDGE_BINARIES \
   --bridge-report /PATH/TO/bridge_build_report.json \
   --patchelf /PATH/TO/patchelf \
-  --version v0.1.0 --output /PATH/TO/EMPTY/OUTPUT
+  --version v0.1.1 --output /PATH/TO/EMPTY/OUTPUT
 ```
 
 `native_build_report.json` records `architecture: aarch64`, `binary_sha256`,
@@ -42,7 +42,7 @@ the 24-case planner validation report, ONNX Runtime 1.16.3 and the pinned Unitre
 The native controller binary is supplied separately from the build output. Keep the snapshot SDK libraries identical
 to those used to link the new controller.
 
-Outputs use the `OnboardMimic-v0.1.0-{runtime,models,engines}.tar.gz` names and extract into
+Outputs use the `OnboardMimic-v0.1.1-{runtime,models,engines}.tar.gz` names and extract into
 `OnboardMimic/`. They include file hashes, source commit, native build report and distinct
 provenance for rebuilt native code versus reused engines. Publish a matching
 source tag and validated package set

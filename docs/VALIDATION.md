@@ -41,3 +41,9 @@ Record source commit, asset hashes, build reports, platform versions and operato
 [Deployment](DEPLOYMENT.md) · [Controls](CONTROL_EXTENSIONS.md) · [Upgrade](UPGRADE.md)
 
 [首次部署](DEPLOYMENT_zh.md) · [控制说明](CONTROL_EXTENSIONS_zh.md) · [升级](UPGRADE_zh.md)
+
+## v0.1.1 installation update / 安装更新
+
+v0.1.1 retains the controller binaries, models and engines from v0.1.0. Its updated installer passed isolated installation, 212 offline tests and 30 model numerical checks on a physical G1.
+
+> v0.1.1 沿用 v0.1.0 的控制程序、模型和引擎。更新后的安装器已在 G1 真机通过独立安装、212 项离线测试和 30 组模型数值检查。

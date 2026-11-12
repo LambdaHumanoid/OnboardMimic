@@ -4,7 +4,7 @@ English · [简体中文](PREBUILT_zh.md)
 
 The prebuilt package targets **G1 29-DOF body / Jetson Orin NX 16 GB / Ubuntu 20.04 / L4T 35.3.1 / CUDA 11.4 / TensorRT 8.5.2**. Hand actuators are not controlled. Other GPUs, 8 GB Orin NX, JetPack 6 and TensorRT 10 require source adaptation, building and validation on the target device.
 
-The baseline above remains the hardware-tested configuration. Updated source installers also admit **L4T35.x, CUDA11.4–11.x and custom carrier-board names** on Ubuntu20.04 / ARM64 Orin with 16GB-class memory. TensorRT8.5.2 is retained for the bundled engines. Accepted variants must still pass native library loading and model numerical checks; a broader version check does not qualify every device. Existing v0.1.0 archives keep their original checks until rebuilt.
+The baseline above remains the hardware-tested configuration. The v0.1.1 installer also admits **L4T35.x, CUDA11.4–11.x and custom carrier-board names** on Ubuntu20.04 / ARM64 Orin with 16GB-class memory. TensorRT8.5.2 is retained for the bundled engines. Accepted variants must still pass native library loading and model numerical checks; a broader version check does not qualify every device.
 
 ## Before installing
 
@@ -14,11 +14,11 @@ The baseline above remains the hardware-tested configuration. Updated source ins
 
 ## Download and extract
 
-Download the complete [OnboardMimic v0.1.0 package set](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.0). The runtime, models and engines form one installation and must be extracted together.
+Download the complete [OnboardMimic v0.1.1 package set](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1). The runtime, models and engines form one installation and must be extracted together.
 
-- `OnboardMimic-v0.1.0-runtime.tar.gz`: source, scripts, ARM64 controller, ONNX Runtime / CycloneDDS libraries and licenses.
-- `OnboardMimic-v0.1.0-models.tar.gz`: three original ONNX models and the TensorRT 8.5-compatible planner ONNX.
-- `OnboardMimic-v0.1.0-engines.tar.gz`: three FP32 TensorRT engines.
+- `OnboardMimic-v0.1.1-runtime.tar.gz`: source, scripts, ARM64 controller, ONNX Runtime / CycloneDDS libraries and licenses.
+- `OnboardMimic-v0.1.1-models.tar.gz`: three original ONNX models and the TensorRT 8.5-compatible planner ONNX.
+- `OnboardMimic-v0.1.1-engines.tar.gz`: three FP32 TensorRT engines.
 - `prebuilt_manifest.json`: platform requirements, provenance and per-file SHA-256 hashes.
 - `SHA256SUMS`: checksums for the downloaded files.
 
@@ -29,16 +29,16 @@ Private repositories require read access. Authenticated GitHub CLI users can dow
 ```bash
 mkdir onboardmimic-download
 cd onboardmimic-download
-gh release download v0.1.0 --repo LambdaHumanoid/OnboardMimic --pattern 'OnboardMimic-v0.1.0-*.tar.gz' --pattern prebuilt_manifest.json --pattern SHA256SUMS
+gh release download v0.1.1 --repo LambdaHumanoid/OnboardMimic --pattern 'OnboardMimic-v0.1.1-*.tar.gz' --pattern prebuilt_manifest.json --pattern SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
 Extract all three archives in a new directory. Together they form `OnboardMimic/`. Do not overwrite a running deployment:
 
 ```bash
-tar -xzf OnboardMimic-v0.1.0-runtime.tar.gz
-tar -xzf OnboardMimic-v0.1.0-models.tar.gz
-tar -xzf OnboardMimic-v0.1.0-engines.tar.gz
+tar -xzf OnboardMimic-v0.1.1-runtime.tar.gz
+tar -xzf OnboardMimic-v0.1.1-models.tar.gz
+tar -xzf OnboardMimic-v0.1.1-engines.tar.gz
 cd OnboardMimic
 python3 scripts/setup.py
 ```
@@ -98,12 +98,10 @@ For an existing deployment, use [upgrade and rollback](UPGRADE.md) rather than o
 
 The updated installer detects JetPack first and installs missing **TensorRT 8.5.2** libraries and system Python bindings for JP5. Matching installations are preserved; existing packages are not automatically upgraded or downgraded. Network access to the corresponding NVIDIA Jetson apt source is required. Conflicting versions or missing repositories produce an actionable error.
 
-Previously downloaded v0.1.0 archives do not change with the source repository. From the extracted `OnboardMimic/` directory, run the repair once before the existing wizard; no model or engine download is needed:
+TensorRT dependency installation is included in the standard setup wizard. To inspect dependencies separately:
 
 ```bash
-curl -fL https://raw.githubusercontent.com/LambdaHumanoid/OnboardMimic/main/scripts/install_tensorrt.py -o scripts/install_tensorrt.py
-/usr/bin/python3 scripts/install_tensorrt.py --profile jp5
-python3 scripts/setup.py
+/usr/bin/python3 scripts/install_tensorrt.py --profile jp5 --check
 ```
 
 Add `--check` for inspection only, or `--development` to include headers and `trtexec` for source builds. This tool installs TensorRT only: it does not flash the device, switch JetPack or start motor control. If CUDA itself is missing, install the CUDA components matching the existing JetPack first.
