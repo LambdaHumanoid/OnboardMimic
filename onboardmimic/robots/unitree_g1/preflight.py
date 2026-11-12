@@ -15,7 +15,7 @@ import subprocess
 SERVICES = ('g1-teleop.service', 'g1-guide-scenes.service')
 FILES = ('native_bridge/build/sonic_command_bridge',
          'native_bridge/build/sonic_state_reader', 'continuity/relay.py')
-CONTROLLERS = {'g1_bridge_node', 'start_g1_teleop.py', 'run_scene_console.sh',
+CONTROLLERS = {'g1_bridge', 'g1_bridge_node', 'start_g1_teleop.py', 'run_scene_console.sh',
                'g1_deploy', 'g1_deploy_onnx_ref', 'run_zmq_dds_bridge.py',
                'loopback_bridge.py', 'sonic_command_bridge'}
 
