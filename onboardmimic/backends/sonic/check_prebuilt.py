@@ -1,4 +1,4 @@
-"""Check release checksums and exact platform. No DDS, controller or motor output."""
+"""Check release checksums and compatible platform families. No DDS, controller or motor output."""
 import argparse
 import ctypes
 import hashlib
@@ -26,12 +26,24 @@ def verify_files(root,manifest):
 
 def environment_errors(facts):
     errors=[]
-    for key,expected in [('arch','aarch64'),('ubuntu','20.04'),('l4t','35.3.1'),('cuda_runtime',11040),('gpu','Orin')]:
+    for key,expected in [('arch','aarch64'),('ubuntu','20.04')]:
         if facts.get(key)!=expected:errors.append('%s: expected %r, got %r'%(key,expected,facts.get(key)))
-    if not re.match(r'^8\.5\.2(?:[.-]|$)',facts.get('tensorrt','')):errors.append('TensorRT 8.5.2 required')
-    if 'Orin NX' not in facts.get('board',''):errors.append('Only Jetson Orin NX is qualified by this release')
+    if not re.match(r'^35\.\d+(?:\.\d+)*$', facts.get('l4t','')):
+        errors.append('JP5 / L4T 35.x required')
+    if not 11040 <= facts.get('cuda_runtime',0) < 12000:
+        errors.append('CUDA 11.4 or later CUDA 11.x runtime required')
+    if not re.search(r'\borin\b', facts.get('gpu',''), re.I):
+        errors.append('Orin GPU required')
+    version=facts.get('tensorrt','').split(':')[-1]
+    if not re.match(r'^8\.5\.2(?:[.-]|$)',version):errors.append('TensorRT 8.5.2 required for bundled engines')
     if facts.get('memory_kib',0)<12*1024*1024:errors.append('16 GB board required (8 GB is not supported)')
     return errors
+
+def environment_notes(facts):
+    notes=[]
+    if facts.get('l4t')!='35.3.1' or facts.get('cuda_runtime')!=11040 or 'Orin NX' not in facts.get('board',''):
+        notes.append('Compatible JP5 variant: continue with library and inference checks; this exact device configuration has not been qualified / JP5 相近配置，继续进行动态库与推理检查；此具体配置尚未完成真机验证')
+    return notes
 
 def inspect_environment():
     facts={'arch':platform.machine()}
@@ -40,7 +52,8 @@ def inspect_environment():
     release=Path('/etc/nv_tegra_release').read_text()
     match=re.search(r'# R(\d+).*?REVISION:\s*([\d.]+)',release)
     facts['l4t']='.'.join(match.groups()) if match else ''
-    facts['board']=Path('/proc/device-tree/model').read_text().strip('\0\n')
+    board=Path('/proc/device-tree/model')
+    facts['board']=board.read_text().strip('\0\n') if board.exists() else ''
     memory=re.search(r'^MemTotal:\s+(\d+)',Path('/proc/meminfo').read_text(),re.M)
     facts['memory_kib']=int(memory[1]) if memory else 0
     facts['tensorrt']=subprocess.check_output(['dpkg-query','-W','-f=${Version}','libnvinfer8'],text=True).strip()
@@ -63,6 +76,7 @@ def main():
     facts=inspect_environment();print(json.dumps(facts,indent=2))
     errors=environment_errors(facts)
     if errors:raise SystemExit('\n'.join(errors)+'\nUse the source build on an unsupported environment.')
+    for note in environment_notes(facts):print(note)
     # Dynamic loader listing never executes the controller's main().
     binaries=['onboardmimic/backends/sonic/deploy/target/release/g1_deploy_onnx_ref',
               'onboardmimic/robots/unitree_g1/native_bridge/build/sonic_state_reader',
@@ -70,6 +84,6 @@ def main():
     for binary in binaries:
         result=subprocess.run(['/lib/ld-linux-aarch64.so.1','--list',str(ROOT/binary)],capture_output=True,text=True)
         if result.returncode or 'not found' in result.stdout:raise SystemExit('Runtime library resolution failed for '+binary+':\n'+result.stdout+result.stderr)
-    print('Environment and runtime libraries match. No controller was executed.')
+    print('Environment and runtime libraries accepted; inference validation is still required. No controller was executed.')
 
 if __name__=='__main__':main()

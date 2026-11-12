@@ -19,7 +19,7 @@ set -u
 sudo apt-get update
 sudo apt-get install -y libzmq5 python3-venv
 # Packaged libraries + platform CUDA are used for validation subprocesses.
-export LD_LIBRARY_PATH="$root/onboardmimic/backends/sonic/deploy/target/lib:/usr/local/cuda-11.4/targets/aarch64-linux/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$root/onboardmimic/backends/sonic/deploy/target/lib:/usr/local/cuda/targets/aarch64-linux/lib:/usr/local/cuda/lib64:/usr/local/cuda-11.4/targets/aarch64-linux/lib:${LD_LIBRARY_PATH:-}"
 /usr/bin/python3 scripts/check_prebuilt.py
 /usr/bin/python3 -m venv --system-site-packages .venv
 # Ubuntu 20.04 pip 20 can report success with incompatible inherited packages.
