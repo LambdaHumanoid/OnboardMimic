@@ -125,6 +125,21 @@ class GuardTest(unittest.TestCase):
                 self.assertFalse((Path(tmp)/'must-not-exist').exists())
                 launch.assert_not_called()
 
+    def test_g1_bridge_blocks_installation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp)/'proc'
+            entry = proc/'85507'
+            entry.mkdir(parents=True)
+            (entry/'exe').symlink_to('/opt/provider/bridge/g1_bridge')
+            (entry/'comm').write_text('g1_bridge\n')
+            (entry/'cmdline').write_bytes(b'/opt/provider/bridge/g1_bridge\0--domain\00\0')
+            owners = support.active_controllers(proc)
+            self.assertEqual(owners, [('85507', 'g1_bridge')])
+            with patch.object(support, 'active_controllers', return_value=owners), patch.object(support.subprocess, 'Popen') as launch:
+                with self.assertRaisesRegex(RuntimeError, 'Controller/bridge'):
+                    support.run(['sudo', 'apt-get', 'update'])
+                launch.assert_not_called()
+
     def test_readonly_check_never_installs_or_starts(self):
         with patch.object(wizard, 'find_ros', return_value=(Path('/ROS'), Path('/WS'))), \
              patch.object(wizard.network, 'detect', return_value='eth1'), \

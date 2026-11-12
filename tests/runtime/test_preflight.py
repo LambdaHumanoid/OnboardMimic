@@ -37,7 +37,7 @@ class PreflightTest(unittest.TestCase):
         self.assertFalse(control_process(['python3', 'test_robot_command_bridge.py']))
 
     def test_read_only_arguments_never_become_programs(self):
-        for controller in ('g1_deploy_onnx_ref', 'robot_command_bridge', 'loopback_bridge.py'):
+        for controller in ('g1_bridge', 'g1_deploy_onnx_ref', 'robot_command_bridge', 'loopback_bridge.py'):
             path = '/opt/robot/' + controller
             for argv in ([tool, path] for tool in ('sha256sum', 'cat', 'stat', 'ls', 'file', 'strings', 'less')):
                 with self.subTest(argv=argv):self.assertFalse(control_process(argv))
@@ -53,6 +53,8 @@ class PreflightTest(unittest.TestCase):
 
     def test_real_entries_with_interpreter_flags_and_launch_wrapper(self):
         cases = [
+            ['/opt/provider/bridge/g1_bridge', '--domain', '0'],
+            ['stdbuf', '-oL', '/opt/provider/bridge/g1_bridge'],
             ['python3.8', '-u', '-W', 'ignore', '/opt/loopback_bridge.py', '--no-release-mode'],
             ['python3', '-X', 'dev', '--', '/opt/start_g1_teleop.py'],
             ['python3', '-m', 'g1_bridge_node'],
