@@ -19,12 +19,12 @@ bash install_scripts/install_jp6.sh --check
 bash install_scripts/install_jp6.sh
 ```
 
-`--check` only checks the actual platform/runtime versions. Installation then
+`--check` only checks the actual platform/runtime versions and reports missing TensorRT components. If components are missing, run without `--check` to install them automatically. Installation then
 handles dependencies, ROS2 Humble, native programs, model download, engine
 compilation, automatic software checks, PICO and console setup. It prints the
 console URL at the end. Preparation and SONIC start remain manual.
 
-`--check` 只检测实际平台和运行库版本。安装脚本随后自动完成依赖安装、ROS2 Humble、
+`--check` 只检测实际平台和运行库版本，报告缺少的 TensorRT 组件；缺失时不加 `--check` 运行即可自动补齐。安装脚本随后自动完成依赖安装、ROS2 Humble、
 原生程序编译、模型下载、引擎生成、软件检查、PICO 和控制台配置，最后显示控制台地址。
 准备姿态和启动 SONIC 仍由用户手动操作。
 
@@ -40,12 +40,10 @@ reliable support on site. The installer does not stop another controller for you
 
 System Python is used so Conda does not hide JetPack libraries. Detection accepts
 L4T36.x / TensorRT10.x patch versions and does not require a specific carrier-board
-label. Unsupported combinations or missing SDK components produce an error before
-lengthy builds; they are not silently treated as compatible.
+label. Missing TensorRT10 libraries, system Python bindings and build tools are installed from the matching NVIDIA Jetson apt source before validation. Matching installed versions are preserved. Conflicting versions or missing CUDA components still produce a clear error before lengthy builds.
 
 使用系统 Python，避免 Conda 遮蔽 JetPack 运行库。检测允许 L4T36.x / TensorRT10.x
-的小版本差异，不要求载板名称完全一致。不支持的组合或缺少 SDK 组件会在长时间编译前
-给出错误，不会仅为通过检测而忽略真实不兼容。
+的小版本差异，不要求载板名称完全一致。缺少的 TensorRT10 运行库、系统 Python 绑定和编译工具会在验证前从对应 NVIDIA Jetson 源自动安装；已有匹配版本保留。版本冲突或 CUDA 本身缺失仍会在长时间编译前明确报错。
 
 ## Tell us three things / 社区反馈三件事就够了
 

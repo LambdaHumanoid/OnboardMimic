@@ -9,6 +9,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from onboardmimic.backends.sonic.platforms import basic_environment, source_environment_errors
+from scripts.install_tensorrt import ensure_tensorrt
 from onboardmimic.robots.unitree_g1.setup_support import require_idle, run
 
 
@@ -49,7 +50,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     facts = basic_environment()
     check_platform(facts)
-    # Query the system Python's JetPack runtime before downloading/building anything.
+    if not args.check and os.geteuid() == 0:
+        raise RuntimeError('Run as your normal robot user, without sudo / 请以普通用户运行，不要 sudo 整个脚本')
+    # Bootstrap missing bindings/libraries before importing TensorRT.
+    ensure_tensorrt(profile="jp6", development=True, check=args.check)
+    # Query the system Python's JetPack runtime before model downloads/builds.
     from onboardmimic.backends.sonic.source_validation import environment
     try:
         facts = environment()
@@ -61,8 +66,6 @@ def main(argv=None):
     print('Version check passed / 版本检查通过: Ubuntu '+facts['ubuntu']+', L4T '+facts['l4t']+', TensorRT '+facts['tensorrt'], flush=True)
     if args.check:
         return 0
-    if os.geteuid() == 0:
-        raise RuntimeError('Run as your normal robot user, without sudo / 请以普通用户运行，不要 sudo 整个脚本')
     require_idle()
     for command, env in install_steps(args.workspace.expanduser().absolute(), not args.no_pico, args.upgrade):
         run(command, cwd=ROOT, env=env)

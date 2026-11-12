@@ -217,10 +217,11 @@ class CommunityInstallerTests(unittest.TestCase):
         module=self.module()
         from onboardmimic.backends.sonic import source_validation as v
         facts=SourceValidationTests().facts()
-        with patch.object(module,'basic_environment',return_value=facts), patch.object(v,'environment',return_value=facts), patch.object(module,'run') as run, contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(module,'basic_environment',return_value=facts), patch.object(module,'ensure_tensorrt') as bootstrap, patch.object(v,'environment',return_value=facts), patch.object(module,'run') as run, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(module.main(['--check']),0)
+            bootstrap.assert_called_once_with(profile='jp6',development=True,check=True)
             run.assert_not_called()
-        with patch.object(module,'basic_environment',return_value=facts), patch.object(v,'environment',return_value=facts), patch.object(module.os,'geteuid',return_value=1000), patch.object(module,'require_idle'), patch.object(module,'run',side_effect=RuntimeError('build failed')) as run, contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(module,'basic_environment',return_value=facts), patch.object(module,'ensure_tensorrt') as bootstrap, patch.object(v,'environment',return_value=facts), patch.object(module.os,'geteuid',return_value=1000), patch.object(module,'require_idle'), patch.object(module,'run',side_effect=RuntimeError('build failed')) as run, contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError,'build failed'):module.main(['--no-pico'])
             self.assertEqual(run.call_count,1)
 
