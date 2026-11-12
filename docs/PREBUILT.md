@@ -4,6 +4,8 @@ English · [简体中文](PREBUILT_zh.md)
 
 The prebuilt package targets **G1 29-DOF body / Jetson Orin NX 16 GB / Ubuntu 20.04 / L4T 35.3.1 / CUDA 11.4 / TensorRT 8.5.2**. Hand actuators are not controlled. Other GPUs, 8 GB Orin NX, JetPack 6 and TensorRT 10 require source adaptation, building and validation on the target device.
 
+The baseline above remains the hardware-tested configuration. Updated source installers also admit **L4T35.x, CUDA11.4–11.x and custom carrier-board names** on Ubuntu20.04 / ARM64 Orin with 16GB-class memory. TensorRT8.5.2 is retained for the bundled engines. Accepted variants must still pass native library loading and model numerical checks; a broader version check does not qualify every device. Existing v0.1.0 archives keep their original checks until rebuilt.
+
 ## Before installing
 
 - Run as the robot's regular user, with network access and sudo permission. The installer installs `python3-venv` and updates pip inside the venv.
