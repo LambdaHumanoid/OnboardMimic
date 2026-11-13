@@ -176,3 +176,10 @@ Thank you to everyone helping build OnboardMimic! / 感谢每一位参与 Onboar
 <a href="https://github.com/LambdaHumanoid/OnboardMimic/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=LambdaHumanoid/OnboardMimic&amp;max=100&amp;columns=15" alt="OnboardMimic contributors / OnboardMimic 贡献者" />
 </a>
+
+<p>
+  <a href="https://github.com/chenyilun95"><img src="https://github.com/chenyilun95.png?size=96" width="64" height="64" alt="chenyilun95" /></a>
+  <a href="https://github.com/dadamrx"><img src="https://github.com/dadamrx.png?size=96" width="64" height="64" alt="dadamrx" /></a>
+</p>
+
+[@chenyilun95](https://github.com/chenyilun95) · [@dadamrx](https://github.com/dadamrx)
