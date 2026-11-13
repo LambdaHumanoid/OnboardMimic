@@ -152,3 +152,19 @@ Built on [NVIDIA GEAR SONIC / GR00T-WholeBodyControl](https://github.com/NVlabs/
 Questions, feedback, or a deployment story? Reach Yiming Jiang at [jiangyimingjym@buaa.edu.cn](mailto:jiangyimingjym@buaa.edu.cn).
 
 > 有问题、建议，或想分享部署经历？通过 [jiangyimingjym@buaa.edu.cn](mailto:jiangyimingjym@buaa.edu.cn) 联系 Yiming Jiang。
+
+## 🤝 Contributing / 参与贡献
+
+Help bring more great controllers onboard. We welcome new WBC backends, robot adaptations, easier installation, bug fixes and clearer documentation. Every contribution counts—whether it is code, a deployment report or a suggestion.
+
+> 一起让更多优秀的控制器实现板载部署。欢迎接入新的 WBC、适配更多机器人、改进安装流程、修复问题和完善文档。代码、部署反馈和建议，都是对项目的贡献。
+
+Have an idea or found a problem? Open an [Issue](https://github.com/LambdaHumanoid/OnboardMimic/issues) or submit a [Pull Request](https://github.com/LambdaHumanoid/OnboardMimic/pulls).
+
+> 有想法或遇到问题？欢迎提交 [Issue](https://github.com/LambdaHumanoid/OnboardMimic/issues) 或 [Pull Request](https://github.com/LambdaHumanoid/OnboardMimic/pulls)。
+
+Thank you to everyone helping build OnboardMimic! / 感谢每一位参与 OnboardMimic 共建的贡献者！
+
+<a href="https://github.com/LambdaHumanoid/OnboardMimic/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=LambdaHumanoid/OnboardMimic&amp;max=100&amp;columns=15" alt="OnboardMimic contributors / OnboardMimic 贡献者" />
+</a>
