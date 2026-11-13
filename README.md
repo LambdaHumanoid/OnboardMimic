@@ -173,13 +173,8 @@ Have an idea or found a problem? Open an [Issue](https://github.com/LambdaHumano
 
 Thank you to everyone helping build OnboardMimic! / 感谢每一位参与 OnboardMimic 共建的贡献者！
 
-<a href="https://github.com/LambdaHumanoid/OnboardMimic/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=LambdaHumanoid/OnboardMimic&amp;max=100&amp;columns=15" alt="OnboardMimic contributors / OnboardMimic 贡献者" />
-</a>
-
 <p>
-  <a href="https://github.com/chenyilun95"><img src="https://github.com/chenyilun95.png?size=96" width="64" height="64" alt="chenyilun95" /></a>
-  <a href="https://github.com/dadamrx"><img src="https://github.com/dadamrx.png?size=96" width="64" height="64" alt="dadamrx" /></a>
+  <a href="https://github.com/IridescentJiang"><img src="docs/assets/contributors/IridescentJiang.png" width="160" height="104" alt="@IridescentJiang — GitHub profile" /></a>
+  <a href="https://github.com/chenyilun95"><img src="docs/assets/contributors/chenyilun95.png" width="160" height="104" alt="@chenyilun95 — GitHub profile" /></a>
+  <a href="https://github.com/dadamrx"><img src="docs/assets/contributors/dadamrx.png" width="160" height="104" alt="@dadamrx — GitHub profile" /></a>
 </p>
-
-[@chenyilun95](https://github.com/chenyilun95) · [@dadamrx](https://github.com/dadamrx)
