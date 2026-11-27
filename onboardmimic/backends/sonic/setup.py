@@ -3,6 +3,7 @@
 import argparse
 import fcntl
 import json
+import ipaddress
 import os
 from pathlib import Path
 import pwd
@@ -10,7 +11,9 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 import urllib.request
+from urllib.parse import urlsplit
 
 from scripts.install_services import ROOT, BOOT_UNITS, install, quote, render_units, require_stopped, write_atomic
 from onboardmimic.robots.unitree_g1.setup_support import env_value, find_ros, lan_addresses, require_idle, run
@@ -75,7 +78,46 @@ def prepare_pico(previous_root=None):
     run([ROOT/'.venv/bin/python', ROOT/'scripts/install_pico_service.py', '--sudo-docker'])
 
 
-def show_urls(access):
+def lab_origin(access, explicit=None):
+    if explicit:
+        parsed = urlsplit(explicit)
+        if (parsed.scheme != 'http' or not parsed.hostname or parsed.username or parsed.password
+                or parsed.path not in ('', '/') or parsed.query or parsed.fragment
+                or parsed.port != 8769 or any(ord(c)<33 for c in explicit)):
+            raise ValueError('Use the OM browser origin http://HOST:8769 / 请填写 OM 网页地址 http://HOST:8769')
+        if access == 'local' and parsed.hostname not in ('127.0.0.1', 'localhost'):
+            raise ValueError('Local access uses a localhost SSH tunnel / 本机访问请使用 localhost SSH 隧道')
+        if parsed.hostname != 'localhost':
+            try:
+                ipaddress.IPv4Address(parsed.hostname)
+            except ValueError:
+                raise ValueError('Use the robot IPv4 address or localhost / 请使用机器人 IPv4 地址或 localhost')
+        return explicit.rstrip('/')
+    if access == 'local':
+        return 'http://127.0.0.1:8769'
+    addresses = lan_addresses()
+    if not addresses:
+        raise ValueError('Specify --origin http://ROBOT_IP:8769 / 请通过 --origin 指定访问地址')
+    return 'http://'+addresses[0][1]+':8769'
+
+
+def wait_lab(timeout=25):
+    deadline = time.monotonic()+timeout
+    last = ''
+    while time.monotonic()<deadline:
+        try:
+            with urllib.request.urlopen('http://127.0.0.1:8773/api/collection', timeout=2) as response:
+                state = json.load(response)
+            if state.get('enabled') and state.get('state') == 'idle':
+                return
+            last = 'Unexpected collection state: '+str(state.get('state'))
+        except (OSError, ValueError) as exc:
+            last = str(exc)
+        time.sleep(1)
+    raise RuntimeError('Lab readiness failed / Lab 未就绪: '+last)
+
+
+def show_urls(access, origin=None):
     user = pwd.getpwuid(os.getuid()).pw_name
     addresses = lan_addresses()
     print('\nConsole ready / 控制台就绪')
@@ -87,10 +129,13 @@ def show_urls(access):
             print('No LAN address yet / 暂无局域网地址；联网后重新运行 --check 查看。')
     else:
         host = addresses[0][1] if addresses else 'ROBOT_IP'
-        print('  Laptop terminal / 电脑终端: ssh -N -L 8769:127.0.0.1:8769 '+user+'@'+host)
+        print('  Laptop terminal / 电脑终端: ssh -N -L 8769:127.0.0.1:8769 '+('-L 8773:127.0.0.1:8773 ' if origin else '')+user+'@'+host)
         print('  Laptop browser / 电脑浏览器: http://127.0.0.1:8769/')
     print('Manual steps / 手动操作: Connect services / 连接服务 → Prepare posture / 准备姿态 → Start SONIC / 启动 SONIC')
     print('API/UI recover to idle after restart; SONIC is never auto-started. / 后台重启后保持空闲，不自动启动 SONIC。')
+    if origin:
+        print('OM + Lab / 数采与回放入口: '+origin+'/')
+        print('Camera / 相机: forward video to robot UDP 18554; recording requires fresh video and SONIC feedback. / 将视频转发到机器人 UDP 18554；视频和 SONIC 反馈就绪后可采集。')
 
 
 def wait_console(timeout=25):
@@ -116,8 +161,14 @@ def main(argv=None):
     mode.add_argument('--check', action='store_true', help='Read-only discovery / 只读检查')
     mode.add_argument('--install-only', action='store_true', help='Install/validate package without service changes / 仅安装验证，不改服务')
     mode.add_argument('--configure-only', action='store_true', help='Configure an already validated package / 配置已验证安装包')
-    parser.add_argument('--yes', action='store_true', help='Noninteractive; defaults to local access, no PICO / 非交互，默认仅本机访问、不启用 PICO')
+    parser.add_argument('--source', action='store_true', help='Configure a locally built, software-validated source checkout / 配置本机构建且通过软件验证的源码')
+    parser.add_argument('--yes', action='store_true', help='Noninteractive; defaults to local access with Lab, no PICO / 非交互，默认本机访问、安装 Lab、不启用 PICO')
     parser.add_argument('--access', choices=('local', 'lan'))
+    lab = parser.add_mutually_exclusive_group()
+    lab.add_argument('--lab', dest='lab', action='store_true', help='Install Lab recording/replay (default) / 默认安装 Lab 数采与回放')
+    lab.add_argument('--no-lab', dest='lab', action='store_false', help='Install OM only / 仅安装 OM')
+    parser.set_defaults(lab=True)
+    parser.add_argument('--origin', help='OM browser origin for Lab, e.g. http://ROBOT_IP:8769 / Lab 嵌入的 OM 网页地址')
     pico = parser.add_mutually_exclusive_group()
     pico.add_argument('--pico', dest='pico', action='store_true')
     pico.add_argument('--no-pico', dest='pico', action='store_false')
@@ -138,7 +189,12 @@ def main(argv=None):
         return
     if os.geteuid() == 0:
         raise RuntimeError('Run as the robot user, without sudo / 请以机器人普通用户执行，不要 sudo 整个向导')
-    if not (ROOT/'prebuilt_manifest.json').is_file():
+    if args.source:
+        if not args.configure_only:
+            raise RuntimeError('Use --source --configure-only after scripts/validate_source.py --inference / 先完成源码软件验收')
+        from .source_validation import verify_report
+        verify_report(ROOT)
+    elif not (ROOT/'prebuilt_manifest.json').is_file():
         raise RuntimeError('Extract all three release archives first / 请先解压同一版本的三个预编译包；源码安装见 docs/SOURCE_BUILD.md')
     require_idle()
     # The lock prevents two installers touching the same user's services/config.
@@ -161,6 +217,18 @@ def main(argv=None):
             raise RuntimeError('Use --yes with --access local|lan and --pico/--no-pico / 非交互执行请指定参数')
         access = args.access or ('local' if args.yes else choose('Access / 访问方式: local=SSH, lan=电脑+手机局域网', ('local', 'lan'), 'lan'))
         use_pico = args.pico if args.pico is not None else (False if args.yes else choose('PICO receiver / 配置 PICO 接收器', ('y', 'n'), 'n') == 'y')
+        from scripts import prepare_lab_install as lab_install
+        origin = None
+        if args.origin and not args.lab:
+            raise ValueError('--origin requires Lab / --origin 需要启用 Lab')
+        if args.lab:
+            # install-only installs both environments but does not configure any origin/service.
+            origin = lab_origin(access, args.origin) if not args.install_only else 'http://127.0.0.1:8769'
+            lab_files = lab_install.bundle(ROOT, Path.home(), origin, use_pico, access)
+            if not args.install_only:
+                lab_install.validate_bundle(ROOT, Path.home(), lab_files, require_token=False)
+        elif not args.install_only and any((Path.home()/'.config/systemd/user'/name).exists() for name in lab_install.LAB_UNITS):
+            raise ValueError('Existing Lab installation preserved; use --lab / 已有 Lab，使用 --lab 保留配置')
         if use_pico and not args.install_only:
             state = subprocess.run(['systemctl', 'show', 'onboardmimic-pico-receiver.service', '--property=ActiveState', '--value'], capture_output=True, text=True)
             if state.returncode or state.stdout.strip() not in ('inactive', 'failed'):
@@ -173,9 +241,14 @@ def main(argv=None):
             run(command, cwd=str(ROOT), env=env)
         elif not (ROOT/'.venv/bin/python').is_file():
             raise RuntimeError('Install the package first / 请先完成安装和推理验证')
+        if args.lab:
+            with tempfile.TemporaryDirectory(prefix='onboardmimic-lab-') as directory:
+                lab_output = Path(directory)/'bundle'
+                lab_install.write_bundle(lab_output, lab_files)
+                lab_install.install_dependencies(lab_output)
         if args.install_only:
             print('Installation validated; services untouched / 安装验证完成，未改动服务。')
-            print('Next / 下一步: python3 scripts/setup.py --configure-only'+(' --pico' if use_pico else ''))
+            print('Next / 下一步: python3 scripts/setup.py --configure-only'+(' --pico' if use_pico else '')+('' if args.lab else ' --no-lab'))
             return
         require_idle()
         previous_manifest = config/'installed_services.json'
@@ -185,10 +258,15 @@ def main(argv=None):
         configure(config, ros, workspace, interface, access)
         if use_pico:
             prepare_pico(previous_root)
+        if args.lab:
+            lab_install.install_bundle(ROOT, Path.home(), None, lab_files, dependencies=False)
+        if use_pico:
             run(['sudo', 'systemctl', 'enable', '--now', 'onboardmimic-pico-receiver.service'])
-        run(['systemctl', '--user', 'start', *BOOT_UNITS])
+        run(['systemctl', '--user', 'start', *BOOT_UNITS, *(lab_install.LAB_UNITS if args.lab else ())])
         wait_console()
-        show_urls(access)
+        if args.lab:
+            wait_lab()
+        show_urls(access, origin)
 
 
 if __name__ == '__main__':

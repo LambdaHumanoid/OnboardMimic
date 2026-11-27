@@ -196,7 +196,7 @@ set(EXE_INCLUDES
 
 # Build a static library, used by both the main executable and the tests: 
 add_library(g1_deploy_shared STATIC ${PROJECT_SRCS})
-target_include_directories(g1_deploy_shared PUBLIC ${EXE_INCLUDES})
+target_include_directories(g1_deploy_shared PUBLIC ${EXE_INCLUDES} ${MSGPACK_INCLUDE_DIRS})
 
 # List of libs to link for both the main executable and the tests
 set(EXE_LIBS
@@ -213,7 +213,7 @@ set(EXE_LIBS
 
 # build the main executable:
 add_executable(${EXECUTABLE_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref.cpp)
-target_include_directories(${EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/ ${PROJECT_SOURCE_DIR}/src)
+target_include_directories(${EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/ ${PROJECT_SOURCE_DIR}/src ${MSGPACK_INCLUDE_DIRS})
 
 target_link_directories(${EXECUTABLE_NAME} PRIVATE ${CUDA_LINK_DIRS})
 target_link_libraries(

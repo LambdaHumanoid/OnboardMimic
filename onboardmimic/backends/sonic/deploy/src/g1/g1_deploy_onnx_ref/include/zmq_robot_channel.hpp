@@ -483,7 +483,8 @@ public:
      * to one LowCmd transport.  Simulation leaves the UDP port at zero and
      * remains ZMQ-only.
      */
-    bool PublishLowCmd(const LowCmd_& cmd) {
+    bool PublishLowCmd(const LowCmd_& cmd, LowCmdTransportMetadata* observed = nullptr) {
+        if (observed) *observed = LowCmdTransportMetadata{};
         if (!commands_enabled_) return true;
         const uint64_t attempt_ns = static_cast<uint64_t>(SteadyNowNs());
         const uint64_t previous_attempt_ns = last_lowcmd_attempt_ns_;
@@ -503,6 +504,7 @@ public:
         metadata.stream_id = lowcmd_stream_id_;
         metadata.sequence = ++lowcmd_sequence_;
         metadata.send_steady_ns = attempt_ns;
+        if (observed) *observed = metadata;
 
         bool udp_success = false;
         if (lowcmd_udp_enabled_) {

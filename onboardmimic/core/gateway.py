@@ -51,6 +51,11 @@ class Gateway:
         signature = hmac.new(self.secret, (self.epoch + ':' + stamp).encode(), hashlib.sha256).hexdigest()
         return stamp + ':' + signature
 
+    def control_ticket(self):
+        # Credentials only: no status rendering, process reads or safety polling.
+        with self.lock:
+            return dict(epoch=self.epoch,ticket=self.ticket(),ticket_ttl_ms=250)
+
     def validate(self, request):
         if request.get('epoch') != self.epoch:
             raise ValueError('控制会话已失效，请刷新状态')
@@ -148,9 +153,16 @@ def make_server(gateway, token, port=0):
         def do_GET(self):
             if not self.authorized():
                 return
+            if self.path == '/api/controller/ticket':
+                return self.respond(gateway.control_ticket())
+            if self.path == '/api/execution/v1/capabilities' and hasattr(gateway, 'capabilities'):
+                return self.respond(gateway.capabilities())
+            if self.path.startswith('/api/execution/v2/plans/') and hasattr(gateway,'execution_status'):
+                try:return self.respond(gateway.execution_status(self.path))
+                except ValueError as exc:return self.respond({'error':str(exc)},404)
             if self.path != '/api/controller':
                 return self.respond({'error': 'not found'}, 404)
-            self.respond(gateway.status())
+            self.respond(getattr(gateway, 'query_status', gateway.status)())
 
         def do_POST(self):
             if not self.authorized():
@@ -158,13 +170,17 @@ def make_server(gateway, token, port=0):
             self.connection.settimeout(1.)
             try:
                 size = int(self.headers.get('Content-Length', '0'))
-                if not 0 < size <= 8192:
+                plan_request=self.path=='/api/execution/v2/plans' and hasattr(gateway,'execution_request')
+                if size <= 0 or (not plan_request and size > 8192):
                     raise ValueError('无效请求长度')
-                x = json.loads(self.rfile.read(size))
+                payload = self.rfile.read(size)
+                if self.path=='/api/execution/v2/plans' and hasattr(gateway,'execution_load_bytes'):
+                    return self.respond(gateway.execution_load_bytes(payload))
+                x = json.loads(payload)
                 if not isinstance(x, dict):
                     raise ValueError('请求必须是对象')
                 self.respond(gateway.request(self.path, x))
-            except (ValueError, TypeError, TimeoutError, RuntimeError) as e:
+            except (ValueError, TypeError, KeyError, IndexError, StopIteration, TimeoutError, RuntimeError) as e:
                 self.respond({'error': str(e)}, 409)
 
     # Hardwired loopback; remote use requires an authenticated SSH tunnel.

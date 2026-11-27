@@ -40,24 +40,27 @@ class OnboardClient:
     def status(self):
         return self.call('/api/controller')
 
-    def command(self, action):
+    def command(self, action, **confirmations):
+        allowed = {'confirm_experimental_protection', 'confirm_landing_execution'}
+        if set(confirmations) - allowed:
+            raise ValueError('Unknown command confirmation field')
         # An emergency stop never waits behind an in-flight movement request.
         if action == 'estop':
             self.generation += 1
             return self.call('/api/controller', {'action': action})
         with self.lock:
             generation = self.generation
-            s = self.status()
+            s = self.call('/api/controller/ticket')
             if generation != self.generation:
                 raise RuntimeError('请求已被急停取消')
             self.seq += 1
             return self.call('/api/controller', {'action': action, 'client': self.client,
-                                           'seq': self.seq, 'epoch': s['epoch'], 'ticket': s['ticket']})
+                                           'seq': self.seq, 'epoch': s['epoch'], 'ticket': s['ticket'], **confirmations})
 
     def control(self, command):
         with self.lock:
             generation = self.generation
-            s = self.status()
+            s = self.call('/api/controller/ticket')
             if generation != self.generation:
                 raise RuntimeError('请求已被急停取消')
             # Preserve browser client and sequence; never retry a motion POST.

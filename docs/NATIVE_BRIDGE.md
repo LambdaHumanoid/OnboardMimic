@@ -35,16 +35,22 @@ and 40 ms settling before new motion requests. Stop and emergency stop stay avai
 
 > 兼容 TCP 端口不能授予指令控制权。UDP 保留原协议并校验 CRC、有限值、发送时效、数据流与序列号。看门狗为 100 ms，阻尼渐变为 150 ms，新流验证 25 帧，实测恢复 500 ms。LowState/IMU 转发上限分别为 500/250 Hz，不重发过期样本。切换反馈源须有新鲜的双主题数据并稳定 40 ms，之后才接受新运动请求；停止与急停仍可用。
 
+When the physical protection executor is armed, its 50 ms new-command timeout
+can take over before the general transport watchdog. These are different guards;
+see [WBC protection](WBC_PROTECTION.rst).
+
+> 物理保护已布防时，50 ms 新命令超时可先于通用传输看门狗触发接管，不能把两者当成同一个阈值。见[WBC 保护](WBC_PROTECTION.rst)。
+
 ## Installation / 安装
 
-Source and prebuilt installations need ROS2 Foxy and a workspace providing
-`unitree_hg` and `unitree_api`. The setup wizard configures their paths; manual
+JP5 installations use ROS2 Foxy; the [JP6 source installer](JETPACK6.md) uses ROS2
+Humble. Both need a matching workspace providing `unitree_hg` and `unitree_api`. The setup wizard configures their paths; manual
 installations set `ROS_SETUP` and `UNITREE_ROS_SETUP` to their real setup scripts.
 The prebuilt package includes ARM64 `sonic_state_reader` and `sonic_command_bridge`,
 but not the target ROS2 installation. Source builds also need ROS2 development
 headers, libzmq, msgpack and nlohmann-json headers.
 
-> 源码和预编译安装均需要 ROS2 Foxy，以及提供 `unitree_hg` 和 `unitree_api` 的工作空间。向导配置这些路径；手动安装时，将 `ROS_SETUP` 和 `UNITREE_ROS_SETUP` 指向实际 setup 脚本。预编译包包含 ARM64 `sonic_state_reader` 和 `sonic_command_bridge`，不包含目标 ROS2 环境。源码构建还需要 ROS2 开发头文件、libzmq、msgpack 和 nlohmann-json 头文件。
+> JP5 使用 ROS2 Foxy；[JP6 源码安装](JETPACK6.md)使用 ROS2 Humble。两者都需要提供 `unitree_hg` 和 `unitree_api` 的匹配工作空间。向导配置这些路径；手动安装时，将 `ROS_SETUP` 和 `UNITREE_ROS_SETUP` 指向实际 setup 脚本。预编译包包含 ARM64 `sonic_state_reader` 和 `sonic_command_bridge`，不包含目标 ROS2 环境。源码构建还需要 ROS2 开发头文件、libzmq、msgpack 和 nlohmann-json 头文件。
 
 Set `CYCLONEDDS_URI` in `~/.config/onboardmimic/bridge.env` to a local DDS XML template.
 On explicit bridge/receiver startup, the direct robot-network route selects the
@@ -54,9 +60,12 @@ guessing eth0. The supported internal network is 192.168.123.0/24.
 
 > 将 `~/.config/onboardmimic/bridge.env` 的 `CYCLONEDDS_URI` 设为本地 DDS XML 模板。显式启动桥接/接收器时，根据直达机器人网络的路由选择实际网卡，在 `var/` 下生成私有 XML；原 XML 与网络路由保持不变。路由缺失或不明确时失败，不猜测 eth0。支持的内部网络为 192.168.123.0/24。
 
-For installation updates, stop the controller and follow the [upgrade guide](UPGRADE.md). Preserve the current installation and configuration for rollback.
+Use [deployment by change scope](INCREMENTAL_DEPLOYMENT.md) for an existing source
+snapshot deployment, or [full migration](UPGRADE.md) for installation/service layout
+changes. Native/control updates require stopped control; static resource updates
+do not. Preserve the previous installation and configuration for rollback.
 
-> 更新安装时，先停止控制器，再按[升级指南](UPGRADE_zh.md)操作。保留当前安装目录与配置以便回退。
+> 已采用源码快照的部署按[变更范围更新](INCREMENTAL_DEPLOYMENT.md)；安装布局变化按[完整迁移](UPGRADE_zh.md)。原生与控制端切换要求停止控制，纯静态资源更新无需停控。保留旧目录和配置用于回退。
 
 ## Evidence and limits / 验证依据与边界
 
@@ -69,8 +78,7 @@ in [VALIDATION.md](VALIDATION.md).
 
 Offline checks cover watchdog/reference transitions, feedback freshness/failover,
 lifecycle admission, service migration and NIC/XML handling. The package includes
-`bridge_build_report.json` with source and binary hashes. Cross-compilation and
-local loader checks do not replace target installation, inference, boot or physical
-commissioning.
+`bridge_build_report.json` with source and binary hashes. Follow [target-device acceptance](VALIDATION.md) for installation, inference, boot
+and physical commissioning.
 
-> 离线检查覆盖看门狗/参考状态切换、反馈时效和故障切换、生命周期准入、服务迁移及 NIC/XML 处理。包内 `bridge_build_report.json` 记录源码和二进制哈希。交叉编译与本地加载器检查不能替代目标机安装、推理、开机或现场调试。
+> 离线检查覆盖看门狗/参考状态切换、反馈时效和故障切换、生命周期准入、服务迁移及 NIC/XML 处理。包内 `bridge_build_report.json` 记录源码和二进制哈希。目标机安装、推理、开机和现场调试按[验收流程](VALIDATION.md)逐项记录。

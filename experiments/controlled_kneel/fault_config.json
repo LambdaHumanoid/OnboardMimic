@@ -1,0 +1,29 @@
+{
+  "knee_first": true,
+  "takeover_delay_s": 0.05,
+  "initial_vx_m_s": 0.1,
+  "times": [
+    0,
+    1.0,
+    1.8,
+    2.4
+  ],
+  "duration": 7,
+  "hip1": -1.45,
+  "waist1": 0.35,
+  "hip2": -2.3,
+  "knee2": 2.3,
+  "ankle2": -0.85,
+  "waist2": 0.5,
+  "hip3": -1.2,
+  "knee3": 2.75,
+  "ankle3": 0.3,
+  "waist3": 0.0,
+  "arm3": -0.5,
+  "elbow3": 0.4,
+  "tuck_shoulder": -1.6,
+  "tuck_elbow": -1.0,
+  "balance_until": 1.0,
+  "blend_s": 0.05,
+  "target_rate_rad_s": 5.0
+}

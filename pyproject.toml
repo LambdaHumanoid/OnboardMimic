@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onboardmimic-lab"
+dynamic = ["version"]
+readme = "lab/README.md"
+description = "OnboardMimic Lab: demonstration collection, motion replay and policy deployment extension"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+capture = ["msgpack>=1,<2", "pyzmq>=25,<28", "numpy>=1.24,<3", "pyarrow>=15,<21", "av>=12,<16"]
+simulation = ["numpy>=1.24,<3", "onnxruntime>=1.18,<2", "mujoco>=3.2,<4", "PyYAML>=6,<7"]
+
+[project.scripts]
+onboardmimic-lab = "onboardmimic_lab.cli:main"
+onboardmimic-lab-console = "onboardmimic_lab.console:main"
+onboardmimic-lab-collector = "onboardmimic_lab.collector_service:main"
+
+[tool.setuptools.packages.find]
+where = ["lab/src"]
+
+[tool.setuptools.package-data]
+onboardmimic_lab = ["static/*.html", "static/*.js", "static/*.css", "static/LICENSE", "static/NOTICE"]
+
+[tool.setuptools.dynamic]
+version = {file = ["VERSION"]}

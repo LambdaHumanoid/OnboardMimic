@@ -6,11 +6,13 @@ English · [简体中文](DEPLOYMENT_zh.md)
 
 Target: G1 29-DOF body, Orin NX 16 GB, JetPack 5 / L4T 35.3.1, CUDA 11.4 and TensorRT 8.5.2. Unless stated otherwise, run commands as the robot's regular user from the `OnboardMimic` root.
 
+For JP6, use the separate [v0.2.0 JP6 runtime package or source installer](JETPACK6.md). The dependency paths and commands below are for JP5.
+
 ## 1. Install
 
-For the supported G1 / JP5 configuration, use the v0.1.1 prebuilt packages:
+For the supported G1 / JP5 configuration, use the v0.2.0 prebuilt packages:
 
-- **Prebuilt (recommended):** download the complete [v0.1.1 package set](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1). Its `python3 scripts/setup.py` wizard completes steps 2 and 3. See the [package guide](PREBUILT.md) for the required file set.
+- **Prebuilt (recommended):** download the complete [v0.2.0 package set](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.2.0). Its `python3 scripts/setup.py` wizard completes steps 2 and 3 and installs independent Lab recording/replay services by default; use `--no-lab` for OM only. See the [package guide](PREBUILT.md) for the required file set.
 - **Source:** follow the [source build guide](SOURCE_BUILD.md), including dependencies, models, compilation, engines and tests, then continue to step 2. Run native and model builds sequentially.
 
 Installation installs `python3-venv` and updates pip inside the venv; network and sudo access are required. It does not upgrade JetPack or start motion control. Missing ROS2 dependencies are repaired with `bash install_scripts/install_ros_dependencies.sh`. Steps 2 and 3 are for source builds or manual configuration.
@@ -102,7 +104,7 @@ First verify preparation, stop and takeover with support, then short ground walk
 ## 5. Stop
 
 - **Stop motion:** clear walking/turning requests; SONIC remains running.
-- **Emergency stop:** terminate the SONIC process owned by this gateway. This is not a power-cut emergency stop and does not guarantee continued standing.
+- **Emergency stop:** terminate the SONIC process owned by this gateway. Power remains on; provide reliable physical support when stopping control.
 
 Before shutting down the backend or upgrading, reliably support the robot, emergency-stop and confirm the policy has exited, then stop services using [upgrade and rollback](UPGRADE.md). Stop motion does not mean SONIC has exited.
 
@@ -143,7 +145,7 @@ After validating the console workflow, the CLI is also available. Execute only t
 | Stop motion, keep SONIC running | `.venv/bin/python scripts/control.py stop` |
 | Terminate SONIC | `.venv/bin/python scripts/control.py estop` |
 
-`left/right` mean lateral walking; `turn-left/turn-right` mean turning. Target speed accepts 0..5 m/s; this is an input range, not high-speed walking qualification.
+`left/right` mean lateral walking; `turn-left/turn-right` mean turning. Target speed accepts 0..5 m/s; choose the operating speed according to the controller, terrain and onsite checks.
 
 HTTP supports `GET /api/controller`, `POST /api/controller` and `POST /api/control`. POST requests are not automatically retried. Motion requests acquire an epoch/ticket, use increasing seq values and have an approximately 550 ms lease. The gateway listens only on `127.0.0.1:18921`; remote clients use a tunnel:
 

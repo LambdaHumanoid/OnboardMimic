@@ -34,7 +34,8 @@ class G1Adapter(RobotAdapter):
         return self.health.ready(now, latest)
 
     def feedback_status(self, latest, now):
-        return {'feedback_continuity': dict(ready=self.feedback_ready(latest,now),
+        from .telemetry import joint_health
+        return {'joint_health': joint_health(latest, now), 'feedback_continuity': dict(ready=self.feedback_ready(latest,now),
             source=(self.health.status or {}).get('source'),
             status=self.health.status, blind_hold_extended=False)}
 

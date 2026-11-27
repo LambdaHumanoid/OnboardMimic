@@ -51,20 +51,15 @@ class ConsoleTest(unittest.TestCase):
   for path in ('/remote','/real/remote','/mobile.css'):
    with urlopen(self.url+path) as response:self.assertEqual(response.status,200)
   self.backend.command.assert_not_called();self.backend.control.assert_not_called()
- def test_skeleton_readonly_fresh_stale_and_invalid(self):
-  import time
-  with tempfile.TemporaryDirectory() as tmp:
-   self.c.pico_runs=Path(tmp);run=Path(tmp)/'sample';run.mkdir();p=run/'status.json'
-   pose=[0,1,0,0,0,0,1]
-   data=dict(updated_at_unix=time.time(),receiver_running=True,data_source='sdk',streams={'body':dict(fresh=True,age_ms=0,unique_frame_hz=80,payload=[pose]*24,source_timestamp_ns=123)})
-   p.write_text(json.dumps(data))
-   with urlopen(self.url+'/api/pico/skeleton') as r:x=json.load(r)
-   self.assertTrue(x['available']);self.assertEqual(len(x['joints']),24)
-   self.assertFalse(x['robot_output_enabled']);self.runner.assert_not_called();self.backend.status.assert_not_called()
-   data['updated_at_unix']=time.time()-1;p.write_text(json.dumps(data));self.assertFalse(self.c.pico_skeleton()['available'])
-   data['updated_at_unix']=time.time();data['streams']['body']['payload'][0]=[0]*7;p.write_text(json.dumps(data));self.assertEqual(self.c.pico_skeleton()['joints'],[])
-   data['data_source']='replay';p.write_text(json.dumps(data));self.assertFalse(self.c.pico_skeleton()['available'])
-  self.backend.command.assert_not_called();self.backend.control.assert_not_called()
+ def test_skeleton_uses_runtime_packet_preview_only(self):
+  preview=dict(available=True,source='sonic_smpl',joints=[[1,2,3]]*24,frame_index=12,delivery='published')
+  self.backend.status.return_value['pose_skeleton']=preview
+  with urlopen(self.url+'/api/pico/skeleton') as r:x=json.load(r)
+  self.assertEqual(x,preview)
+  self.backend.status.return_value['pose_skeleton']=None
+  self.assertFalse(self.c.pico_skeleton()['available'])
+  self.assertEqual(self.c.pico_skeleton()['joints'],[])
+  self.runner.assert_not_called();self.backend.command.assert_not_called();self.backend.control.assert_not_called()
  def test_connect_requires_explicit_authorized_post(self):
   with self.assertRaises(HTTPError) as e:self.post('/api/controller',{'action':'connect_services'},False)
   self.assertEqual(e.exception.code,403);self.runner.assert_not_called()
@@ -100,6 +95,23 @@ class ConsoleTest(unittest.TestCase):
   self.c.connect_status.write_text(json.dumps({'phase':'ready','bridge_pid':123}))
   self.assertFalse(self.c.status()['setup_ready'])
   self.assertFalse(self.c.status()['prepare_available'])
+ def test_split_release_reads_live_connection_producer_record(self):
+  producer=Path(self.tmp.name)/'producer';(producer/'var').mkdir(parents=True)
+  record=producer/'var/connect-status.json'
+  record.write_text(json.dumps(dict(phase='ready',bridge_pid=456)))
+  self.c.connect_status.write_text(json.dumps(dict(phase='ready',bridge_pid=123)))
+  def run(args,**kwargs):
+   value=('ActiveState=active\nMainPID=456\n' if 'onboardmimic-bridge.service' in args
+          else 'ActiveState=active\nResult=success\nWorkingDirectory='+str(producer)+'\n')
+   return Mock(returncode=0,stdout=value,stderr='')
+  self.runner.side_effect=run
+  self.assertTrue(self.c.status()['setup_ready'])
+  record.write_text(json.dumps(dict(phase='ready',bridge_pid=123)))
+  self.assertFalse(self.c.status()['setup_ready'])
+  record.unlink()
+  self.assertFalse(self.c.status()['setup_ready'])
+  self.backend.command.assert_not_called()
+  self.assertTrue(all(c.args[0][2]=='show' for c in self.runner.call_args_list))
  def test_lateral_allowed_and_removed_actions_rejected(self):
   self.backend.control.return_value={'ok':True}
   for move in ('left','right'):

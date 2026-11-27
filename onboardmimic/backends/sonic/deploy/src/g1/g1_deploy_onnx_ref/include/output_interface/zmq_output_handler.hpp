@@ -286,13 +286,14 @@ private:
             has_heading_state = true;
         }
 
-        // State-logger fields: 64 base + 2 optional heading. `last_action`
+        // State-logger fields: 66 base + 2 optional heading. `last_action`
         // preserves the pre-inference logger semantics; `policy_action` is the
         // action produced from this tick's measured state.
         // Visualisation fields: output_data_map_.size() (typically 11)
-        int num_state_fields = has_heading_state ? 66 : 64;
+        int num_state_fields = has_heading_state ? 68 : 66;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
-        pk.pack_map(num_state_fields + num_viz_fields);
+        pk.pack_map(num_state_fields + num_viz_fields + 1);
+        pk.pack("pose_entry_progress"); pk.pack(pose_entry_progress);
 
         // ---- State-logger fields ----
 
@@ -301,6 +302,15 @@ private:
 
         pk.pack("index");
         pk.pack(state.index);
+
+        // Source clocks of the observation used for this tick's token/decoder.
+        // Keep these separate from collector receipt time for dataset alignment.
+        pk.pack("timestamp_monotonic_ns");
+        pk.pack(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            state.timestamp_monotonic.time_since_epoch()).count());
+        pk.pack("timestamp_realtime_ns");
+        pk.pack(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            state.timestamp.time_since_epoch()).count());
 
         pk.pack("ros_timestamp");
         pk.pack(state.ros_timestamp);

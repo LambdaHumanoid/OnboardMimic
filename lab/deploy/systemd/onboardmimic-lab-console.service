@@ -1,0 +1,16 @@
+[Unit]
+Description=OnboardMimic Lab independent data console
+Wants=onboardmimic-lab-collector.service
+After=onboardmimic-lab-collector.service
+[Service]
+Type=simple
+WorkingDirectory=%h/OnboardMimic
+Environment=PYTHONPATH=%h/OnboardMimic/lab/src
+# To embed /embed, append --embed-origin with the exact OnboardMimic browser origin.
+ExecStart=%h/OnboardMimic/.venv/bin/python -m onboardmimic_lab.console --host 0.0.0.0 --port 8773
+KillMode=control-group
+Restart=on-failure
+RestartSec=3
+UMask=0077
+[Install]
+WantedBy=default.target

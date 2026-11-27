@@ -24,7 +24,19 @@ def verify_files(root,manifest):
         if not path.is_file() or path.stat().st_size!=entry['size'] or sha256(path)!=entry['sha256']:
             raise ValueError('Missing or modified release file: '+name)
 
-def environment_errors(facts):
+def environment_errors(facts, manifest=None):
+    if manifest and manifest.get('jetpack_profile') == 'jp6':
+        from .platforms import source_environment_errors
+        errors = source_environment_errors(facts)
+        target = manifest['platform']
+        if facts.get('ubuntu') != '22.04': errors.append('JP6 / Ubuntu 22.04 required')
+        runtime_version = facts.get('tensorrt', '').split(':')[-1].split('-')[0]
+        if runtime_version.split('.')[:3] != target['tensorrt'].split('.')[:3]:
+            errors.append('TensorRT version differs from JP6 native build')
+        major, minor = map(int, target['cuda'].split('.')[:2])
+        if facts.get('cuda_runtime') != major*1000+minor*10:
+            errors.append('CUDA version differs from JP6 native build')
+        return errors
     errors=[]
     for key,expected in [('arch','aarch64'),('ubuntu','20.04')]:
         if facts.get(key)!=expected:errors.append('%s: expected %r, got %r'%(key,expected,facts.get(key)))
@@ -45,7 +57,10 @@ def environment_notes(facts):
         notes.append('Compatible JP5 variant: continue with library and inference checks; this exact device configuration has not been qualified / JP5 相近配置，继续进行动态库与推理检查；此具体配置尚未完成真机验证')
     return notes
 
-def inspect_environment():
+def inspect_environment(manifest=None):
+    if manifest and manifest.get('jetpack_profile') == 'jp6':
+        from .source_validation import environment
+        return environment()
     facts={'arch':platform.machine()}
     os_info=dict(line.split('=',1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
     facts['ubuntu']=os_info.get('VERSION_ID','').strip('"') if os_info.get('ID','').strip('"')=='ubuntu' else ''
@@ -73,10 +88,15 @@ def main():
     verify_files(ROOT,manifest)
     print('All release file hashes match.')
     if args.files_only:return
-    facts=inspect_environment();print(json.dumps(facts,indent=2))
-    errors=environment_errors(facts)
+    facts=inspect_environment(manifest);print(json.dumps(facts,indent=2))
+    errors=environment_errors(facts,manifest)
     if errors:raise SystemExit('\n'.join(errors)+'\nUse the source build on an unsupported environment.')
-    for note in environment_notes(facts):print(note)
+    for note in (environment_notes(facts) if manifest.get('jetpack_profile','jp5')=='jp5' else []):print(note)
+    if manifest.get('jetpack_profile') == 'jp6':
+        from .source_validation import check_loaders
+        check_loaders(ROOT, facts['arch'])
+        print('JP6 libraries resolved; target inference validation is still required. No controller was executed.')
+        return
     # Dynamic loader listing never executes the controller's main().
     binaries=['onboardmimic/backends/sonic/deploy/target/release/g1_deploy_onnx_ref',
               'onboardmimic/robots/unitree_g1/native_bridge/build/sonic_state_reader',

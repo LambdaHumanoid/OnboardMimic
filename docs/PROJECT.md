@@ -34,11 +34,11 @@ this layer.
 > 通过本体与后端适配器支持更多组合。上层任务规划由其他系统提供。
 
 Low latency refers to the local motion-control loop. Remote commands and video
-still depend on the network. Outdoor mobile teleoperation is a target use case,
-not a claim that every outdoor condition has been qualified.
+still depend on the network. Outdoor mobile teleoperation is a target use case; assess network coverage and
+terrain when configuring a deployment.
 
 > 低时延指机器人本机运控闭环；远程指令和视频仍受网络影响。室外移动遥操是面向的使用场景，
-> 具体环境的适用范围以实际验证为准。
+> 部署时根据网络覆盖和地形配置使用环境。
 
 The project directory is `OnboardMimic/`, and the Python package is `onboardmimic`.
 README, documentation and both consoles use the identity above. Source development
@@ -51,13 +51,13 @@ is on the `main` branch of the existing GitHub repository. See the
 
 ## Source provenance / 源码来源
 
-The layout reference is NVIDIA's `NVlabs/GR00T-WholeBodyControl` at `45c03facbf848e0c743091b7d9c17952096ff908`. This is **not** a claim that our deployment sources are an unmodified copy of that commit.
+The layout reference is NVIDIA's `NVlabs/GR00T-WholeBodyControl` at `45c03facbf848e0c743091b7d9c17952096ff908`. The deployment snapshot and its changes are identified by the source hashes below.
 
-> 目录布局参考 NVIDIA `NVlabs/GR00T-WholeBodyControl` 的 `45c03facbf848e0c743091b7d9c17952096ff908` 提交；这**不表示**本项目部署源码是该提交的未修改副本。
+> 目录布局参考 NVIDIA `NVlabs/GR00T-WholeBodyControl` 的 `45c03facbf848e0c743091b7d9c17952096ff908` 提交；部署快照及其修改通过下述源码哈希标识。
 
-The native source here is the tested SONIC deployment snapshot from our onboard deployment, including its ZMQ bridge protocol, initialization/handoff and feedback safety changes. The original imported deployment snapshot did not retain an upstream Git commit identity; we cannot supply an exact upstream merge base. `source_manifest.json` records the imported native source hashes before release packaging changes. Existing NVIDIA notices remain in place. The ROS2 bridge and HTTP adapter are the deployment integration used by this project.
+The native source here is the tested SONIC deployment snapshot from our onboard deployment, including its ZMQ bridge protocol, initialization/handoff and feedback safety changes. `source_manifest.json` records the imported native source hashes before release packaging changes. Existing NVIDIA notices remain in place. The ROS2 bridge and HTTP adapter are the deployment integration used by this project.
 
-> 本项目原生源码来自经过验证的 SONIC 板载部署快照，包含 ZMQ 桥接协议、初始化/接管与反馈保护修改。导入快照未保留上游 Git 提交标识，因此无法提供准确的上游合并基点。`source_manifest.json` 记录发布打包修改前的原生源码哈希；原有 NVIDIA 声明保留。ROS2 桥接与 HTTP 适配器用于本项目的部署集成。
+> 本项目原生源码来自经过验证的 SONIC 板载部署快照，包含 ZMQ 桥接协议、初始化/接管与反馈保护修改。`source_manifest.json` 记录发布打包修改前的原生源码哈希；原有 NVIDIA 声明保留。ROS2 桥接与 HTTP 适配器用于本项目的部署集成。
 
 The release intentionally preserves `onboardmimic/backends/sonic/deploy/src`, `cmake`, `policy/release`, `planner/target_vel/V2`, `reference/example`, and `target/release`. Jetson-specific utilities are grouped under `onboardmimic/backends/sonic/deploy/onboard`. This is a deployment-only distribution, not the complete training/VR repository.
 

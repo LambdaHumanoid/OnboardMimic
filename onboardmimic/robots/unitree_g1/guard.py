@@ -27,8 +27,13 @@ def physical_guard(owned_pid=None):
             inspection_error_count=len(errors), inspection_errors=[
                 dict(pid=e.get('pid'), error=str(e.get('error',''))[:300]) for e in errors[:16]]))
     for protocol, port in (('tcp',16660),('tcp',16661),('udp',16663)):
-        entries = [line.split() for line in Path('/proc/net/'+protocol).read_text().splitlines()[1:]]
-        matching = [e for e in entries if int(e[1].split(':')[1],16) == port and
-                    (protocol == 'udp' or e[3] == '0A')]
+        matching = []
+        with Path('/proc/net/'+protocol).open() as entries:
+            next(entries, None)
+            for line in entries:
+                e = line.split()
+                if int(e[1].split(':')[1],16) == port and (protocol == 'udp' or e[3] == '0A'):
+                    matching.append(e)
+                    if len(matching)>1:break
         if len(matching) != 1 or matching[0][1].split(':')[0] != '0100007F':
             raise RuntimeError('专用桥接端口必须只监听 127.0.0.1：%d' % port)

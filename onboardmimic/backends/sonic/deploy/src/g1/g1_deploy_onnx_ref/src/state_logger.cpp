@@ -103,8 +103,9 @@ uint64_t StateLogger::LogFullState(const std::array<double, 4>& base_quat,
                                    bool brainco_left_feedback_online,
                                    bool brainco_right_feedback_online,
                                    bool brainco_vla_command_allowed,
-                                   double ros_timestamp) {
+                                   double ros_timestamp, uint64_t low_state_received_ns, uint64_t torso_imu_received_ns) {
   Entry e;
+  e.low_state_received_ns=low_state_received_ns;e.torso_imu_received_ns=torso_imu_received_ns;
   e.index = next_index_.fetch_add(1, std::memory_order_relaxed);
   e.timestamp = std::chrono::system_clock::now();
   e.timestamp_monotonic = std::chrono::steady_clock::now();

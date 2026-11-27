@@ -123,7 +123,9 @@ bool ConvertONNXToTRT(
     const std::string& onnxModelPath,
     std::string& trtFile,
     const std::string prefix,
-    bool forceConvert
+    bool forceConvert,
+    std::string* observedOnnxHash,
+    std::string* observedCacheHash
 )
 {
     if ( !FileExists( onnxModelPath ) )
@@ -139,10 +141,12 @@ bool ConvertONNXToTRT(
         std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()
     );
 
+    if(observedOnnxHash) *observedOnnxHash = trtHash;
     // hash in the cuda device name and precision::
     trtHash = picosha2::hash256_hex_string(trtHash + GetCudaDeviceName( options.deviceID ));
     trtHash = picosha2::hash256_hex_string(trtHash + std::to_string(int(options.precision)));
 
+    if(observedCacheHash) *observedCacheHash = trtHash;
     // name of the tensorrt we're going to write to (same directory as the ONNX model):
     const auto filenamePos = onnxModelPath.find_last_of( '/' ) + 1;
     const auto onnxDir = onnxModelPath.substr(0, filenamePos);
@@ -338,9 +342,12 @@ public:
         Destroy();
     }
 
-    bool Initialize( const std::string& trtPath, int deviceIndex, const Options::AxisNames& axisNames )
+    std::string loaded_engine_sha256;
+
+    bool Initialize( const std::string& trtPath, int deviceIndex, const Options::AxisNames& axisNames, const std::string& expectedCacheHash )
     {
         Destroy();
+        loaded_engine_sha256.clear();
 
         // Read the serialized model from disk
         std::ifstream file( trtPath, std::ios::binary | std::ios::ate );
@@ -358,6 +365,10 @@ public:
             LOG_ERROR( "Unable to read engine file!" );
             return false;
         }
+
+        if (buffer.size() <= 64) return false;
+        if (!expectedCacheHash.empty() && std::string(buffer.begin(),buffer.begin()+64)!=expectedCacheHash) return false;
+        const auto loaded_digest = picosha2::hash256_hex_string(buffer.begin(), buffer.end());
 
         // Create runtime to deserialize the engine file.
         m_runtime = std::unique_ptr<nvinfer1::IRuntime>( nvinfer1::createInferRuntime( s_logger ) );
@@ -384,6 +395,8 @@ public:
             LOG_ERROR("Unable to create engine.");
             return false;
         }
+
+        loaded_engine_sha256 = loaded_digest; // exact bytes passed to deserialization (including cache header)
 
         // The execution context contains all of the state associated with a particular invocation
         m_context = std::unique_ptr<nvinfer1::IExecutionContext>( m_engine->createExecutionContext() );
@@ -722,9 +735,9 @@ TRTInferenceEngine::~TRTInferenceEngine()
 {
 }
 
-bool TRTInferenceEngine::Initialize(const std::string& trtPath, int deviceIndex, const Options::AxisNames& axisNames)
+bool TRTInferenceEngine::Initialize(const std::string& trtPath, int deviceIndex, const Options::AxisNames& axisNames, const std::string& expectedCacheHash)
 {
-    return m_impl->Initialize(trtPath, deviceIndex, axisNames);
+    return m_impl->Initialize(trtPath, deviceIndex, axisNames, expectedCacheHash);
 }
 
 bool TRTInferenceEngine::InitInputs(const AxisSizes& axisSizes)
@@ -803,3 +816,4 @@ DataType TRTInferenceEngine::GetTensorDataType(std::string name) const
         return DataType::UNKNOWN;
     }
 }
+std::string TRTInferenceEngine::LoadedEngineSHA256() const { return m_impl->loaded_engine_sha256; }

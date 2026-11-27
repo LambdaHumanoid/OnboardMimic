@@ -102,14 +102,26 @@ class GatewayTest(unittest.TestCase):
             self.g.request('/api/control', self.packet(stop='false'))
         self.assertEqual(self.g.lease.deadline, 0)
 
-    def test_client_cancels_lifecycle_if_estop_interrupts_status(self):
+    def test_client_cancels_lifecycle_if_estop_interrupts_ticket(self):
         client = OnboardClient('http://127.0.0.1:18921', 'x' * 32)
-        def interrupted_status():
+        def interrupted_ticket(path):
+            self.assertEqual(path, "/api/controller/ticket")
             client.generation += 1
             return self.g.status()
-        with patch.object(client, 'status', side_effect=interrupted_status), patch.object(client, 'call') as send:
+        with patch.object(client, 'call', side_effect=interrupted_ticket) as send:
             with self.assertRaises(RuntimeError):client.command('prepare_pose')
-            send.assert_not_called()
+            send.assert_called_once_with("/api/controller/ticket")
+
+    def test_client_uses_lightweight_fresh_ticket_without_retry(self):
+        client = OnboardClient('http://127.0.0.1:18921', 'x' * 32)
+        for invoke in (lambda: client.command('prepare_pose'),
+                       lambda: client.control({'client':'browser','seq':1,'stop':True})):
+            with patch.object(client, 'status', side_effect=AssertionError('full status queried')), \
+                    patch.object(client, 'call', side_effect=[{'epoch':'e','ticket':'fresh'}, TimeoutError('lost')]) as call:
+                with self.assertRaises(TimeoutError): invoke()
+                self.assertEqual(call.call_count, 2)
+                self.assertEqual(call.call_args_list[0].args, ('/api/controller/ticket',))
+                self.assertEqual(call.call_args_list[1].args[1]['ticket'], 'fresh')
 
     def test_client_rejects_nonlocal_and_credential_urls(self):
         for url in ('http://example.com:18921', 'http://127.0.0.1:18921@evil.example', 'http://user@127.0.0.1:18921', 'http://127.0.0.1:18921/path'):

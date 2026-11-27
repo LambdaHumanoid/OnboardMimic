@@ -1,14 +1,14 @@
 """Model-only Orin benchmark. No sockets, DDS, bridge or motor output.
 Synthetic fixed observations: latency evidence, not balance validation.
 """
-import ctypes as C,json,time,threading,sys
+import ctypes as C,json,time,threading,sys,os
 from pathlib import Path
 import numpy as np
 np.bool = np.bool_  # TensorRT 8.5 Python bindings use the removed NumPy alias.
 import tensorrt as trt
-lib=C.CDLL('/usr/local/cuda/lib64/libcudart.so')
+lib=C.CDLL(os.environ.get('CUDART_LIBRARY', '/usr/local/cuda/lib64/libcudart.so'))
 P=C.c_void_p;I=C.c_int;S=C.c_size_t
-signatures={'cudaSetDevice':[I],'cudaMalloc':[C.POINTER(P),S],'cudaMallocHost':[C.POINTER(P),S],'cudaStreamCreate':[C.POINTER(P)],'cudaMemcpyAsync':[P,P,S,I,P],'cudaStreamSynchronize':[P],'cudaStreamBeginCapture':[P,I],'cudaStreamEndCapture':[P,C.POINTER(P)],'cudaGraphInstantiate':[C.POINTER(P),P,P,P,S],'cudaGraphLaunch':[P,P]}
+signatures={'cudaSetDevice':[I],'cudaMalloc':[C.POINTER(P),S],'cudaMallocHost':[C.POINTER(P),S],'cudaStreamCreate':[C.POINTER(P)],'cudaMemcpyAsync':[P,P,S,I,P],'cudaStreamSynchronize':[P],'cudaStreamBeginCapture':[P,I],'cudaStreamEndCapture':[P,C.POINTER(P)],'cudaGraphInstantiateWithFlags':[C.POINTER(P),P,C.c_ulonglong],'cudaGraphLaunch':[P,P]}
 for n,args in signatures.items():getattr(lib,n).argtypes=args;getattr(lib,n).restype=I
 def cuda(name,*args):
  code=getattr(lib,name)(*args)
@@ -19,13 +19,21 @@ class Model:
   self.runtime=trt.Runtime(logger);self.engine=self.runtime.deserialize_cuda_engine(Path(path).read_bytes())
   if self.engine is None:raise RuntimeError('Deserialize failed: '+str(path))
   self.context=self.engine.create_execution_context();self.stream=P();cuda('cudaStreamCreate',C.byref(self.stream));self.bindings=[];self.arrays={};self.device={};self.inputs=[];self.outputs=[]
-  for i in range(self.engine.num_bindings):
-   name=self.engine.get_binding_name(i);shape=tuple(self.context.get_binding_shape(i));dtype=np.dtype(trt.nptype(self.engine.get_binding_dtype(i)))
+  self.tensor_api = int(trt.__version__.split('.')[0]) >= 10
+  count = self.engine.num_io_tensors if self.tensor_api else self.engine.num_bindings
+  for i in range(count):
+   name = self.engine.get_tensor_name(i) if self.tensor_api else self.engine.get_binding_name(i)
+   shape = tuple(self.context.get_tensor_shape(name) if self.tensor_api else self.context.get_binding_shape(i))
+   dtype = np.dtype(trt.nptype(self.engine.get_tensor_dtype(name) if self.tensor_api else self.engine.get_binding_dtype(i)))
    assert all(v>=0 for v in shape),(name,shape)
    size=int(np.prod(shape))*dtype.itemsize;host=P();device=P();cuda('cudaMallocHost',C.byref(host),size);cuda('cudaMalloc',C.byref(device),size)
    raw=(C.c_ubyte*size).from_address(host.value);array=np.frombuffer(raw,dtype=dtype).reshape(shape);array.fill(0)
    self.arrays[name]=array;self.device[name]=device;self.bindings.append(device.value)
-   (self.inputs if self.engine.binding_is_input(i) else self.outputs).append(name)
+   if self.tensor_api:
+    if not self.context.set_tensor_address(name,device.value):raise RuntimeError('Tensor address rejected: '+name)
+    is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+   else:is_input = self.engine.binding_is_input(i)
+   (self.inputs if is_input else self.outputs).append(name)
   for name in self.inputs:
    a=self.arrays[name]
    if name=='context_mujoco_qpos':
@@ -39,14 +47,17 @@ class Model:
   self.graph_exec=None
   self.run()
   graph=P();executable=P();cuda('cudaStreamBeginCapture',self.stream,2)
-  if not self.context.execute_async_v2(self.bindings,self.stream.value):raise RuntimeError('Graph enqueue failed')
-  cuda('cudaStreamEndCapture',self.stream,C.byref(graph));cuda('cudaGraphInstantiate',C.byref(executable),graph,None,None,0);self.graph_exec=executable
+  if not self.enqueue():raise RuntimeError('Graph enqueue failed')
+  cuda('cudaStreamEndCapture',self.stream,C.byref(graph));cuda('cudaGraphInstantiateWithFlags',C.byref(executable),graph,0);self.graph_exec=executable
   print(json.dumps({'model':str(path),'inputs':{k:{'shape':list(self.arrays[k].shape),'dtype':str(self.arrays[k].dtype)} for k in self.inputs}}),flush=True)
+ def enqueue(self):
+  if self.tensor_api:return self.context.execute_async_v3(stream_handle=self.stream.value)
+  return self.context.execute_async_v2(self.bindings,self.stream.value)
  def run(self):
   for k in self.inputs:
    a=self.arrays[k];cuda('cudaMemcpyAsync',self.device[k],P(a.ctypes.data),a.nbytes,1,self.stream)
   if self.graph_exec:cuda('cudaGraphLaunch',self.graph_exec,self.stream)
-  elif not self.context.execute_async_v2(self.bindings,self.stream.value):raise RuntimeError('Inference failed')
+  elif not self.enqueue():raise RuntimeError('Inference failed')
   for k in self.outputs:
    a=self.arrays[k];cuda('cudaMemcpyAsync',P(a.ctypes.data),self.device[k],a.nbytes,2,self.stream)
   cuda('cudaStreamSynchronize',self.stream)

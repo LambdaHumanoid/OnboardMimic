@@ -15,8 +15,7 @@ OnboardMimic 负责集成已有的人形 S0 运控。目前实现的真机组合
 | `robots/unitree_g1/` | 29 关节反馈和阈值、ROS/DDS、宇树模式连接、原生桥接、单发送源准入 | SONIC 模型转换与 Planner 消息格式 |
 | `backends/sonic/` | 启动配置、SONIC 协议、进度解码、PICO→SONIC 映射、模型清单、构建与安装打包 | 控制台布局、其他本体的硬件假设 |
 
-SONIC 原生程序内部仍有 G1 专属策略代码。将它放入后端模块，并不代表其模型能控制任意本体。
-为 SONIC 适配新机器人，还需要对应模型和原生实现，不能只增加硬件适配器。
+SONIC 原生程序包含 G1 专属策略代码。适配新机器人需要对应的模型、原生实现和硬件适配器。
 
 ## 选择组合
 
@@ -32,8 +31,21 @@ robot, backend = select('unitree_g1', 'sonic')
 安装的 API 和控制台服务记录同一组 `--robot` / `--backend`，新安装统一使用 `onboardmimic*` 服务名。
 控制台发现后台的本体/后端不匹配会拒绝启动；急停仍可以尝试发送。
 
-安装入口调用 `backend.installer(robot)`。目前安装方案只支持指定 Orin NX/JP5 环境上的 G1/SONIC。
+安装入口调用 `backend.installer(robot)`。当前支持指定 Orin NX 上的 G1/SONIC：JP5 安装包和独立的 [JP6 源码安装](JETPACK6.md)。
 安装完成不等于获得运动许可：开机只启动空闲 API 和页面，连接、准备姿态、启动策略仍分别手动执行。
+
+## Lab 与执行控制权
+
+`lab/` 与 OM 同仓库、统一根 VERSION，安装和服务保持独立。Lab 网页与 Collector
+通过 HTTP/遥测协议交互，不导入 OM 内部模块；OM 负责 iframe 嵌入、语言同步、页面
+就绪确认及失联占位重试。
+
+Lab 记录实际 token/state 与视频，生成 LeRobot v2.1 数据和 reference-plan v2；
+OM 负责机载回放时序、实时反馈/历史、独占控制和受保护输出。录制、数据处理和回放
+不依赖浏览器续租；Planner 行走与 Pose 输入仍有各自的新鲜度要求。
+正常回放结束或用户停止返回 Planner，执行故障走保护退出。新增 WBC 必须明确接入
+受保护写入器与自有进程生命周期。见 [Lab](../lab/README.md)、
+[回放协议](SONIC_REFERENCE_REPLAY.md)和[保护模块](WBC_PROTECTION.rst)。
 
 ## 控制台本体 / WBC 选择接口
 
@@ -74,7 +86,7 @@ robot, backend = select('unitree_g1', 'sonic')
 最多记录一次 `running_admission_warning`，恢复后记录 `running_admission_recovered`，
 日志位于 `var/logs/runtime-events.log`。进程诊断只记录限量的 PID、程序名和错误信息，
 不记录完整命令参数。桥接共享锁继续拒绝后来者，通信看门狗、实测反馈限制和急停
-继续有效。这项进程检查不代表能隔离外部 DDS 发送源。
+继续有效。外部 DDS 访问由部署网络配置。
 
 ## 新增 S0 后端
 
@@ -140,4 +152,4 @@ python3 onboardmimic/robots/unitree_g1/native_bridge/differential_test.py \
   --binary /tmp/onboardmimic-bridge-test/core_test
 ```
 
-离线测试不能替代目标机安装、推理、开机和动作验收。已发布 G1 配置的范围见[验证说明](VALIDATION.md)。
+离线测试之后，按[验证流程](VALIDATION.md)完成目标机安装、推理、开机和动作验收。

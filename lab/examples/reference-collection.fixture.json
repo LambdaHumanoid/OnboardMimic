@@ -1,0 +1,77 @@
+{
+  "capture_adapter": "reference-v1",
+  "root": "./data-fixture",
+  "same_host": true,
+  "telemetry_endpoint": "tcp://127.0.0.1:16688",
+  "camera_port": 18554,
+  "controller_spec": {
+    "schema": "onboardmimic.lab.controller-spec",
+    "schema_version": 1,
+    "robot_id": "fixture_robot",
+    "backend_id": "fixture_joint",
+    "execution_id": "fixture_joint.v1",
+    "reference_space": "fixture.joint_position.v1",
+    "clock": "same_host_monotonic_ns",
+    "period_ns": 20000000,
+    "max_gap_ns": 30000000,
+    "artifacts": {
+      "fixture": "b418588d18a31ec7e1e2467da8056ddc409982650b6a093d36bfa0e5e20b75bc"
+    },
+    "state": {
+      "q": {
+        "shape": [
+          2,
+          3
+        ],
+        "unit": "rad",
+        "frame": "joint_local",
+        "semantic": "joint_position_history",
+        "joint_names": [
+          "hip",
+          "knee",
+          "ankle"
+        ]
+      }
+    },
+    "reference": {
+      "q_target": {
+        "shape": [
+          3
+        ],
+        "unit": "rad",
+        "frame": "joint_local",
+        "semantic": "joint_position_target",
+        "joint_names": [
+          "hip",
+          "knee",
+          "ankle"
+        ]
+      }
+    },
+    "control_output": {
+      "q_target": {
+        "shape": [
+          3
+        ],
+        "unit": "rad",
+        "frame": "joint_local",
+        "semantic": "joint_position_target",
+        "joint_names": [
+          "hip",
+          "knee",
+          "ankle"
+        ]
+      }
+    },
+    "history": {
+      "length": 2,
+      "period_ns": 10000000,
+      "order": "oldest_first",
+      "reset": "required",
+      "layout": "state.q rows correspond one-to-one to state_history_ns"
+    },
+    "record_modes": [
+      "teleoperation"
+    ]
+  }
+}

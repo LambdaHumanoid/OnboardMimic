@@ -46,6 +46,15 @@ class SonicBackend(S0Backend):
         env.pop('SONIC_LOWCMD_ZMQ_FALLBACK',None)
         return LaunchSpec(controller_args(RESOURCES,interface,robot),DEPLOY,env)
 
+    def validate_runtime_assets(self):
+        from .runtime_assets import validate_caches
+        return validate_caches(DEPLOY)
+
+    def checked_launch_spec(self, spec):
+        import sys
+        return LaunchSpec([sys.executable, str(Path(__file__).with_name('runtime_assets.py')),
+                           str(DEPLOY)] + spec.argv, spec.cwd, spec.env)
+
     def progress(self, text):
         return BackendProgress(preparing='[LowCmd TX] transport=' in text,
             prepared='Init Done' in text, active='Bumpless policy handoff complete' in text,
@@ -56,7 +65,11 @@ class SonicBackend(S0Backend):
             return None
         encoder = value.get('encoder_mode')
         return dict(mode='pose' if encoder == 2 else 'planner' if encoder in (0,1) else None,
-                    playing=value.get('play') is True)
+                    playing=value.get('play') is True, pose_entry_progress=value.get('pose_entry_progress'))
+
+    def reference_replay(self, gateway, path):
+        from .native.replay import Replay
+        return Replay(gateway,path)
 
     def transport(self, gateway, robot):
         from .transport import Transport

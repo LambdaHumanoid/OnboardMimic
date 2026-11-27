@@ -1,0 +1,16 @@
+{
+  "hip2": -2.45,
+  "knee2": 2.3,
+  "ankle2": -0.85,
+  "waist2": 0.5,
+  "arm2": -1.0,
+  "elbow2": 0.15,
+  "hip3": -1.9,
+  "knee3": 2.75,
+  "ankle3": 0.3,
+  "waist3": 0.5,
+  "arm3": -0.5,
+  "elbow3": 0.4,
+  "duration": 22,
+  "contact_gated": true
+}

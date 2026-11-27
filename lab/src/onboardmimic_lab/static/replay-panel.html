@@ -1,0 +1,29 @@
+<header class="collection-heading"><div><p class="collection-brand">OnboardMimic Lab</p><h2 id="replay-title" data-zh="数据回放" data-en="Episode Replay">数据回放</h2></div></header>
+<div class="replay-workspace">
+<div class="replay-controls">
+<div class="replay-picker"><label for="replay-task" data-zh="任务" data-en="Task">任务</label><select id="replay-task"><option value="">—</option></select><p id="replay-task-person"></p></div>
+<div class="replay-picker"><label for="replay-episode" data-zh="已保存的数据" data-en="Saved episode">已保存的数据</label><select id="replay-episode"><option value="">—</option></select><p id="replay-empty" role="status"></p></div>
+<div id="replay-details" hidden>
+<div id="replay-segment-picker" class="replay-validation" hidden><label for="replay-segment" data-zh="数据有中断，请选择回放范围" data-en="Recording has gaps. Choose a replay range">数据有中断，请选择回放范围</label><select id="replay-segment"></select></div>
+
+<details><summary data-zh="技术信息" data-en="Technical information">技术信息</summary><div class="collection-summary replay-meta"><span id="replay-frames"></span><span id="replay-controller"></span><span id="replay-fixture"></span></div><p id="replay-real-safety" class="replay-muted" hidden data-zh="正常完成或主动停止回放后返回 Planner；故障会触发保护退出。" data-en="Normal completion or an operator replay stop returns to Planner; faults trigger a protective exit.">正常完成或主动停止回放后返回 Planner；故障会触发保护退出。</p><p id="replay-contract" class="replay-muted"></p></details>
+</div>
+<p id="replay-validation-state" class="operation-notice" role="status" aria-live="polite" aria-atomic="true"></p>
+<div class="episode-actions"><button id="replay-real" disabled data-zh="真机回放" data-en="Physical replay">真机回放</button><button id="replay-stop" disabled data-zh="停止回放" data-en="Stop replay">停止回放</button></div>
+<p id="replay-real-hint" class="replay-muted operation-notice" role="status" aria-live="polite"></p>
+
+<div id="replay-physical" hidden>
+<div class="collection-summary replay-physical-summary"><p id="replay-real-state" class="operation-notice" role="status" aria-live="polite"></p><p id="replay-real-progress"></p><progress id="replay-real-bar" max="1" value="0" aria-label="Replay progress"></progress><p id="replay-real-ack"></p><p id="replay-real-reason"></p></div>
+
+</div>
+<p id="replay-error" role="alert"></p>
+</div>
+<div class="replay-right-column">
+<aside class="replay-media" aria-labelledby="replay-media-title">
+<p id="replay-media-title" class="replay-media-title" data-zh="录制视频" data-en="Recorded video">录制视频</p>
+<video id="replay-recorded-video" controls preload="metadata" hidden></video><p id="replay-preview-error" class="replay-muted" hidden data-zh="录制视频预览暂不可用。" data-en="Recorded video preview is unavailable.">录制视频预览暂不可用。</p>
+<p id="replay-video-placeholder" data-zh="选择一条数据查看视频" data-en="Choose an episode to view its video">选择一条数据查看视频</p>
+</aside>
+<details id="replay-execution-details" hidden><summary data-zh="执行详情" data-en="Execution details">执行详情</summary><p id="replay-real-model"></p><p class="replay-muted" data-zh="进度表示受保护输出已提交，不表示电机已到位。停止确认不代表已确认触地。回放由机载后台执行，不依赖页面续租；重连不会自动开始新的回放。" data-en="Progress means protected output submission, not motor arrival. Stop confirmation does not verify ground contact. Replay runs onboard without browser renewal; reconnecting never starts a new replay.">进度表示受保护输出已提交，不表示电机已到位。停止确认不代表已确认触地。回放由机载后台执行，不依赖页面续租；重连不会自动开始新的回放。</p></details>
+</div>
+</div>

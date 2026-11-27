@@ -1,4 +1,4 @@
-"""Install Foxy prerequisites and build an isolated, pinned Unitree workspace."""
+"""Install Foxy/Humble prerequisites and build an isolated, pinned Unitree workspace."""
 import argparse
 import os
 from pathlib import Path
@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import urllib.request
 
+from onboardmimic.core.host_platform import os_release
 from onboardmimic.robots.unitree_g1.setup_support import require_idle, run, probe_ros
 
 SOURCES = (
@@ -36,20 +37,26 @@ def main():
     args = parser.parse_args()
     if os.geteuid() == 0:
         raise RuntimeError('Run without sudo / 请用机器人普通用户运行')
-    release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
-    if platform.machine() != 'aarch64' or release.get('VERSION_ID', '').strip('"') != '20.04' or release.get('ID', '').strip('"') != 'ubuntu':
-        raise RuntimeError('This dependency recipe requires Ubuntu 20.04 aarch64 / 此依赖安装方案仅适用 Ubuntu 20.04 ARM64')
+    release = os_release()
+    if platform.machine() != 'aarch64' or release.get('VERSION_ID', '').strip('"') not in ('20.04', '22.04') or release.get('ID', '').strip('"') != 'ubuntu':
+        raise RuntimeError('This dependency recipe requires Ubuntu 20.04/22.04 aarch64 / 需要 Ubuntu 20.04/22.04 ARM64')
+    distro, codename = ('humble', 'jammy') if release['VERSION_ID'].strip('"') == '22.04' else ('foxy', 'focal')
     require_idle()
     workspace = args.workspace.expanduser().absolute()
     # Never overwrite an existing non-wizard workspace or system ROS overlay.
     marker = workspace/'.onboardmimic-dependencies'
     if workspace.exists() and any(workspace.iterdir()) and not marker.exists():
         raise RuntimeError('Existing workspace preserved; choose an empty --workspace / 已保留原工作空间，请选择新目录')
+    if marker.exists():
+        previous = marker.read_text()
+        previous_distro = 'humble' if 'ROS_DISTRO=humble' in previous else 'foxy'
+        if previous_distro != distro:
+            raise RuntimeError('ROS distribution changed; choose a new --workspace / ROS 版本变化，请使用新工作空间')
     workspace.mkdir(parents=True, exist_ok=True)
-    marker.write_text('Pinned Unitree ROS2 dependencies; no robot executable is built.\n')
-    ros = Path('/opt/ros/foxy/setup.bash')
+    marker.write_text('ROS_DISTRO='+distro+'\nPinned Unitree ROS2 dependencies; no robot executable is built.\n')
+    ros = Path('/opt/ros')/distro/'setup.bash'
     if not ros.exists():
-        # Official Foxy repository recipe; retain an existing ROS apt source.
+        # Official ROS repository recipe; retain an existing ROS apt source.
         sources = [Path('/etc/apt/sources.list')]+list(Path('/etc/apt/sources.list.d').glob('*'))
         configured = any(p.is_file() and 'packages.ros.org/ros2/ubuntu' in p.read_text(errors='replace') for p in sources)
         if not configured:
@@ -63,32 +70,40 @@ def main():
                 source = Path(tmp)/'ros2-onboardmimic.list'
                 # Foxy's official apt endpoint uses HTTP; authenticity is
                 # verified by apt using the ROS key fetched over HTTPS above.
-                source.write_text('deb [arch=arm64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu focal main\n')
+                source.write_text('deb [arch=arm64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu '+codename+' main\n')
                 run(['sudo', 'install', '-m', '0644', key, '/usr/share/keyrings/ros-archive-keyring.gpg'])
                 run(['sudo', 'install', '-m', '0644', source, '/etc/apt/sources.list.d/ros2-onboardmimic.list'])
     run(['sudo', 'apt-get', 'update'])
-    run(['sudo', 'apt-get', 'install', '-y', '--no-upgrade', 'ros-foxy-ros-base', 'ros-foxy-rmw-cyclonedds-cpp',
-         'ros-foxy-rosidl-generator-dds-idl', 'ros-foxy-geometry-msgs', 'python3-colcon-common-extensions',
+    run(['sudo', 'apt-get', 'install', '-y', '--no-upgrade', 'ros-'+distro+'-ros-base', 'ros-'+distro+'-rmw-cyclonedds-cpp',
+         'ros-'+distro+'-rosidl-generator-dds-idl', 'ros-'+distro+'-geometry-msgs', 'python3-colcon-common-extensions',
          'python3-venv', 'git', 'cmake', 'build-essential', 'libssl-dev', 'libyaml-cpp-dev'])
     source_root = workspace/'src'
     source_root.mkdir(exist_ok=True)
-    for spec in SOURCES:
+    # Humble provides CycloneDDS through apt; do not overlay Foxy's RMW.
+    for spec in (SOURCES if distro == 'foxy' else SOURCES[:1]):
         checkout(source_root, *spec)
     # Cyclone 0.10.2 is built without a sourced ROS environment, as Unitree requires.
     env = {k: v for k, v in os.environ.items() if k in ('HOME', 'USER', 'LOGNAME', 'TERM', 'http_proxy', 'https_proxy', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY')}
     env.update(PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', LANG='C.UTF-8', MAKEFLAGS='-j2')
-    run(['colcon', 'build', '--base-paths', 'src/cyclonedds', '--executor', 'sequential', '--cmake-args', '-DBUILD_TESTING=OFF'], cwd=str(workspace), env=env)
+    if distro == 'foxy':
+        run(['colcon', 'build', '--base-paths', 'src/cyclonedds', '--executor', 'sequential', '--cmake-args', '-DBUILD_TESTING=OFF'], cwd=str(workspace), env=env)
     script = '''source /opt/ros/foxy/setup.bash && source install/setup.bash &&
 exec colcon build --base-paths src/rmw_cyclonedds/rmw_cyclonedds_cpp \\
  src/unitree_ros2/cyclonedds_ws/src/unitree/unitree_hg \\
  src/unitree_ros2/cyclonedds_ws/src/unitree/unitree_api \\
+ --executor sequential --cmake-args -DBUILD_TESTING=OFF'''
+    if distro == 'humble':
+        script = '''source /opt/ros/humble/setup.bash &&
+exec colcon build --base-paths src/unitree_ros2/cyclonedds_ws/src/unitree/unitree_hg \
+ src/unitree_ros2/cyclonedds_ws/src/unitree/unitree_api \
  --executor sequential --cmake-args -DBUILD_TESTING=OFF'''
     run(['bash', '--noprofile', '--norc', '-c', script], cwd=str(workspace), env=env)
     ok, message = probe_ros(ros, workspace/'install/setup.bash')
     if not ok:
         raise RuntimeError(message)
     print('Dependencies built; original workspaces untouched / 依赖构建完成，原工作空间未改动。')
-    print('Continue / 继续: python3 scripts/setup.py --unitree-ros-setup '+str(workspace/'install/setup.bash'))
+    print('Next: finish source builds and validation before setup / 下一步：先完成源码构建与验证，再配置服务。')
+    print('JP6: docs/JETPACK6.md; JP5: docs/SOURCE_BUILD.md / docs/SOURCE_BUILD_zh.md')
 
 
 if __name__ == '__main__':

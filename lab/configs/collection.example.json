@@ -1,0 +1,10 @@
+{
+  "root": "../data",
+  "capture_adapter": "sonic-native-v2",
+  "same_host": true,
+  "controller_spec_file": "/replace/with/exported/controller-spec.json",
+  "gateway": "http://127.0.0.1:18921",
+  "token_file": "/replace/with/private/gateway.token",
+  "telemetry_endpoint": "tcp://127.0.0.1:16691",
+  "camera_port": 18554
+}

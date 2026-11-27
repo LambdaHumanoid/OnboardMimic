@@ -6,11 +6,13 @@
 
 目标配置：G1 29-DOF 身体、Orin NX 16 GB、JetPack 5 / L4T 35.3.1、CUDA 11.4、TensorRT 8.5.2。以下命令均以机器人普通用户在 `OnboardMimic` 根目录执行，除非另有说明。
 
+JP6 请使用独立的 [v0.2.0 JP6 运行包或源码安装器](JETPACK6.md)。下文依赖路径与命令适用于 JP5。
+
 ## 1. 完成安装
 
-上述 G1 / JP5 配置优先使用 v0.1.1 预编译包：
+上述 G1 / JP5 配置优先使用 v0.2.0 预编译包：
 
-- **预编译包（推荐）**：下载完整的 [v0.1.1 安装包](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1)；安装向导 `python3 scripts/setup.py` 会完成下面第 2、3 步。所需文件集合见[安装包说明](PREBUILT_zh.md)。
+- **预编译包（推荐）**：下载完整的 [v0.2.0 安装包](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.2.0)；安装向导 `python3 scripts/setup.py` 会完成下面第 2、3 步，默认同时配置独立 Lab 数采与回放服务；仅需 OM 可加 `--no-lab`。所需文件集合见[安装包说明](PREBUILT_zh.md)。
 - **源码构建**：按[源码构建指南](SOURCE_BUILD_zh.md)安装、下载模型、编译和构建引擎，通过测试后进入第 2 步。编译与模型构建顺序执行。
 
 安装脚本会安装 `python3-venv` 并在虚拟环境内更新 pip；需要联网和 sudo 权限。它不升级 JetPack，不启动运动控制器。向导缺少 ROS2 依赖时会给出 `bash install_scripts/install_ros_dependencies.sh` 修复命令。第 2、3 步为源码构建或手动配置用户保留。
@@ -102,7 +104,7 @@ systemctl --user start onboardmimic.service onboardmimic-console.service
 ## 5. 停止
 
 - **停止运动**：清除行走/转向请求，SONIC 继续运行。
-- **急停**：终止本网关拥有的 SONIC 进程；不是断电急停，也不保证机器人保持站立。
+- **急停**：终止本网关拥有的 SONIC 进程；机器人保持供电，停止控制时请提供可靠支撑。
 
 需要关闭后台或升级时，先可靠支撑机器人，点击急停并确认策略进程已退出，再按[升级与回退](UPGRADE_zh.md)停止相关服务。不要把“停止运动”当作“SONIC 已退出”。
 

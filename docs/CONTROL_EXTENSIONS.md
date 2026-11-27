@@ -23,7 +23,7 @@ systemctl --user start onboardmimic.service onboardmimic-console.service
 `install_services.py` creates service definitions and a token, enables user linger and console/API boot startup without requiring an SSH login. It installs/enables services; the start command starts them now. The unified `setup.py` wizard also starts the idle backend. The bridge starts through **Connect services**; posture preparation and SONIC startup remain manual. If linger permission fails, run the suggested sudo command and retry. If existing units differ, stop the previous deployment and use `--upgrade` as described in [upgrading](UPGRADE.md); custom drop-ins are retained. The default console address is `127.0.0.1:8769`.
 
 ```bash
-ssh -N -L 8769:127.0.0.1:8769 USER@ROBOT_HOST
+ssh -N -L 8769:127.0.0.1:8769 -L 8773:127.0.0.1:8773 USER@ROBOT_HOST
 # Browser: http://127.0.0.1:8769/
 ```
 
@@ -38,7 +38,7 @@ Desktop routes are `/` or `/real`; mobile routes are `/remote` or `/real/remote`
 3. **Start SONIC:** separately request takeover and wait for confirmation, with a one-second handover.
 4. The **Planner / PICO Pose** tabs appear after startup. Selecting a tab only changes the page; it does not change control mode.
 
-Emergency stop is always visible and terminates the session's controller. It does not cut power or guarantee continued standing. Opening the page or restoring the network does not prepare or start automatically.
+Emergency stop is always visible and terminates the session's controller. Power remains on; provide reliable physical support when stopping control. Opening the page or restoring the network does not prepare or start automatically.
 
 Failed connection shows its reason. Check for other running controllers. If Unitree mode release fails or the bridge is unavailable, preparation stays disabled. Reconnecting does not replace another controller. See [control ownership](CONTROL_AUTHORITY.md).
 
@@ -88,7 +88,7 @@ The setting persists across boots and changes only the web listen address; it do
 
 Hold to walk forward/backward/left/right or turn; release to stop. WASD / arrows walk, Q/E turn, Space/Esc stop motion. Desktop buttons support holding the left mouse button. Mobile joysticks send discrete commands along the dominant direction; joystick displacement does not change speed.
 
-One **target speed** applies to every walking direction. Default: 0.5 m/s. The page and HTTP `speed` accept 0..5 m/s; this is input validation, not a guarantee of stable walking. Change the default with `--default-speed` on the `onboardmimic.core.runtime` gateway, or explicitly supply `speed` per request.
+One **target speed** applies to every walking direction. Default: 0.5 m/s. The page and HTTP `speed` accept 0..5 m/s; choose an operating speed suited to the controller, terrain and onsite checks. Change the default with `--default-speed` on the `onboardmimic.core.runtime` gateway, or explicitly supply `speed` per request.
 
 ```bash
 .venv/bin/python scripts/control.py forward --speed 0.4 --duration 1
@@ -113,9 +113,9 @@ Complete device pairing and full-body tracking calibration in the headset app. C
 
 The headset and robot must be mutually reachable. Enter the **robot's actual IP** in XRoboToolkit. Reception uses TCP `63901`, not web port `8769`. Hotspot addresses depend on local configuration; do not assume `10.42.0.1`. Receiver status is in `onboardmimic/inputs/pico/runs/live/status.json`; inspect connections with `sudo journalctl -u onboardmimic-pico-receiver.service -n 50`. The receiver only receives tracking; boot does not enter Pose or start SONIC.
 
-After preparation and SONIC startup, stop walking, establish a stable stance and align the operator's posture with the robot. Open the PICO Pose tab and click **Enter PICO Pose**. Selecting the tab alone does not take control. `scripts/control.py pose` / `planner` also switch modes. Confirmation comes from `g1_debug` encoder_mode/play; Planner commands are rejected during transitions. Stale tracking requests zero-speed Planner. Reconnection does not automatically re-enter Pose. A mode-confirmation timeout falls back; if Planner fallback also times out, the session controller terminates. Software fallback does not guarantee protection against falls.
+After preparation and SONIC startup, stop walking, establish a stable stance and align the operator's posture with the robot. Open the PICO Pose tab and click **Enter PICO Pose**. Selecting the tab alone does not take control. `scripts/control.py pose` / `planner` also switch modes. Confirmation comes from `g1_debug` encoder_mode/play; Planner commands are rejected during transitions. Stale tracking requests zero-speed Planner. Reconnection does not automatically re-enter Pose. A mode-confirmation timeout falls back; if Planner fallback also times out, the session controller terminates. Use physical support during commissioning and check the deployed [protection configuration](WBC_PROTECTION.rst).
 
-The body preview only reads receiver files; it does not mean the policy has taken control. For a custom receiver directory, pass `--pico-runs /ABSOLUTE/RUNS_PARENT` to the console.
+The body preview reads receiver files; runtime feedback reports policy control status. For a custom receiver directory, pass `--pico-runs /ABSOLUTE/RUNS_PARENT` to the console.
 
 <details>
 <summary>Source or manual installation: build and configure the PICO receiver</summary>
@@ -153,7 +153,7 @@ bash onboardmimic/inputs/pico/prepare_container.sh
 docker image inspect onboardmimic-pico-receiver:20261020 --format '{{.Architecture}}'
 ```
 
-Expect `arm64`. Build on the ARM64 robot with network access; on x86, the script only downloads dependencies. Enter your own tracker serials; `cp -n` preserves existing configuration. Tracker count alone does not establish Body-data readiness.
+Expect `arm64`. Build on the ARM64 robot with network access; on x86, the script only downloads dependencies. Enter your own tracker serials; `cp -n` preserves existing configuration. Use the Body-data status to confirm readiness.
 
 ### 3. Configure and start reception only
 
@@ -180,3 +180,11 @@ Expect `active`. The configuration script installs the receiver service, sets co
 A custom API unit or conflicting `60-pico.conf` is not overwritten; merge manually using the preview. The container uses CPU and host networking, mounts no device or motion-control credentials, and does not record by default. A running receiver does not mean SONIC has taken control.
 
 </details>
+
+### SMPL preview and Pose admission
+
+The skeleton preview uses the exact `smpl_joints` in the SONIC Pose packet, with pelvis-centered display. In Pose mode it shows the last published packet's final frame; otherwise it shows the prepared input. The 10 Hz display samples the 50 Hz input; publication is not an acknowledgement of policy consumption. Stale data is cleared.
+
+Before entering Pose, the runtime transforms PICO arm positions into the SMPL root frame and compares normalized left/right upper-arm and forearm directions. Translation and body size do not affect this comparison. Entry requires 0.3 seconds of continuously consistent fresh samples. A difference above 60 degrees, or missing/degenerate arm positions, keeps entry pending; after 0.3 seconds it reports a tracking/mapping error. Correct input must remain consistent for 0.3 seconds before retrying manually. This admission check does not change active Pose motion or replace existing stop protections. Thresholds are software-tested defaults. Calibrate with actual tracking data and check tracking accuracy separately from position/rotation consistency.
+
+On PICO Pose entry, the current human reference is held while motor commands blend from the held robot command toward the policy target over two seconds. Live tracking is released only after native completion feedback. Hold your pose during this phase. Stream loss, stop or a five-second acknowledgement timeout cancels entry; it never retries automatically. This transition does not correct tracking errors or disable speed/fault protections.

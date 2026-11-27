@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 
 from onboardmimic.core.paths import ROOT
+from .release_profiles import release_platform, verify_engine_evidence
 
 def digest(path):
     h=hashlib.sha256()
@@ -51,16 +52,19 @@ def verify_startup_report(report):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--platform',choices=('jp5','jp6'),default='jp5')
+    p.add_argument('--target-validation',type=Path,help='Target validation required when bundling JP6 engines')
+    p.add_argument('--engine-dir',type=Path,help='Optional validated JP6 engines; otherwise generate engines on target')
     p.add_argument('--snapshot',type=Path,required=True,help='Audited SONIC model/engine snapshot directory')
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--patchelf',required=True)
-    p.add_argument('--version',default='v0.1.1')
+    p.add_argument('--version',default='v'+(ROOT/'VERSION').read_text().strip())
     p.add_argument('--native-binary',type=Path,required=True,help='Freshly built ARM64 controller; never executed by this script')
     p.add_argument('--build-report',type=Path,required=True,help='Source and binary hashes plus toolchain provenance')
     p.add_argument('--bridge-build',type=Path,required=True,help='Fresh ARM64 native bridge binaries')
     p.add_argument('--bridge-report',type=Path,required=True,help='Native bridge build/source hashes')
     a=p.parse_args()
-    if not re.fullmatch(r'[a-zA-Z0-9._-]+',a.version):p.error('Invalid version')
+    if a.version != 'v'+(ROOT/'VERSION').read_text().strip():p.error('Release version must match root VERSION')
     if subprocess.check_output(['git','status','--porcelain'],cwd=ROOT):raise SystemExit('Commit or remove local changes before packaging')
     commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip()
     a.output.mkdir(parents=True,exist_ok=True)
@@ -73,6 +77,13 @@ def main():
     bridge_report=json.loads(a.bridge_report.read_text())
     verify_startup_report(bridge_report)
     verify_bridge_build(a.bridge_build,bridge_report,ROOT/'onboardmimic/robots/unitree_g1/native_bridge')
+    validation=json.loads(a.target_validation.read_text()) if a.target_validation else None
+    target=release_platform(a.platform,build_report,bridge_report,validation)
+    engines=snap/'engines' if a.platform=='jp5' else a.engine_dir
+    if a.platform=='jp6' and engines is not None:
+        if validation is None:raise SystemExit('Bundled JP6 engines require --target-validation')
+        engines=engines.resolve()
+        verify_engine_evidence(engines,validation,digest)
     model_spec=json.loads((ROOT/'onboardmimic/backends/sonic/resources.json').read_text())['models']
     for item in model_spec['files'].values():
         if digest(snap/'source'/item['destination'])!=item['sha256']:raise SystemExit('Original model hash mismatch')
@@ -101,7 +112,7 @@ def main():
         binary_name='onboardmimic/backends/sonic/deploy/target/release/g1_deploy_onnx_ref'
         original=a.native_binary
         binary=copy(original,binary_name,'runtime')
-        subprocess.run([a.patchelf,'--set-rpath','$ORIGIN/../lib:/usr/local/cuda-11.4/targets/aarch64-linux/lib',str(binary)],check=True)
+        subprocess.run([a.patchelf,'--set-rpath','$ORIGIN/../lib:/usr/local/cuda/targets/aarch64-linux/lib',str(binary)],check=True)
         libbase='onboardmimic/backends/sonic/deploy/target/lib/'
         ort=snap/'deps/onnxruntime-linux-aarch64-1.16.3'
         copy(ort/'lib/libonnxruntime.so.1.16.3',libbase+'libonnxruntime.so.1.16.3','runtime')
@@ -122,16 +133,17 @@ def main():
         copy(a.bridge_report,'bridge_build_report.json','runtime')
         for name in ('sonic_state_reader','sonic_command_bridge'):
             copy(a.bridge_build/name,'onboardmimic/robots/unitree_g1/native_bridge/build/'+name,'runtime')
-        for name in ['encoder_fp32.engine','decoder_fp32.engine','planner_fp32.engine']:
-            copy(snap/'engines'/name,'onboardmimic/backends/sonic/deploy/onboard/engines/'+name,'engines')
+        for name in (['encoder_fp32.engine','decoder_fp32.engine','planner_fp32.engine'] if engines is not None else []):
+            copy(engines/name,'onboardmimic/backends/sonic/deploy/onboard/engines/'+name,'engines')
+        if a.platform=='jp6' and validation is not None:copy(a.target_validation,'target_inference_validation.json','runtime')
         inventory={}
         for group,names in groups.items():
             for name in sorted(names):
                 path=stage/name
                 if path.suffix in ('.token','.key','.pem') or any(x in path.parts for x in ('private','__pycache__')):raise SystemExit('Forbidden file: '+name)
                 inventory[name]={'sha256':digest(path),'size':path.stat().st_size,'asset_group':group}
-        manifest={'profile':{'robot':'unitree_g1','backend':'sonic','layout':'onboardmimic'},'version':a.version,'source_commit':commit,'platform':{'board':'Jetson Orin NX 16GB','arch':'aarch64','ubuntu':'20.04','l4t':'35.3.1','cuda':'11.4','tensorrt':'8.5.2','gpu_cache_name':'Orin','precision':'FP32, TF32 disabled'},
-                  'provenance':{'native_build':build_report.get('method','unspecified'),'build_timestamp_utc':build_report.get('built_at_utc'),'engine_snapshot':'2026-10-19 onboard deployment (unchanged engines)','original_binary_sha256':digest(original),'packaged_binary_sha256':digest(binary),'binary_modification':'Recompiled current native sources; RUNPATH relocated with patchelf','qualification':'Fresh ARM64 build with historical model/engine assets. Target-device inference and physical commissioning remain required; no robot execution during packaging.'},'files':inventory}
+        manifest={'profile':{'robot':'unitree_g1','backend':'sonic','layout':'onboardmimic'},'version':a.version,'source_commit':commit,'platform':target,'jetpack_profile':a.platform,'engine_policy':('bundled' if engines is not None else 'build_on_target'),
+                  'provenance':{'native_build':build_report.get('method','unspecified'),'build_timestamp_utc':build_report.get('built_at_utc'),'engine_snapshot':(('target Jetson validation' if engines is not None else 'generated on target; no bundled engines') if a.platform=='jp6' else '2026-10-19 onboard deployment (unchanged engines)'),'original_binary_sha256':digest(original),'packaged_binary_sha256':digest(binary),'binary_modification':'Recompiled current native sources; RUNPATH relocated with patchelf','qualification':'Fresh ARM64 build with audited models; engine provenance is recorded separately. Target-device inference and physical commissioning remain required; no robot execution during packaging.'},'files':inventory}
         (stage/'prebuilt_manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
         shutil.copyfile(stage/'prebuilt_manifest.json',a.output/'prebuilt_manifest.json')
         groups['runtime'].add('prebuilt_manifest.json')
@@ -139,7 +151,8 @@ def main():
         subprocess.run(['python3',str(stage/'scripts/check_prebuilt.py'),'--files-only'],check=True)
         assets=[]
         for group,names in groups.items():
-            dest=a.output/('OnboardMimic-'+a.version+'-'+group+'.tar.gz')
+            if not names:continue
+            dest=a.output/('OnboardMimic-'+a.version+('-jp6' if a.platform=='jp6' else '')+'-'+group+'.tar.gz')
             with dest.open('wb') as raw,gzip.GzipFile(filename='',mode='wb',fileobj=raw,compresslevel=1,mtime=0) as gz,tarfile.open(fileobj=gz,mode='w|') as tf:
                 for name in sorted(names):
                     path=stage/name;info=tf.gettarinfo(str(path),arcname='OnboardMimic/'+name)

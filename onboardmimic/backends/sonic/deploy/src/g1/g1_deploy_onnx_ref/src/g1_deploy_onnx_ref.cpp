@@ -1,3 +1,6 @@
+#include "command_handoff.hpp"
+#include "../include/reference_replay.hpp"
+#include "native_consumption.hpp"
 /**
  * @file g1_deploy_onnx_ref.cpp
  * @brief Main application: deploys an RL locomotion policy on the Unitree G1 robot.
@@ -143,6 +146,7 @@
 #include "../include/error_monitor.hpp"
 #include "../include/control_start_safety.hpp"
 #include "../include/left_shoulder_back_offset.hpp"
+#include "../include/pose_entry_blend.hpp"
 #include "../include/joint_velocity_safety.hpp"
 #include "../include/lower_body_energy_governor.hpp"
 #include "../include/lower_body_braking_priority_slew.hpp"
@@ -418,7 +422,7 @@ class G1Deploy {
     std::array<double, 4> init_ref_data_root_rot_array_;
 
     DataBuffer<LowState_> low_state_buffer_;
-    DataBuffer<MotorCommand> motor_command_buffer_;
+    CommandHandoff<MotorCommand> motor_command_buffer_;
     DataBuffer<IMUState_> imu_torso_buffer_;
     DataBuffer<HeadingState> heading_state_buffer_;
     DataBuffer<MovementState> movement_state_buffer_;
@@ -1025,6 +1029,8 @@ class G1Deploy {
     control_start_safety::GatePhase last_reported_start_gate_phase_ =
         control_start_safety::GatePhase::Idle;
     std::array<float, G1_NUM_MOTOR> held_targets_before_control_{};
+    pose_entry::Blend pose_entry_blend_;
+    bool pose_command_ = false;
     bool validate_first_policy_command_ = false;
     std::size_t startup_blend_ticks_remaining_ = 0;
     
@@ -1118,6 +1124,22 @@ class G1Deploy {
     };
     
     // Pre-allocated observation buffers to avoid allocation in control loop
+    std::unique_ptr<sonic_consumption::Publisher> consumption_;
+    std::unique_ptr<sonic_replay::Service> replay_;
+    sonic_replay::Tick replay_tick_;
+    sonic_consumption::Record consumption_attempt_{};
+    uint64_t consumption_index_=0,consumption_generation_=1,consumption_reset_ns_=sonic_consumption::mono();
+    size_t consumption_field_=0;
+    void CaptureHistory(const std::vector<double>& target, const std::vector<StateLogger::Entry>& history) {
+      if (!consumption_ || &target != &obs_buffer_ || consumption_field_ >= sonic_consumption::max_fields) return;
+      auto& out=consumption_attempt_.histories[consumption_field_];
+      if(history.size()>sonic_consumption::max_history) return;
+      out.count=history.size();
+      for(size_t i=0;i<history.size();++i){
+        out.ns[i]=std::chrono::duration_cast<std::chrono::nanoseconds>(history[i].timestamp_monotonic.time_since_epoch()).count();
+        out.index[i]=history[i].index;out.low_state_received_ns[i]=history[i].low_state_received_ns;out.torso_imu_received_ns[i]=history[i].torso_imu_received_ns;
+      }
+    }
     std::vector<double> obs_buffer_;          // Policy observation buffer
     std::vector<double> encoder_obs_buffer_;  // Encoder observation buffer
     
@@ -1288,6 +1310,7 @@ class G1Deploy {
       if (!state_logger_) { return; }
 
       if (reinitialize_heading_) {
+        // Heading changes do not clear the real StateLogger history.
         double sample_dt = control_dt_;
         auto hist = state_logger_->GetLatest(1, sample_dt);
         const auto& base_quat = hist[0].base_quat;
@@ -2188,6 +2211,7 @@ class G1Deploy {
       // step_size here means: sample every step_size * dt (e.g., step_size=2 means 0, 2*dt, 4*dt, ...)
       double sample_dt = control_dt_ * step_size;
       auto hist = state_logger_->GetLatest(static_cast<size_t>(num_frames), sample_dt, newest_first);
+      CaptureHistory(target_buffer, hist);
       
       // Check if we have valid historical data
       if (hist.empty() || hist[0].body_q.empty()) {
@@ -2235,6 +2259,7 @@ class G1Deploy {
       if (!state_logger_) { return false; }
       double sample_dt = control_dt_ * step_size;
       auto hist = state_logger_->GetLatest(static_cast<size_t>(num_frames), sample_dt, newest_first);
+      CaptureHistory(target_buffer, hist);
       
       // Check if we have valid historical data
       if (hist.empty() || hist[0].body_dq.empty()) {
@@ -2298,6 +2323,7 @@ class G1Deploy {
       if (!state_logger_) { return false; }
       double sample_dt = control_dt_ * step_size;
       auto hist = state_logger_->GetLatest(static_cast<size_t>(num_frames), sample_dt, newest_first);
+      CaptureHistory(target_buffer, hist);
       
       // Check if we have valid historical data
       if (hist.empty() || hist[0].last_action.empty()) {
@@ -2343,6 +2369,7 @@ class G1Deploy {
       if (!state_logger_) { return false; }
       double sample_dt = control_dt_ * step_size;
       auto hist = state_logger_->GetLatest(static_cast<size_t>(num_frames), sample_dt, newest_first);
+      CaptureHistory(target_buffer, hist);
       
       // Check if we have valid historical data
       if (hist.empty()) {
@@ -2364,6 +2391,7 @@ class G1Deploy {
       if (!state_logger_) { return false; }
       double sample_dt = control_dt_ * step_size;
       auto hist = state_logger_->GetLatest(static_cast<size_t>(num_frames), sample_dt, newest_first);
+      CaptureHistory(target_buffer, hist);
       
       // Check if we have valid historical data
       if (hist.empty()) {
@@ -2396,6 +2424,17 @@ class G1Deploy {
 
     /// Populate the token_state observation (either from local encoder or external data).
     bool GatherTokenState(std::vector<double>& target_buffer, size_t offset) {
+      if (replay_tick_.external && !replay_tick_.returning) {
+        std::copy(replay_tick_.token.begin(), replay_tick_.token.end(), token_state_data_.begin());
+        std::copy(replay_tick_.token.begin(), replay_tick_.token.end(), target_buffer.begin()+offset);
+        return true;
+      }
+      if(replay_tick_.returning && !sonic_replay::planner_return_admissible(
+          is_using_encoder_, current_motion_==planner_motion_, current_motion_->GetEncodeMode())) {
+        std::cerr << "[ReplayReturn] Live Planner reference unavailable; encoder_mode="
+                  << current_motion_->GetEncodeMode() << std::endl;
+        return false;
+      }
       if (!is_using_encoder_) {
         // No encoder configured; use token_state_data_ (can be set externally via ROS2/ZMQ)
         std::copy(token_state_data_.begin(), token_state_data_.end(), target_buffer.begin() + offset);
@@ -2408,13 +2447,25 @@ class G1Deploy {
       }
 
       // Gather encoder observations (populate encoder's internal input buffer)
-      if (!GatherEncoderObservations()) {
+      uint64_t encoder_cpu_started=0;
+      if(consumption_){consumption_attempt_.encoder_stages[0]=sonic_consumption::mono();encoder_cpu_started=sonic_consumption::thread_cpu();}
+      const bool encoder_gathered=GatherEncoderObservations();
+      if(consumption_){consumption_attempt_.encoder_stages[1]=sonic_consumption::mono();consumption_attempt_.encoder_gather_cpu_ns=sonic_consumption::thread_cpu()-encoder_cpu_started;}
+      if (!encoder_gathered) {
         std::cerr << "✗ Error: Failed to gather encoder observations!" << std::endl;
         return false;
       }
 
+      if(consumption_){
+        const auto& input=encoder_engine_->GetInputBuffer();
+        consumption_attempt_.encoder_size=input.size();consumption_attempt_.encoder_at=sonic_consumption::mono();
+        std::copy(input.begin(),input.end(),consumption_attempt_.encoder_input.begin());
+      }
       // Run encoder inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
-      if (!encoder_engine_->Encode()) {
+      if(consumption_){consumption_attempt_.encoder_stages[2]=sonic_consumption::mono();encoder_cpu_started=sonic_consumption::thread_cpu();}
+      const bool encoder_encoded=encoder_engine_->Encode(nullptr,consumption_ ? &consumption_attempt_.encoder_timing : nullptr);
+      if(consumption_){consumption_attempt_.encoder_stages[3]=sonic_consumption::mono();consumption_attempt_.encoder_infer_cpu_ns=sonic_consumption::thread_cpu()-encoder_cpu_started;}
+      if (!encoder_encoded) {
         std::cerr << "✗ Error: Encoder inference failed" << std::endl;
         return false;
       }
@@ -2431,7 +2482,8 @@ class G1Deploy {
       }
       
       for (size_t i = 0; i < token_dim; ++i) {
-        const double v = static_cast<double>(token_buffer[i]);
+        const double live = static_cast<double>(token_buffer[i]);
+        const double v = replay_tick_.returning ? (1.-replay_tick_.planner_blend)*replay_tick_.token[i]+replay_tick_.planner_blend*live : live;
         token_state_data_[i] = v;
         target_buffer[offset + i] = v;
       }
@@ -2731,14 +2783,18 @@ class G1Deploy {
     
     // Gather observations (simplified - functions read from internal state)
     bool GatherObservations() {
+      if(consumption_){consumption_attempt_=sonic_consumption::Record{};consumption_attempt_.index=++consumption_index_;consumption_attempt_.generation=consumption_generation_;consumption_attempt_.reset_ns=consumption_reset_ns_;}
+      consumption_field_=0;
       // Clear observation buffer
       std::fill(obs_buffer_.begin(), obs_buffer_.end(), 0.0);
       
       // Process observations using pre-built active functions (no map lookup needed!)
       for (const auto& active_obs : active_obs_functions_) {
         bool success = active_obs.function(obs_buffer_, active_obs.offset);
+        ++consumption_field_;
         
         if (!success) {
+          if(consumption_){consumption_attempt_.at=sonic_consumption::mono();consumption_attempt_.realtime=sonic_consumption::wall();consumption_attempt_.finished=consumption_attempt_.at;consumption_->inference.push(consumption_attempt_);}
           std::cout << "Error: Failed to gather observation: " << active_obs.name << std::endl;
           return false;
         }
@@ -3532,7 +3588,7 @@ class G1Deploy {
         
         std::cout << "✓ Encoder model loaded successfully!" << std::endl;
         is_using_encoder_ = true;
-        initial_encoder_mode_ = 0;  // Encoder available, default to mode 0.
+        initial_encoder_mode_ = sonic_replay::planner_encoder_mode;  // G1 Planner references.
       } else {
         if (encoder_config_.dimension > 0) {
           std::cout << "Encoder config found but no encoder file provided - tokens can be set externally" << std::endl;
@@ -3658,6 +3714,40 @@ class G1Deploy {
           static_cast<int>(lower_body_impact_damper_hold_ticks_);
       robot_config["lower_body_impact_damper_all_monitored"] =
           lower_body_impact_damper_all_monitored_;
+
+      // Explicit local opt-in; no service defaults or legacy telemetry change.
+      if(const char* port=std::getenv("OM_SONIC_NATIVE_TELEMETRY_PORT")) {
+        using J=sonic_consumption::Json;
+        if(obs_buffer_.size()>sonic_consumption::max_input || encoder_obs_buffer_.size()>sonic_consumption::max_input || active_obs_functions_.size()>sonic_consumption::max_fields)
+          throw std::runtime_error("Native telemetry layout exceeds fixed capacity");
+        J layout=J::array(),encoder_layout=J::array(),parameters;
+        for(const auto& field:active_obs_functions_)layout.push_back({{"name",field.name},{"offset",field.offset},{"dimension",field.dimension}});
+        for(const auto& field:active_encoder_obs_functions_)encoder_layout.push_back({{"name",field.name},{"offset",field.offset},{"dimension",field.dimension}});
+        for(const auto& pair:robot_config) {
+          if(pair.first.find("path")!=std::string::npos || pair.first=="encoder_file")continue;
+          std::visit([&](const auto& value){parameters[pair.first]=value;},pair.second);
+        }
+        parameters["encoder_modes"]=J::array();
+        for(const auto& mode:encoder_config_.encoder_modes)parameters["encoder_modes"].push_back({{"name",mode.name},{"mode_id",mode.mode_id},{"required_observations",mode.required_observations}});
+        parameters["encoder_fp16"]=encoder_config_.use_fp16;
+        parameters["isaaclab_to_mujoco"]=isaaclab_to_mujoco;parameters["mujoco_to_isaaclab"]=mujoco_to_isaaclab;
+        parameters["action_scale"]=g1_action_scale;parameters["default_angles"]=default_angles;parameters["kp"]=kps;parameters["kd"]=kds;
+        J manifest={{"schema","onboardmimic.sonic.native-manifest"},{"schema_version",2},{"layout",layout},
+          {"encoder_layout",encoder_layout},{"input_dimension",obs_buffer_.size()},
+          {"period_ns",uint64_t(control_dt_*1e9)},{"parameters",parameters},
+          {"artifacts",{{"decoder_loaded_trt",policy_engine_->LoadedEngineSHA256()},
+                        {"decoder_onnx_cache_validated",policy_engine_->validated_onnx_sha256_},
+                        {"native_executable",sonic_consumption::file_digest("/proc/self/exe")}}},
+          {"artifact_evidence","sha256_of_exact_deserialized_trt_bytes"},
+          {"history_time_semantic","state_logger_entry_assembly_not_sensor_exposure"}};
+        if(is_using_encoder_){manifest["artifacts"]["encoder_loaded_trt"]=encoder_engine_->LoadedEngineSHA256();manifest["artifacts"]["encoder_onnx_cache_validated"]=encoder_engine_->validated_onnx_sha256_;}
+        manifest["artifacts"]["loaded_parameters"]=sonic_consumption::digest(parameters.dump());
+        manifest["artifacts"]["loaded_observation_layout"]=sonic_consumption::digest(layout.dump());
+        manifest["artifacts"]["loaded_encoder_layout"]=sonic_consumption::digest(encoder_layout.dump());
+        consumption_=std::make_unique<sonic_consumption::Publisher>(std::stoi(port),manifest);
+        if(const char* path=std::getenv("OM_SONIC_REPLAY_SOCKET"))
+          replay_=std::make_unique<sonic_replay::Service>(path,manifest["artifacts"]);
+      }
 
       // Initialize state logger with complete robot configuration
       try {
@@ -3949,6 +4039,8 @@ class G1Deploy {
      * Also publishes Dex3 hand commands at the same cadence.
      */
     void LowCommandWriter() {
+      // Independent replay watchdog suppresses stale writes even if Control stalls.
+      if(replay_ && replay_->stopping()) return;
       std::call_once(
           command_writer_setup_once_,
           [this]() { ConfigureCommandWriterThread(); });
@@ -3968,7 +4060,7 @@ class G1Deploy {
         dds_low_command.motor_cmd().at(i).kd() = 0.0f;
       }
 
-      const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
+      const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.SelectForSend().data;
       if (mc) {
         // Only set the 29 body joints (0-28), leave hand joints (29-34) disabled
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
@@ -3987,7 +4079,13 @@ class G1Deploy {
           // PublishLowCmd records writer gaps and non-blocking send failures.
           // Do not retry a stale frame here; the robot-side watchdog owns the
           // fail-safe decision for a missing stream.
-          (void)zmq_robot_channel_->PublishLowCmd(dds_low_command);
+          LowCmdTransportMetadata metadata;
+          const bool sent=zmq_robot_channel_->PublishLowCmd(dds_low_command, consumption_?&metadata:nullptr);
+          if(consumption_ && sent && mc->inference_sequence && metadata.sequence){
+            sonic_consumption::Record mapping;mapping.kind=1;mapping.index=mc->inference_sequence;mapping.generation=mc->inference_generation;
+            mapping.stream=metadata.stream_id;mapping.seq=metadata.sequence;mapping.send_ns=metadata.send_steady_ns;
+            mapping.at=sonic_consumption::mono();consumption_->writer.push(mapping);
+          }
         }
       }
 
@@ -4344,7 +4442,9 @@ class G1Deploy {
             brainco_left_feedback_online_,
             brainco_right_feedback_online_,
             brainco_vla_command_allowed_,
-            ros_timestamp);
+            ros_timestamp,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(low_state_data.timestamp.time_since_epoch()).count(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(imu_data.timestamp.time_since_epoch()).count());
 
         std::array<double, lower_body_observation_guard::kJointCount>
             q_target_policy_order{};
@@ -4557,14 +4657,23 @@ class G1Deploy {
      * (hardware order) using `g1_action_scale` and `default_angles`.
      */
     bool CreatePolicyCommand() {
+      sonic_consumption::Attempt observed{consumption_.get(),consumption_attempt_};
       // Convert double observation to float and populate policy's internal input buffer
       auto& obs_buffer_float = policy_engine_->GetInputBuffer();
       for (size_t i = 0; i < obs_buffer_.size(); i++) {
         obs_buffer_float[i] = static_cast<float>(obs_buffer_[i]);
       }
 
+      if(consumption_){
+        consumption_attempt_.input_size=obs_buffer_float.size();
+        std::copy(obs_buffer_float.begin(),obs_buffer_float.end(),consumption_attempt_.input.begin());
+        consumption_attempt_.at=sonic_consumption::mono();
+        consumption_attempt_.control_stages[5]=consumption_attempt_.at;
+        consumption_attempt_.cpu_started=sonic_consumption::thread_cpu();
+        consumption_attempt_.realtime=sonic_consumption::wall();
+      }
       // Run policy inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
-      if (!policy_engine_->Infer()) {
+      if (!policy_engine_->Infer(nullptr, consumption_ ? &consumption_attempt_.infer_timing : nullptr)) {
         std::cerr << "✗ Error: Control policy inference failed" << std::endl;
         return false;
       }
@@ -4572,6 +4681,7 @@ class G1Deploy {
       // Access actions from control policy's internal buffer (already populated by Infer)
       auto& action_buffer = policy_engine_->GetActionBuffer();
       float* floatarr = action_buffer.data();
+      if(consumption_){consumption_attempt_.inference_ok=true;std::copy_n(floatarr,29,consumption_attempt_.raw_action.begin());}
 
       MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
@@ -4682,6 +4792,12 @@ class G1Deploy {
         }
       }
 
+      const auto previous = motor_command_buffer_.GetDataWithTime().data;
+      if (!previous || !pose_entry_blend_.Apply(pose_command_,
+          std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+          previous->q_target, motor_command_tmp.q_target)) return false;
+      if (pose_command_) UpdateLastActionFromMotorCommand(motor_command_tmp);
+
       if (!ApplyLowerBodyImpactDamper(
               motor_command_tmp, !startup_blend_active)) {
         return false;
@@ -4697,7 +4813,23 @@ class G1Deploy {
         return false;
       }
 
-      motor_command_buffer_.SetData(motor_command_tmp);
+      if(consumption_){
+        motor_command_tmp.inference_sequence=consumption_attempt_.index;
+        motor_command_tmp.inference_generation=consumption_attempt_.generation;
+        consumption_attempt_.q=motor_command_tmp.q_target;consumption_attempt_.dq=motor_command_tmp.dq_target;
+        consumption_attempt_.kp=motor_command_tmp.kp;consumption_attempt_.kd=motor_command_tmp.kd;
+        consumption_attempt_.tau=motor_command_tmp.tau_ff;consumption_attempt_.command_ok=true;
+        consumption_attempt_.finished=sonic_consumption::mono();
+      }
+      const auto replacement=motor_command_buffer_.SetData(motor_command_tmp);
+      if(consumption_){
+        consumption_attempt_.command_buffered_ns=sonic_consumption::mono();
+        if(replacement.previous){
+          consumption_attempt_.replaced_index=replacement.previous->inference_sequence;
+          consumption_attempt_.replaced_generation=replacement.previous->inference_generation;
+          consumption_attempt_.replaced_selected=replacement.selected;
+        }
+      }
       return true;
     }
 
@@ -5497,6 +5629,9 @@ class G1Deploy {
      *    10. Periodic timing log every 50 ticks (~1 s).
      */
     void Control() {
+      std::array<uint64_t,6> diagnostic_stages{};
+      uint64_t diagnostic_cpu=0;rusage diagnostic_usage{};
+      if(consumption_){diagnostic_stages[0]=sonic_consumption::mono();diagnostic_cpu=sonic_consumption::thread_cpu();getrusage(RUSAGE_THREAD,&diagnostic_usage);}
       if (operator_state.stop) { return; }
 
       switch (program_state_) {
@@ -5610,6 +5745,27 @@ class G1Deploy {
             }
           }
 
+          if (replay_) {
+            sonic_replay::Feedback entry_feedback;
+            const auto ls=used_low_state_data_.data;
+            const auto entry_command=motor_command_buffer_.GetDataWithTime();
+            if(ls && used_low_state_data_.GetAgeMs()<=50. && entry_command.data && entry_command.GetAgeMs()<=50.){
+              entry_feedback.fresh=true;
+              for(size_t i=0;i<29;++i){entry_feedback.q[i]=ls->motor_state()[i].q();entry_feedback.dq[i]=ls->motor_state()[i].dq();entry_feedback.target[i]=entry_command.data->q_target[i];}
+              const auto q=ls->imu_state().quaternion();
+              const double w=q[0],x=q[1],y=q[2],z=q[3],norm=w*w+x*x+y*y+z*z;
+              entry_feedback.fresh=control_start_safety::IsFinite(norm)&&norm>.9&&norm<1.1;
+              entry_feedback.gravity={2*(w*y-x*z),-2*(w*x+y*z),-(w*w-x*x-y*y+z*z)};
+            }
+            replay_tick_=replay_->tick(sonic_consumption::mono(), operator_state.play && !operator_state.stop,entry_feedback);
+            if(replay_tick_.stop){
+                operator_state.stop=true;
+                std::cerr << "[REPLAY_STOP] " << replay_->status().dump() << std::endl;
+                return;
+            }
+            // Replay prewarms live history; it does not reset StateLogger.
+          }
+          if(consumption_)diagnostic_stages[1]=sonic_consumption::mono();
           if (!GatherInputInterfaceData()) {
             return;
           }
@@ -5617,12 +5773,14 @@ class G1Deploy {
           
           // Lock mutex for observation gathering and output sending to ensure consistency
           // This ensures all observations use the same snapshot of current_motion_ and current_frame_
+          if(consumption_)diagnostic_stages[2]=sonic_consumption::mono();
           int current_frame_copy;
           int current_encoder_mode_copy;
           bool current_play_copy;
           std::shared_ptr<const MotionSequence> current_motion_copy = nullptr;
           {
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
+            if(consumption_)diagnostic_stages[3]=sonic_consumption::mono();
             current_frame_copy = current_frame_;
             current_motion_copy = current_motion_;
             current_encoder_mode_copy = current_motion_copy->GetEncodeMode();
@@ -5635,6 +5793,7 @@ class G1Deploy {
             // Must run before any orientation observation functions
             UpdateHeadingState();
 
+            // Recording follows the live decoder, independent of encoder mode.
             // Gather all observations using modular functions
             // This may update token_state_data_ with encoder output (if encoder is used)
             if (!GatherObservations()) {
@@ -5642,6 +5801,19 @@ class G1Deploy {
               std::cout << "Stopping control system." << std::endl;
               operator_state.stop = true;
               return;
+            }
+            if(consumption_){
+              diagnostic_stages[4]=sonic_consumption::mono();
+              consumption_attempt_.control_stages=diagnostic_stages;
+              consumption_attempt_.control_cpu_started=diagnostic_cpu;
+              consumption_attempt_.voluntary_started=diagnostic_usage.ru_nvcsw;
+              consumption_attempt_.involuntary_started=diagnostic_usage.ru_nivcsw;
+              const int actual_mode=current_motion_->GetEncodeMode();
+              consumption_attempt_.mode=replay_tick_.external?3:actual_mode;consumption_attempt_.generation=consumption_generation_;
+              consumption_attempt_.replay_run=replay_tick_.run;
+              consumption_attempt_.replay_frame=replay_tick_.frame;
+              consumption_attempt_.replay_consumed=replay_tick_.consumed;
+              consumption_attempt_.reset_ns=consumption_reset_ns_;
             }
           } // Release lock after all observation-dependent operations
 
@@ -5656,6 +5828,7 @@ class G1Deploy {
 
           auto obs_end_time = std::chrono::steady_clock::now();
 
+          pose_command_ = current_encoder_mode_copy == 2 || replay_tick_.external;
           if (!CreatePolicyCommand()) {
             std::cout << "✗ Error: Failed to create policy command in the middle of the control loop!" << std::endl;
             std::cout << "Stopping control system." << std::endl;
@@ -5684,6 +5857,7 @@ class G1Deploy {
           // Publish output data (state logger data, robot config, command/motion data) to all output interfaces
           for (auto& output_interface : output_interfaces_) {
             if (output_interface) {
+              output_interface->pose_entry_progress = pose_entry_blend_.progress;
               output_interface->publish(
                 vr_3point_position_buffer_, vr_3point_orientation_buffer_, vr_3point_compliance_buffer_,
                 left_hand_joint_buffer_, right_hand_joint_buffer_, init_ref_data_root_rot_array_,

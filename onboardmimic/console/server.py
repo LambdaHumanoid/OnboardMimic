@@ -1,8 +1,11 @@
 """Robot-local console. Boot and GET are read-only; setup requires an explicit POST."""
+from .assets import select as select_assets, pin as pin_assets, status as asset_status
 import argparse
+import os
 import sys
 import json
 import math
+import logging
 import secrets
 import subprocess
 import threading
@@ -12,14 +15,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 from onboardmimic.core.client import OnboardClient
 from onboardmimic.console.client import OnboardBackend
+from onboardmimic.console.lab_embed import describe as describe_lab_embed
 
 from onboardmimic.core.registry import catalog, select, select_input, DEFAULT_ROBOT, DEFAULT_BACKEND
 from onboardmimic.core.paths import ROOT
 
 class Console:
     def __init__(self, backend, static, runner=subprocess.run, connection=None, tracking=None,
-                 robot_id=DEFAULT_ROBOT, backend_id=DEFAULT_BACKEND):
+                 robot_id=DEFAULT_ROBOT, backend_id=DEFAULT_BACKEND, lab_embed_url=None):
         robot, controller = select(robot_id, backend_id)
+        self.lab_embed = describe_lab_embed(lab_embed_url)
         self.selection = {'robot_id': robot.id, 'backend_id': controller.id}
         self.backend, self.static, self.runner = backend, Path(static), runner
         self.token = secrets.token_urlsafe(32)
@@ -72,7 +77,10 @@ class Console:
         return self.tracking.status()
 
     def pico_skeleton(self):
-        return self.tracking.skeleton()
+        value = self.backend.status().get('pose_skeleton')
+        if isinstance(value, dict) and value.get('source') == 'sonic_smpl':
+            return value
+        return dict(available=False,joints=[],source='sonic_smpl',reason='等待 SONIC SMPL 预览')
 
     def command(self, x):
         # Serialize selection with all starts and control POSTs. Estop bypasses this lock.
@@ -106,8 +114,11 @@ class Console:
             if result.returncode: raise RuntimeError('无法取消连接流程：'+result.stderr.strip())
         elif action in ('prepare_pose','start_policy'):
             if not self.status()['setup_ready']: raise ValueError('请先连接控制服务')
+        elif action in ('test_wbc_sigterm','test_wbc_sigkill'):
+            if not self.status().get('wbc_exit_tests_enabled',False):raise ValueError('真实退出测试未启用')
         else: raise ValueError('未知操作')
-        return self.backend.command(action)
+        confirmations = {key: x[key] for key in ('confirm_experimental_protection', 'confirm_landing_execution') if key in x}
+        return self.backend.command(action, **confirmations)
 
     def control(self, x):
         with self.mode_lock:
@@ -128,11 +139,15 @@ def make_server(console, host='127.0.0.1', port=0):
             if not isinstance(data,bytes): data=json.dumps(data,ensure_ascii=False).encode()
             self.send_response(code); self.send_header('Content-Type',kind)
             self.send_header('Content-Length',str(len(data))); self.send_header('Cache-Control','no-store')
+            if console.lab_embed['enabled']:
+                self.send_header('Content-Security-Policy', "frame-src " + console.lab_embed['origin'] + "; object-src 'none'")
             self.send_header('X-Content-Type-Options','nosniff'); self.end_headers();self.wfile.write(data)
         def do_GET(self):
             route=urlsplit(self.path).path
             try:
+                if route=='/api/deployment-assets':return self.reply(asset_status())
                 if route=='/api/session':return self.reply({'token':console.token})
+                if route=='/api/console-config':return self.reply({'schema_version':1,'lab_embed':console.lab_embed})
                 if route=='/api/platform':return self.reply(console.platform())
                 if route == '/api/controller':return self.reply(console.status())
                 if route in ('/api/pico/skeleton','/api/input/skeleton'):return self.reply(console.pico_skeleton())
@@ -140,38 +155,55 @@ def make_server(console, host='127.0.0.1', port=0):
                     preview=console.tracking.preview_script()
                     return self.reply(preview.read_bytes() if preview else b'',kind='text/javascript; charset=utf-8')
                 paths={'/':'index.html','/real':'index.html','/remote':'mobile.html','/real/remote':'mobile.html','/mobile.css':'mobile.css',
-                       '/i18n.js':'i18n.js','/app.js':'app.js','/platform.js':'platform.js','/style.css':'style.css'}
+                       '/lab-embed.js':'lab-embed.js','/i18n.js':'i18n.js','/app.js':'app.js','/platform.js':'platform.js','/style.css':'style.css'}
                 if route not in paths:return self.reply({'error':'Not found'},404)
-                path=console.static/paths[route];data=path.read_text()
+                assets,asset_version=select_assets(console.static,'onboardmimic/console/static',self.path)
+                path=assets/paths[route];data=path.read_text()
+                if path.suffix=='.html':data=pin_assets(data,asset_version)
                 kind={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8'}[path.suffix]
                 self.reply(data.encode(),kind=kind)
             except Exception as exc:self.reply({'error':str(exc)},503)
         def do_POST(self):
+            began = time.monotonic(); action = None
+            def rejected(message, code):
+                logging.getLogger(__name__).warning(json.dumps(dict(
+                    event='console_request_rejected', route=self.path.split('?')[0][:80],
+                    action=action, status=code, error=str(message)[:512],
+                    elapsed_ms=round((time.monotonic()-began)*1000, 3)), ensure_ascii=False))
+                return self.reply({'error': str(message)}, code)
             try:
-                if self.path not in ('/api/controller','/api/control'):return self.reply({'error':'Not found'},404)
+                if self.path not in ('/api/controller','/api/control','/api/protection-test'):return self.reply({'error':'Not found'},404)
                 origin=self.headers.get('Origin')
-                if origin and urlsplit(origin).netloc!=self.headers.get('Host'):return self.reply({'error':'跨站控制已拒绝'},403)
-                if not secrets.compare_digest(self.headers.get('X-Control-Token',''),console.token):return self.reply({'error':'请刷新控制页'},403)
+                if origin and urlsplit(origin).netloc!=self.headers.get('Host'):return rejected('跨站控制已拒绝',403)
+                if not secrets.compare_digest(self.headers.get('X-Control-Token',''),console.token):return rejected('请刷新控制页',403)
                 size=int(self.headers.get('Content-Length','0'))
                 if not 0<size<=2048:raise ValueError('无效请求长度')
                 x=json.loads(self.rfile.read(size))
                 if not isinstance(x,dict):raise ValueError('无效请求')
+                action = str(x.get('action',''))[:64]
+                if self.path == '/api/protection-test':
+                    from onboardmimic.core.protection.probe import run_probe
+                    if set(x)!={'case'} or not isinstance(x['case'],str):raise ValueError('无效注入参数')
+                    return self.reply(run_probe(x['case']))
                 self.reply(console.command(x) if self.path=='/api/controller' else console.control(x))
-            except ValueError as exc:self.reply({'error':str(exc)},400)
-            except Exception as exc:self.reply({'error':str(exc)},503)
+            except ValueError as exc:rejected(exc,400)
+            except Exception as exc:rejected(exc,503)
     return ThreadingHTTPServer((host,port),Handler)
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--host',default='127.0.0.1');p.add_argument('--port',type=int,default=8769)
     p.add_argument('--pico-runs',type=Path);p.add_argument('--token-file',type=Path,required=True)
     p.add_argument('--input',default='pico');p.add_argument('--robot',default=DEFAULT_ROBOT);p.add_argument('--backend',default=DEFAULT_BACKEND)
+    p.add_argument('--lab-embed-url',default=os.environ.get('ONBOARDMIMIC_LAB_EMBED_URL'),help='Browser-accessible Lab /embed URL; omitted hides Lab')
     a=p.parse_args()
+    try:describe_lab_embed(a.lab_embed_url)
+    except ValueError as exc:p.error(str(exc))
     robot, controller = select(a.robot,a.backend)
     if a.token_file.stat().st_mode & 0o077: p.error('Token file must be private')
     token=a.token_file.read_text().strip()
     if len(token)<32:p.error('Invalid token')
     backend=OnboardBackend(OnboardClient('http://127.0.0.1:18921',token,timeout=2),robot.id,controller.id)
     console=Console(backend,Path(__file__).parent/'static',connection=robot.connection(),tracking=select_input(a.input),
-                    robot_id=robot.id,backend_id=controller.id)
+                    robot_id=robot.id,backend_id=controller.id,lab_embed_url=a.lab_embed_url)
     if a.pico_runs: console.pico_runs=a.pico_runs
     make_server(console,a.host,a.port).serve_forever()

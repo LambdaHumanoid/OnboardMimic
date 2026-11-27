@@ -1,0 +1,30 @@
+{
+  "evidence": "LOCAL UNIT TEST ONLY; substituted process evidence, not current robot status",
+  "ready": {
+    "lab": {
+      "record_ready": true,
+      "contract_sha256": "ec212b3c7de4578515aaac2400b5b6851bd0a3eafb837ccc94e308beea65a87f",
+      "session_id": "61913dae294fd63ed8c1b00b4504328c699db598411d60c936de5698c5af2984",
+      "native_consumption_fresh": true,
+      "reason": ""
+    }
+  },
+  "stale": {
+    "lab": {
+      "record_ready": false,
+      "contract_sha256": "ec212b3c7de4578515aaac2400b5b6851bd0a3eafb837ccc94e308beea65a87f",
+      "session_id": "61913dae294fd63ed8c1b00b4504328c699db598411d60c936de5698c5af2984",
+      "native_consumption_fresh": false,
+      "reason": "native_consumption_stale_or_warming"
+    }
+  },
+  "fixture": {
+    "lab": {
+      "record_ready": false,
+      "contract_sha256": "262ef83335d30e91d21a8922f094a68bdf5fe770f677f946a02ce9badf9e87d5",
+      "session_id": "61913dae294fd63ed8c1b00b4504328c699db598411d60c936de5698c5af2984",
+      "native_consumption_fresh": true,
+      "reason": "fixture_not_recordable"
+    }
+  }
+}

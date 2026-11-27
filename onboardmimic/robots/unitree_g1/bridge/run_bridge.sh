@@ -12,4 +12,9 @@ python="$root/.venv/bin/python"
 "$python" -m onboardmimic.robots.unitree_g1.bridge.network --template "$CYCLONEDDS_URI" --output "$root/var/command-dds.xml"
 export CYCLONEDDS_URI="file://$root/var/command-dds.xml"
 "$python" -m onboardmimic.robots.unitree_g1.continuity.check_feedback
-exec "$robot/native_bridge/build/sonic_command_bridge" --physical --udp-port 16663 --cmd-port 16661 --primary-port 16665 --standby-port 16666 --logs "$root/var/logs/native-bridge"
+protection_args=()
+if [[ -n "${ONBOARDMIMIC_EXPERIMENTAL_PROTECTION_SOCKET:-}" ]]; then
+    "$python" -m onboardmimic.robots.unitree_g1.bridge.protection_socket "$ONBOARDMIMIC_EXPERIMENTAL_PROTECTION_SOCKET"
+    protection_args=(--experimental-protection-socket "$ONBOARDMIMIC_EXPERIMENTAL_PROTECTION_SOCKET" --protection-voice)
+fi
+exec "$robot/native_bridge/build/sonic_command_bridge" "${protection_args[@]}" --physical --udp-port 16663 --cmd-port 16661 --primary-port 16665 --standby-port 16666 --logs "$root/var/logs/native-bridge"

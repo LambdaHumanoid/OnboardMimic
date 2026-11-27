@@ -54,6 +54,7 @@
  */
 class OutputInterface {
 public:
+    double pose_entry_progress = 1.0;
     /// Identifies the concrete output transport.
     enum class OutputType {
         ROS2,      ///< ROS 2 DDS topics.

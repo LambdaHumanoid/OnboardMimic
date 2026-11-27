@@ -1,6 +1,10 @@
 /* UI-only localization: never sends a control request or replaces controls. */
 (()=>{
  const messages={
+ "Lab 数采": "Lab data collection",
+ "Lab · 数采": "Lab · Data collection",
+ "数采独立运行；录制状态由下方 Lab 页面显示。": "Recording runs independently; see Lab below for its status.",
+ "Lab 需要独立来源，HTTPS 主页面需要 HTTPS Lab。": "Lab requires a separate origin and HTTPS when the host uses HTTPS.",
  "本体": "Robot",
  "敬请期待": "Coming soon",
  "本体与 WBC": "Robot & WBC",

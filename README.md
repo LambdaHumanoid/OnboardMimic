@@ -10,15 +10,25 @@
 >
 > **SONIC 已实现板载部署，下一站计划接入 SuperMimic。**
 
-SONIC is our first onboard controller. Run it on your G1’s own Jetson: keep the robot’s cerebellum onboard, with JetPack 5 deployment tools, bilingual desktop/mobile consoles and PICO full-body teleoperation.
+SONIC is our first onboard controller. Run it on your G1’s own Jetson: keep the robot’s cerebellum onboard, with JetPack 5/6 deployment tools, bilingual desktop/mobile consoles and PICO full-body teleoperation.
 
-> SONIC 是首个板载控制器，目前支持 **Unitree G1**：让机器人的“小脑”运行在自身 Jetson 上，配套 JetPack 5 部署工具、中英文电脑/手机控制台与 PICO 全身遥操。
+> SONIC 是首个板载控制器，目前支持 **Unitree G1**：让机器人的“小脑”运行在自身 Jetson 上，配套 JetPack 5/6 部署工具、中英文电脑/手机控制台与 PICO 全身遥操。
 
 https://github.com/user-attachments/assets/6afc6f3e-d37e-4cd0-8d34-da85d1bc39bf
 
-[🚀 Get started](#get-started) · [📦 Download v0.1.1](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1) · [🤝 Community](#community) · [🎮 Console](#consoles) · [🧩 Architecture](docs/ARCHITECTURE.md)
+[📚 Documentation / 文档](docs/README.md) · [🚀 Get started](#get-started) · [📦 Download v0.2.0](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.2.0) · [🤝 Community](#community) · [🧪 Lab](#lab) · [🎮 Console](#consoles) · [🧩 Architecture](docs/ARCHITECTURE.md)
+
+OM and Lab share the root [`VERSION`](VERSION). Use the v0.2.0 package for your JetPack version and follow the [documentation index](docs/README.md).
+
+> OM 与 Lab 统一使用根目录 `VERSION`。请按 JetPack 版本选择 v0.2.0 安装包，操作指南见[文档索引](docs/README.md)。
 
 ## 📰 News
+
+<a id="v020"></a>
+
+- **[v0.2.0](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.2.0) · Record, replay and protect.** Integrated [OnboardMimic Lab](#lab) with LeRobot v2.1 recording and replay, [fall protection](docs/WBC_PROTECTION.rst) on unexpected controller stops, and separate JP5/JP6 runtime packages.
+
+> **v0.2.0 · 数采、回放与保护。** 集成 OnboardMimic Lab，支持 LeRobot v2.1 数采与回放，新增控制器异常停止时的摔倒保护，提供独立的 JP5、JP6 运行包。
 
 - **[v0.1.1](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1) · Easier JP5 installation.** Automatic TensorRT dependency installation, broader JP5 compatibility, and improved controller detection.
 
@@ -31,7 +41,7 @@ https://github.com/user-attachments/assets/6afc6f3e-d37e-4cd0-8d34-da85d1bc39bf
 ## 📝 TODO
 
 - [ ] **Integrate SuperMimic as an onboard backend. / 接入 SuperMimic 板载后端。**
-- [ ] Support motion recording and playback. / 支持动作录制和回放。
+- [x] Integrate recording and replay tooling in Lab. / 内置 Lab 数采与回放工具。
 - [ ] Adapt SONIC’s low-latency and newer policy variants. / 适配 SONIC 的低延迟版本和更新策略。
 - [ ] Bring more controllers and robot bodies onboard. / 适配更多控制器与机器人本体。
 
@@ -43,7 +53,7 @@ Why does this matter? Official SONIC supports onboard deployment, but its [G1 Or
 
 Running SONIC on an external GPU computer avoids that onboard setup, but puts network latency, jitter and dropped packets in the control path. Your robot has acquired a wireless leash.
 
-With OnboardMimic’s SONIC backend, the control loop stays on the robot’s Jetson, using the supported JP5 configuration below. The laptop or phone sends commands; PICO sends body tracking. Remote commands and tracking still need a network, but the local motion-control loop no longer takes the round trip.
+With OnboardMimic’s SONIC backend, the control loop stays on the robot’s Jetson, using the supported JP5 or JP6 installation path below. The laptop or phone sends commands; PICO sends body tracking. Remote commands and tracking still need a network, but the local motion-control loop no longer takes the round trip.
 
 > **实现板载部署，更好用。先从 SONIC 开始。** OnboardMimic 将运控闭环留在机器人本机，不再绕经 Wi-Fi。我们先将 SONIC 的规划器和策略适配到 G1 现有的 JetPack 5 系统，并提供配套部署工具、运行管理和操控界面。电脑负责遥控，机器人负责自身平衡。
 >
@@ -51,7 +61,7 @@ With OnboardMimic’s SONIC backend, the control loop stays on the robot’s Jet
 >
 > 放到外部 GPU 电脑上可以免去这套板载配置，但网络延迟、抖动和丢包会进入控制链路，给机器人拴上一根“无线牵引绳”。
 >
-> 使用下方支持的 JP5 配置，OnboardMimic 的 SONIC 后端让运控闭环留在机器人自身 Jetson 上。电脑和手机负责发指令，PICO 负责提供人体追踪；这些数据仍需网络传输，但本机运控闭环不再经过网络往返。
+> 使用下方支持的 JP5 或 JP6 安装路径，OnboardMimic 的 SONIC 后端让运控闭环留在机器人自身 Jetson 上。电脑和手机负责发指令，PICO 负责提供人体追踪；这些数据仍需网络传输，但本机运控闭环不再经过网络往返。
 
 SONIC is our first onboard controller, with **SuperMimic planned as the next backend** and more controllers to follow. Robot adapters, controllers and input devices are separate modules to support those integrations. The algorithms and pretrained models remain the work of their original authors. [How the platform fits together →](docs/ARCHITECTURE.md)
 
@@ -61,41 +71,56 @@ SONIC is our first onboard controller, with **SuperMimic planned as the next bac
 
 ## 🚀 Get started / 开始使用
 
-| Component / 组件 | Current SONIC profile / 当前 SONIC 配置 |
-| --- | --- |
-| Robot / 机器人 | Unitree G1, 29-DOF body, no hand control / 29 自由度本体，不含手部控制 |
-| Computer / 机载计算机 | Jetson Orin NX **16 GB** |
-| System / 系统 | JetPack 5 · Ubuntu 20.04 · L4T **35.3.1** |
-| GPU software / GPU 软件 | CUDA **11.4** · TensorRT **8.5.2** |
+**Both JetPack 5 and JetPack 6 have passed real-robot validation on Unitree G1.** Both use the same `main` branch. Choose the installation path that matches your robot’s system.
 
-**Start with your coding agent:** give it this repository and ask it to check your hardware/software versions, download the v0.1.1 packages, follow the installation guide, configure communication, and open the console. For manual setup:
+> **JetPack 5 和 JetPack 6 均已在 Unitree G1 真机上验证通过。** 两者共用 `main` 分支，按机器人当前系统选择安装入口。
 
-1. Download the three archives and checksums from [v0.1.1](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1), then follow the [package guide](docs/PREBUILT.md) to verify and extract them.
-2. Run **`python3 scripts/setup.py`** in `OnboardMimic/`. The wizard installs dependencies, checks inference, configures communication and opens the idle console. Choose LAN access for phones; PICO is optional.
+Hardware / 硬件：**Unitree G1 · 29-DOF body / 29 自由度本体 · Jetson Orin NX 16 GB**。Hand control is not included / 不含手部控制。
+
+| Validated platform / 已验证平台 | System / 系统 | GPU runtime / GPU 运行环境 | Installation / 安装入口 |
+| --- | --- | --- | --- |
+| **JetPack 5** | Ubuntu 20.04 · L4T **35.3.1** | CUDA **11.4** · TensorRT 8.5.2 | [JP5 packages / 预编译安装](docs/PREBUILT.md) · [中文](docs/PREBUILT_zh.md) |
+| **JetPack 6** | Ubuntu 22.04 · L4T **36.4.7** | CUDA **12.6** | [JP6 packages / 预编译安装](docs/JETPACK6.md) · [中文](docs/JETPACK6.md#install--安装) |
+
+**Start with your coding agent:** give it this repository and ask it to check your hardware/software versions, follow the matching installation guide, configure communication, and open the console.
+
+1. Follow the **JP5 or JP6 guide above**. The installer sets up OM and Lab together, installs dependencies and models, and runs inference checks. Use `--no-lab` for OM only.
+2. Configure console access and optional PICO tracking. Choose LAN access to use a laptop or phone.
 3. Open the console: **Connect services → Prepare posture → Start controller.** Installing or opening the page does not start SONIC.
 
-> **直接把仓库交给你的 coding agent。** 让它先核对软硬件版本，再下载 v0.1.1 安装包，按指南完成安装、通信配置和控制台启动。手动安装：
+> **直接把仓库交给你的 coding agent。** 让它核对软硬件版本，按对应平台指南完成安装、通信配置和控制台启动。
 >
-> 1. 从 [v0.1.1](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1) 下载三个压缩包和校验值，按[预编译安装指南](docs/PREBUILT_zh.md)校验并解压。
-> 2. 在 `OnboardMimic/` 中运行 **`python3 scripts/setup.py`**。向导安装依赖、检查推理、配置通信并启动空闲控制台；手机访问选择 LAN，PICO 可选。
+> 1. 按上表的 **JP5 或 JP6 指南**，由统一向导同时安装 OM 与 Lab、依赖及模型，并完成推理检查。仅需 OM 可加 `--no-lab`。
+> 2. 配置控制台访问及可选的 PICO 追踪；电脑、手机访问选择 LAN 模式。
 > 3. 打开控制台，手动执行 **连接服务 → 准备姿态 → 启动控制器**。安装或打开页面不会启动 SONIC。
 
+The [v0.2.0 packages](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.2.0) have separate JP5 and JP6 installation paths. JP6 runtime filenames include `-jp6`; its engines are generated on the target Jetson. See [validation scope](docs/VALIDATION.md) for platform details and the [source guide](docs/SOURCE_BUILD.md) for custom builds.
 
-The release has completed the full deployment workflow on a physical G1, including inference checks, console access, reboot readiness and operator motion acceptance. [Validation scope](docs/VALIDATION.md). Other robot bodies and environments require separate adaptation. For custom builds, use the [source guide](docs/SOURCE_BUILD.md).
-
-> 已在 G1 真机上完成全流程部署验证，包括推理检查、控制台访问、开机就绪和现场运动验收。[验证范围](docs/VALIDATION.md)。其他本体与环境需要单独适配；定制构建见[源码指南](docs/SOURCE_BUILD_zh.md)。
+> [v0.2.0 安装包](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.2.0) 区分 JP5 与 JP6；JP6 文件名含 `-jp6`，引擎在目标 Jetson 上生成。平台详情见[验证范围](docs/VALIDATION.md)，定制构建见[源码指南](docs/SOURCE_BUILD_zh.md)。
 
 <a id="community"></a>
 
 ## 🤝 Community validation / 社区共建
 
-Our current adaptation and real-robot validation cover the mainstream G1 EDU factory configuration listed above: **JetPack 5.1.1 / L4T 35.3.1**. If your G1 EDU runs a different JetPack or L4T version, we welcome your help adapting and validating OnboardMimic on your own robot.
+**JP5 and JP6 are both validated platforms.** We welcome contributions on either platform: testing additional JetPack/L4T versions, improving installation and controls, and adapting more hardware configurations.
 
-Share your hardware/software versions, any required changes, and test results through an [Issue](https://github.com/LambdaHumanoid/OnboardMimic/issues) or [Pull Request](https://github.com/LambdaHumanoid/OnboardMimic/pulls), using the [validation scope](docs/VALIDATION.md) as a reference. After successful real-robot validation and review of the results, we can add your configuration to the **verified configurations list**, recording the exact versions, tested features and contributor credit.
+Share your hardware/software versions, any required changes, and test results through an [Issue](https://github.com/LambdaHumanoid/OnboardMimic/issues) or [Pull Request](https://github.com/LambdaHumanoid/OnboardMimic/pulls). Use the [validation scope](docs/VALIDATION.md) as a reference. Confirmed results can be added to the **verified configurations list**, recording the exact versions, tested features and contributor credit.
 
-> 目前我们仅适配并完成了上述主流 G1 EDU 原厂配置的真机验证：**JetPack 5.1.1 / L4T 35.3.1**。如果你的 G1 EDU 使用其他 JetPack 或 L4T 版本，欢迎在自己的真机上参与适配与验证，一起扩大项目的支持范围。
+> **JP5 和 JP6 均为已验证平台。** 欢迎在任一平台参与共建：测试更多 JetPack/L4T 版本、改进安装与操控体验、适配更多硬件配置。
 >
-> 欢迎通过 [Issue](https://github.com/LambdaHumanoid/OnboardMimic/issues) 或 [Pull Request](https://github.com/LambdaHumanoid/OnboardMimic/pulls) 分享软硬件版本、必要的适配修改和测试结果，并参考现有的[验证范围](docs/VALIDATION.md)。真机验证通过并确认结果后，我们可以将该配置加入**已验证版本列表**，注明具体版本、已验证功能与贡献者。
+> 通过 [Issue](https://github.com/LambdaHumanoid/OnboardMimic/issues) 或 [Pull Request](https://github.com/LambdaHumanoid/OnboardMimic/pulls) 分享软硬件版本、必要的修改和测试结果，并参考[验证范围](docs/VALIDATION.md)。确认结果后，我们可以将该配置加入**已验证版本列表**，注明具体版本、已验证功能与贡献者。
+
+<a id="lab"></a>
+
+## 🧪 OnboardMimic Lab · Recording & replay / 数采与回放
+
+[![OnboardMimic architecture: Lab data workspace, onboard control, WBC and protection bridge / Lab 数据工作台、机载控制、WBC 与保护桥](docs/architecture/architecture.svg)](docs/architecture/architecture.svg)
+
+Lab brings task and episode management, video and robot-data recording, LeRobot v2.1 datasets and motion replay into the OnboardMimic console. It shares OnboardMimic’s repository and version while running as an independent data service. OnboardMimic handles replay timing, live robot feedback, control ownership and protection.
+
+> Lab 在 OnboardMimic 控制台内提供任务与 episode 管理、视频和机器人数据采集、LeRobot v2.1 数据保存及动作回放。Lab 与 OnboardMimic 同仓库、统一版本，数据服务独立运行；OnboardMimic 负责机载回放时序、实时机器人反馈、控制权和保护。
+
+[Lab guide / 使用说明](lab/README.md) · [Recording & replay / 采集与回放流程](lab/docs/pipeline.md) · [LeRobot v2.1 / 数据格式](lab/docs/lerobot-storage.md)
 
 <a id="consoles"></a>
 
@@ -120,18 +145,18 @@ After setup, the console and API are ready at boot. Connect services, prepare po
 > 完成配置后，控制台和后台开机就绪；连接服务、准备姿态和启动控制器均由用户手动操作。配置 LAN 访问后，电脑打开 **`http://ROBOT_IP:8769/`**，手机打开 **`http://ROBOT_IP:8769/remote`**；仅本机访问时在电脑使用 SSH 隧道。
 
 ```bash
-ssh -N -L 8769:127.0.0.1:8769 USER@ROBOT_HOST
+ssh -N -L 8769:127.0.0.1:8769 -L 8773:127.0.0.1:8773 USER@ROBOT_HOST
 ```
 
 Keep the tunnel open and visit **http://127.0.0.1:8769/**. / 保持隧道运行，在电脑浏览器打开上述地址。
 
-Remote walking requests expire when updates stop; the local controller keeps running. Emergency stop terminates the controller. Neither behavior guarantees the robot remains standing. / 遥控断连后行走请求会到期，本机控制器继续运行；急停会终止控制器。这两种机制都不保证机器人保持站立。
+Remote walking requests expire when updates stop; the local controller keeps running. Emergency stop terminates the controller. Provide physical support when stopping the controller. / 遥控断连后行走请求会到期，本机控制器继续运行；急停会终止控制器。停止控制器时请提供可靠支撑。
 
 ## 📚 Documentation / 文档
 
-[Prebuilt packages](docs/PREBUILT.md) · [Source build](docs/SOURCE_BUILD.md) · [Deployment](docs/DEPLOYMENT.md) · [Planner & PICO](docs/CONTROL_EXTENSIONS.md) · [Upgrade](docs/UPGRADE.md) · [Architecture](docs/ARCHITECTURE.md) · [Validation](docs/VALIDATION.md)
+[Prebuilt packages](docs/PREBUILT.md) · [Source build](docs/SOURCE_BUILD.md) · [Deployment](docs/DEPLOYMENT.md) · [Planner & PICO](docs/CONTROL_EXTENSIONS.md) · [Upgrade](docs/UPGRADE.md) · [Incremental deployment](docs/INCREMENTAL_DEPLOYMENT.md) · [Architecture](docs/ARCHITECTURE.md) · [Validation](docs/VALIDATION.md)
 
-[预编译安装](docs/PREBUILT_zh.md) · [源码构建](docs/SOURCE_BUILD_zh.md) · [首次部署](docs/DEPLOYMENT_zh.md) · [Planner 与 PICO](docs/CONTROL_EXTENSIONS_zh.md) · [升级与回退](docs/UPGRADE_zh.md) · [架构说明](docs/ARCHITECTURE_zh.md) · [验证范围](docs/VALIDATION.md)
+[预编译安装](docs/PREBUILT_zh.md) · [源码构建](docs/SOURCE_BUILD_zh.md) · [首次部署](docs/DEPLOYMENT_zh.md) · [Planner 与 PICO](docs/CONTROL_EXTENSIONS_zh.md) · [升级与回退](docs/UPGRADE_zh.md) · [按变更部署](docs/INCREMENTAL_DEPLOYMENT.md) · [架构说明](docs/ARCHITECTURE_zh.md) · [验证范围](docs/VALIDATION.md)
 
 ## 🙏 Acknowledgements / 致谢
 
@@ -169,4 +194,5 @@ Thank you to everyone helping build OnboardMimic! / 感谢每一位参与 Onboar
   <a href="https://github.com/IridescentJiang"><img src="docs/assets/contributors/IridescentJiang.png" width="160" height="104" alt="@IridescentJiang — GitHub profile" /></a>
   <a href="https://github.com/chenyilun95"><img src="docs/assets/contributors/chenyilun95.png" width="160" height="104" alt="@chenyilun95 — GitHub profile" /></a>
   <a href="https://github.com/dadamrx"><img src="docs/assets/contributors/dadamrx.png" width="160" height="104" alt="@dadamrx — GitHub profile" /></a>
+  <a href="https://github.com/longvs123"><img src="docs/assets/contributors/longvs123.png" width="160" height="104" alt="@longvs123 — GitHub profile" /></a>
 </p>

@@ -1,0 +1,8 @@
+{
+  "encoder_model": "/replace/with/active/model_encoder.onnx",
+  "decoder_model": "/replace/with/active/model_decoder.onnx",
+  "observation_config": "/replace/with/OnboardMimic/onboardmimic/backends/sonic/deploy/policy/release/observation_config.yaml",
+  "policy_parameters": "/replace/with/OnboardMimic/onboardmimic/backends/sonic/deploy/src/g1/g1_deploy_onnx_ref/include/policy_parameters.hpp",
+  "scene": "/replace/with/g1/scene_29dof.xml",
+  "initial_height_m": 0.79
+}

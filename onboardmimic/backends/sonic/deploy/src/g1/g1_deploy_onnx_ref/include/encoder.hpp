@@ -1,3 +1,5 @@
+#include <array>
+#include <chrono>
 #include "onboard_cuda_stream.hpp"
 /**
  * @file encoder.hpp
@@ -52,6 +54,8 @@
  */
 class EncoderEngine {
 public:
+  std::string validated_onnx_sha256_, validated_cache_sha256_;
+  std::string LoadedEngineSHA256() const { return inference_engine_ ? inference_engine_->LoadedEngineSHA256() : std::string(); }
   EncoderEngine() = default;
   ~EncoderEngine() { Destroy(); }
 
@@ -81,13 +85,13 @@ public:
       if (use_fp16) { options.precision = Precision::FP16; prefix += "fp16_"; }
 
       std::string cached_trt_file;
-      if (!ConvertONNXToTRT(options, model_path, cached_trt_file, prefix, false)) {
+      if (!ConvertONNXToTRT(options, model_path, cached_trt_file, prefix, false, &validated_onnx_sha256_, &validated_cache_sha256_)) {
         std::cerr << "✗ Failed to convert encoder ONNX to TRT: " << model_path << std::endl;
         inference_engine_.reset();
         return false;
       }
 
-      if (!inference_engine_->Initialize(cached_trt_file, options.deviceID, options.dynamic_axes_names)) {
+      if (!inference_engine_->Initialize(cached_trt_file, options.deviceID, options.dynamic_axes_names, validated_cache_sha256_)) {
         std::cerr << "✗ Failed to initialize encoder TensorRT model: " << cached_trt_file << std::endl;
         inference_engine_.reset();
         return false;
@@ -233,15 +237,19 @@ public:
    * @param stream CUDA stream for inference (uses internal stream if nullptr)
    * @return true if inference successful, false otherwise
    */
-  bool Encode(cudaStream_t stream = nullptr) {
+  bool Encode(cudaStream_t stream = nullptr, std::array<uint64_t,5>* timing = nullptr) {
+    if (timing) timing->fill(0);
     if (!initialized_) { std::cerr << "✗ EncoderEngine::Encode - Not initialized" << std::endl; return false; }
     if (!inference_engine_) { std::cerr << "✗ EncoderEngine::Encode - TensorRT engine not initialized" << std::endl; return false; }
 
     cudaStream_t encode_stream = (stream != nullptr) ? stream : cuda_stream_;
 
+    const auto started = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Transfer input data from CPU to GPU
-    inference_engine_->SetInputData(input_tensor_name_, encoder_input_buffer_);
+    // Keep pinned input, inference and output on the same explicit stream.
+    inference_engine_->SetInputDataAsync(input_tensor_name_, encoder_input_buffer_, encode_stream);
 
+    const auto input_done = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (graph_captured_ && cuda_graph_exec_ != nullptr) {
       cudaError_t status = cudaGraphLaunch(cuda_graph_exec_, encode_stream);
       if (status != cudaSuccess) {
@@ -256,8 +264,19 @@ public:
     }
     
     // Automatically populate internal token buffer after inference (GPU to CPU)
+    const auto launched = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     inference_engine_->GetOutputDataAsync(output_tensor_name_, token_buffer_, encode_stream);
-    cudaStreamSynchronize(encode_stream);
+    const auto copied = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto synchronized = cudaStreamSynchronize(encode_stream);
+    if (timing) {
+      const auto ended = std::chrono::steady_clock::now();
+      (*timing)[0]=std::chrono::duration_cast<std::chrono::nanoseconds>(copied-started).count();
+      (*timing)[1]=std::chrono::duration_cast<std::chrono::nanoseconds>(ended-copied).count();
+      (*timing)[2]=std::chrono::duration_cast<std::chrono::nanoseconds>(input_done-started).count();
+      (*timing)[3]=std::chrono::duration_cast<std::chrono::nanoseconds>(launched-input_done).count();
+      (*timing)[4]=std::chrono::duration_cast<std::chrono::nanoseconds>(copied-launched).count();
+    }
+    if (synchronized != cudaSuccess) return false;
     
     return true;
   }
@@ -286,7 +305,7 @@ public:
     cudaStreamEndCapture(cuda_stream_, &cuda_graph_);
     cudaStreamSynchronize(cuda_stream_);
     
-    cudaGraphInstantiate(&cuda_graph_exec_, cuda_graph_, NULL, NULL, 0);
+    cudaGraphInstantiateWithFlags(&cuda_graph_exec_, cuda_graph_, 0);
     
     graph_captured_ = true;
     std::cout << "✓ Encoder CUDA graph captured successfully!" << std::endl;

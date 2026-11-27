@@ -101,34 +101,56 @@ class PoseModeTest(NativeTest):
     def pose_ready(self):
         from unittest.mock import Mock
         self.activate();self.now+=.6;self.refresh();self.g.tick()
-        self.g.pose_reader=Mock();self.g.pose_reader.snapshot.return_value={'ready':True,'packet':b'pose'}
+        self.g.pose_reader=Mock();self.g.pose_reader.snapshot.return_value={'pose_admission_ready':True,'ready':True,'packet':b'pose'}
         self.g.ingest('g1_debug',{'encoder_mode':0,'play':True})
+    def test_inconsistent_pose_never_enters_mode(self):
+        self.pose_ready()
+        self.g.pose_reader.snapshot.return_value.update(pose_admission_ready=False,consistency={'reason':'tracking mismatch'})
+        with self.assertRaisesRegex(ValueError,'tracking mismatch'):self.command('select_pose')
+        self.assertEqual(self.g.input_mode,'planner');self.assertFalse(self.g.mode_pending)
+        self.assertEqual(self.proc.kills,0)
+    def test_missing_admission_never_enters_mode(self):
+        self.pose_ready();self.g.pose_reader.snapshot.return_value.pop('pose_admission_ready')
+        with self.assertRaises(ValueError):self.command('select_pose')
+        self.assertEqual(self.g.input_mode,'planner')
     def test_switch_keeps_process_and_requires_policy_ack(self):
         self.pose_ready();pid=self.g.process.pid
         self.command('select_pose');self.assertTrue(self.g.mode_pending)
         self.assertEqual(self.g.input_mode,'pose');self.assertEqual(self.g.process.pid,pid)
-        self.now+=.12;self.refresh();self.g.ingest('g1_debug',{'encoder_mode':2,'play':True});self.g.tick()
+        self.now+=.12;self.refresh();self.g.ingest('g1_debug',{'encoder_mode':2,'play':True,'pose_entry_progress':1.0});self.g.tick()
         self.assertFalse(self.g.mode_pending);self.assertIsNone(self.g.last_packet)
         with self.assertRaises(ValueError):self.g.request('/api/control',self.packet(move='forward'))
         self.command('select_planner');self.now+=.12;self.refresh()
         self.g.ingest('g1_debug',{'encoder_mode':0,'play':True});self.g.tick()
         self.assertFalse(self.g.mode_pending);self.assertEqual(self.g.last_packet['speed'],0)
         self.assertEqual(self.launches,1);self.assertEqual(self.proc.kills,0)
+    def test_pose_transition_waits_for_native_completion(self):
+        self.pose_ready();self.command('select_pose')
+        self.g.pose_reader.freeze_reference.assert_called_once()
+        self.now+=.5;self.refresh();self.g.ingest('g1_debug',{'encoder_mode':2,'play':True,'pose_entry_progress':.25});self.g.tick()
+        self.assertTrue(self.g.mode_pending);self.g.pose_reader.release_reference.assert_not_called()
+        self.now+=1.6;self.refresh();self.g.ingest('g1_debug',{'encoder_mode':2,'play':True,'pose_entry_progress':1.});self.g.tick()
+        self.assertFalse(self.g.mode_pending);self.g.pose_reader.release_reference.assert_called_once()
+    def test_missing_transition_ack_times_out_even_with_fresh_pose_feedback(self):
+        self.pose_ready();self.command('select_pose');self.now+=5.1;self.refresh()
+        self.g.ingest('g1_debug',{'encoder_mode':2,'play':True});self.g.tick()
+        self.assertEqual(self.g.input_mode,'planner')
+        self.g.pose_reader.release_reference.assert_called_once()
     def test_pico_loss_returns_planner_and_never_auto_resumes(self):
         self.pose_ready();self.command('select_pose');self.g.pose_reader.snapshot.return_value={'ready':False}
         self.g.tick();self.assertEqual(self.g.input_mode,'planner');self.assertTrue(self.g.mode_pending)
-        self.g.pose_reader.snapshot.return_value={'ready':True};self.g.tick();self.assertEqual(self.g.input_mode,'planner')
+        self.g.pose_reader.snapshot.return_value={'pose_admission_ready':True,'ready':True};self.g.tick();self.assertEqual(self.g.input_mode,'planner')
     def test_stop_in_pose_requests_planner(self):
         self.pose_ready();self.command('select_pose');self.g.request('/api/control',self.packet(stop=True))
         self.assertEqual(self.g.input_mode,'planner');self.assertEqual(self.proc.kills,0)
     def test_no_pico_or_moving_refuses_switch(self):
         self.pose_ready();self.g.pose_reader.snapshot.return_value={'ready':False}
         with self.assertRaises(ValueError):self.command('select_pose')
-        self.g.pose_reader.snapshot.return_value={'ready':True};self.g.request('/api/control',self.packet(move='forward'))
+        self.g.pose_reader.snapshot.return_value={'pose_admission_ready':True,'ready':True};self.g.request('/api/control',self.packet(move='forward'))
         with self.assertRaises(ValueError):self.command('select_pose')
     def test_ack_timeout_falls_back_and_invalidates_queued_move(self):
         self.pose_ready();old=self.packet(move='forward');self.command('select_pose')
-        self.now+=2.01;self.refresh();self.g.tick();self.assertEqual(self.g.input_mode,'planner')
+        self.now+=5.01;self.refresh();self.g.tick();self.assertEqual(self.g.input_mode,'planner')
         with self.assertRaises(ValueError):self.g.request('/api/control',old)
 
 if __name__=='__main__': unittest.main()

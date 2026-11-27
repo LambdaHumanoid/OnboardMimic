@@ -101,6 +101,22 @@ class S0Backend(ABC):
     def pose_reader(self, input_id, path):
         raise ValueError('Backend does not support input: '+input_id)
 
+    def protection_output(self, topic, value, session, received_at):
+        """Optional OutputEvidence from validated, newly accepted WBC commands.
+
+        Adapter must bind evidence to this run, reject replays and preserve
+        trustworthy receipt time. Ordinary mode/debug messages are insufficient.
+        None explicitly means command-stall monitoring is unavailable.
+        """
+        return None
+
+    def validate_runtime_assets(self):
+        """Optional read-only asset admission before launching a controller."""
+
+    def checked_launch_spec(self, spec):
+        """Optional child-side preflight wrapper; never block the runtime lock."""
+        return spec
+
 
 class TrackingInput(ABC):
     id: str

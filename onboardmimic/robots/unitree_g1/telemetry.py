@@ -28,3 +28,22 @@ def feedback(latest, target, now):
 def safe(t):
     return bool(t.get('fresh') and t.get('valid') and not t.get('faults')
                 and t.get('max_speed_rad_s', 99) <= 12.5)
+
+
+def joint_health(latest, now):
+    """Read-only display. Per-joint warning limits are not yet verified."""
+    at, body = latest.get('rt/lowstate', (None, {}))
+    fresh = at is not None and 0 <= now-at <= .5
+    motors = body.get('motor_state', []) if fresh else []
+    rows = []
+    for i in range(29):
+        m = motors[i] if i < len(motors) and isinstance(motors[i], dict) else {}
+        raw = m.get('temperature', [])
+        if not isinstance(raw, (list, tuple)): raw = [raw]
+        values = [v if type(v) in (int, float) and math.isfinite(v) else None for v in raw]
+        valid = [v for v in values if v is not None]
+        temperature = max(valid) if valid else None
+        rows.append(dict(index=i, temperature_c=temperature,
+                         temperatures_c=values, fault=m.get('motorstate'),
+                         hot=None))
+    return dict(fresh=fresh, warning_c=None, joints=rows)

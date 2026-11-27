@@ -1,0 +1,25 @@
+OnboardMimic Lab is bundled with OnboardMimic and shares its release version.
+Source components retain their original licenses and attribution.
+
+The Lab collection panel assets in src/onboardmimic_lab/static/ are adapted from
+the OnboardMimic v0.1.2 development collection panel (Apache-2.0). The motion
+console and controller assets are supplied by the containing OM installation.
+The Apache-2.0 license text is included in third_party/openlambda/LICENSE.
+
+Selected OpenLambda source files are retained under third_party/openlambda/,
+with upstream LICENSE and NOTICE files. See upstreams.json for pinned commits.
+Upstream names are preserved for provenance and are not a claim of authorship.
+
+src/onboardmimic_lab/video_timing.py is copied from OpenLambda's
+data_collection/robot/src/lambda_robot_data/timing.py (Apache-2.0).
+The original license and notices remain in third_party/openlambda/.
+
+src/onboardmimic_lab/lerobot_dataset.py adapts the Parquet/MP4 export design,
+field naming, image crop/encoding settings and metadata layout from OpenLambda
+data_collection/robot/src/lambda_robot_data/export.py (Apache-2.0).
+OM changes: body-only profile, native consumed-token inputs, causal camera
+alignment, verified publication/cleanup, and integrated replay compatibility.
+
+lerobot_storage.py implements the documented LeRobot v2.1 layout and metadata
+contracts, verified against Hugging Face LeRobot v0.3.3 (Apache-2.0), referencing
+OpenLambda data_collection/human/src/storage/lerobot.py layout conventions.

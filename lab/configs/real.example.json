@@ -1,0 +1,4 @@
+{
+  "gateway": "http://127.0.0.1:18921",
+  "token_file": "/replace/with/private/onboardmimic/http.token"
+}

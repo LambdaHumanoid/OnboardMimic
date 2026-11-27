@@ -1,0 +1,12 @@
+OpenLambda real-robot collection
+
+This module provides source decoding, a checksummed record format, an MPEG-TS
+timestamp parser, physical schema validation, offline nearest-source alignment,
+a read-only ROS hand observer, and timestamped Parquet/MP4 export behind a
+standalone CLI.
+
+See the repository root LICENSE for Apache-2.0 terms. Upstream SONIC code,
+hardware SDKs and model assets retain their respective licenses. No SONIC
+weights, proprietary device SDK or collected demonstrations are included in
+this module.
+

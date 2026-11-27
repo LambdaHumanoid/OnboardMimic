@@ -1,0 +1,88 @@
+{
+  "capture_adapter": "reference-v1",
+  "root": "./data-software-joint",
+  "same_host": true,
+  "telemetry_endpoint": "tcp://127.0.0.1:16688",
+  "camera_port": 18554,
+  "max_duration_s": 120,
+  "controller_spec": {
+    "schema": "onboardmimic.lab.controller-spec",
+    "schema_version": 1,
+    "robot_id": "software_joint_fixture",
+    "backend_id": "software_joint",
+    "execution_id": "software_joint.v1",
+    "reference_space": "software_joint.position.v1",
+    "clock": "same_host_monotonic_ns",
+    "period_ns": 20000000,
+    "max_gap_ns": 60000000,
+    "artifacts": {
+      "execution/software.py": "dd109c7db294e15a8602676c0f4a83da99c345448036add26d0dc5197b380bcb",
+      "execution/__init__.py": "2e1de6d6273ced58f2bdb4866a59a1459d9c25a5b7a65da8b3aaecfd5f695c54",
+      "execution/server.py": "c9e8e0877d271cd14fa01add7c95d1d53a38f21670d08378c369bcfa6736409b",
+      "gateway.py": "e729456494e9a1fcab1c70d9e314b5ff31eabda2e5e91238f752a6bae6906571",
+      "protection/fence.py": "7453516cf9d2e150e13ccd09ff64c7f4439a84cb7ee76ab773c298aa1c7dc039",
+      "protection/monitor.py": "ebe6e2959b54b0174fc7d96362b78c98a492cc8240ad83f0ea1dfe2fa0c79bcf",
+      "protection/contracts.py": "83118e1c5260cfcbc0ecdf8e08054ee7b19f2e5d1cd2a2eaf9ea1b9a2591d7c2",
+      "loaded_config": "e1991dda2775690d3a40e7f7e2053b6228c3e0e4a62316a4ef08927789aaa326"
+    },
+    "state": {
+      "q": {
+        "shape": [
+          1,
+          3
+        ],
+        "unit": "rad",
+        "frame": "joint_local",
+        "semantic": "joint_position_history",
+        "joint_names": [
+          "joint_0",
+          "joint_1",
+          "joint_2"
+        ]
+      }
+    },
+    "reference": {
+      "q_target": {
+        "shape": [
+          3
+        ],
+        "unit": "rad",
+        "frame": "joint_local",
+        "semantic": "joint_position_target",
+        "joint_names": [
+          "joint_0",
+          "joint_1",
+          "joint_2"
+        ]
+      }
+    },
+    "control_output": {
+      "q_target": {
+        "shape": [
+          3
+        ],
+        "unit": "rad",
+        "frame": "joint_local",
+        "semantic": "joint_position_target",
+        "joint_names": [
+          "joint_0",
+          "joint_1",
+          "joint_2"
+        ]
+      }
+    },
+    "history": {
+      "length": 1,
+      "period_ns": 20000000,
+      "order": "oldest_first",
+      "reset": "required",
+      "layout": "state.q[0] is the actual software plant input at this tick"
+    },
+    "record_modes": [
+      "teleoperation",
+      "model",
+      "replay"
+    ],
+    "hardware": false
+  }
+}

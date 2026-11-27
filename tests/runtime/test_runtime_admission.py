@@ -32,6 +32,22 @@ class AdmissionTests(unittest.TestCase):
     def service(self,name,user=False):
         if name=='onboardmimic-bridge.service':return dict(LoadState='loaded',ActiveState='active',MainPID='456')
         return dict(LoadState='loaded',ActiveState='inactive')
+    def test_streamed_ports_preserve_loopback_and_duplicate_checks(self):
+        import io
+        from pathlib import Path
+        def net(path,*args,**kwargs):
+            udp=str(path).endswith('/udp')
+            ports=[16663] if udp else [16660,16661]
+            rows=['header\n']+[f'0: {address}:{port:04X} 00000000:0000 0A\n' for port in ports]
+            if duplicate:rows.append(rows[-1])
+            return io.StringIO(''.join(rows))
+        with patch('onboardmimic.robots.unitree_g1.guard.service',side_effect=self.service),patch('onboardmimic.robots.unitree_g1.guard.processes',return_value=([],[])),patch.object(Path,'open',net):
+            address='0100007F';duplicate=False;physical_guard()
+            address='00000000'
+            with self.assertRaises(RuntimeError):physical_guard()
+            address='0100007F';duplicate=True
+            with self.assertRaises(RuntimeError):physical_guard()
+
     def test_same_inventory_refused_at_start_but_active_controller_survives(self):
         for running,errors in [([dict(pid=999,argv=['/bin/sonic_command_bridge','--token','SECRET'])],[]),
                                ([],[dict(pid=999,error='[Errno 3] No such process')])]:

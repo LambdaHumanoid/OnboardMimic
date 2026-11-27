@@ -1,0 +1,28 @@
+{
+  "backward_roll": true,
+  "takeover_delay_s": 0.05,
+  "failure_mode": "zero_torque",
+  "initial_vx_m_s": 0.1,
+  "times": [
+    0,
+    1.0,
+    1.7,
+    2.2
+  ],
+  "duration": 7,
+  "hip1": -1.15,
+  "knee1": 2.3,
+  "ankle1": -0.75,
+  "waist1": 0.2,
+  "hip2": -1.4,
+  "knee2": 2.7,
+  "ankle2": 0.3,
+  "waist2": 0.2,
+  "hip3": -2.2,
+  "knee3": 2.75,
+  "ankle3": 0.3,
+  "waist3": 0.0,
+  "balance_until": 1.0,
+  "blend_s": 0.05,
+  "target_rate_rad_s": 5.0
+}

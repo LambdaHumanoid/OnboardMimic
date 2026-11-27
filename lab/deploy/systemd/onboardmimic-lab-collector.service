@@ -1,0 +1,14 @@
+[Unit]
+Description=OnboardMimic Lab independent collector
+[Service]
+Type=simple
+WorkingDirectory=%h/OnboardMimic
+Environment=PYTHONPATH=%h/OnboardMimic/lab/src
+ExecStart=%h/OnboardMimic/.venv/bin/python -m onboardmimic_lab.collector_service --config %h/OnboardMimic/lab/configs/collection.local.json
+KillMode=control-group
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=140
+UMask=0077
+[Install]
+WantedBy=default.target

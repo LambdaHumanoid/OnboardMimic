@@ -2,9 +2,9 @@
 
 [English](PREBUILT.md) · 简体中文
 
-预编译版本面向 **G1 29-DOF 身体 / Jetson Orin NX 16GB / Ubuntu 20.04 / L4T 35.3.1 / CUDA 11.4 / TensorRT 8.5.2**，不支持手部执行器。其他 GPU、8GB Orin NX、JetPack 6 或 TensorRT 10 尚未验证，需要源码适配、构建与目标设备验证。
+预编译版本面向 **G1 29-DOF 身体 / Jetson Orin NX 16GB / Ubuntu 20.04 / L4T 35.3.1 / CUDA 11.4 / TensorRT 8.5.2**。JP6 / TensorRT 10 请使用 [JP6 运行包](JETPACK6.md)；其他硬件参见[源码适配指南](SOURCE_BUILD_zh.md)。
 
-上述配置仍是真机验证基线。v0.1.1 安装器也允许 **L4T35.x、CUDA11.4 及之后的 11.x、定制载板名称**，保留 Ubuntu20.04、ARM64 Orin 和 16GB 级别内存要求。随包引擎仍要求 TensorRT8.5.2。相近配置继续进行动态库加载与模型数值验证，通过版本检查不等于所有设备都已验收。
+上述配置仍是真机验证基线。安装器也允许 **L4T35.x、CUDA11.4 及之后的 11.x、定制载板名称**，保留 Ubuntu20.04、ARM64 Orin 和 16GB 级别内存要求。随包引擎仍要求 TensorRT8.5.2。安装时在各设备上执行动态库加载与模型数值检查。
 
 ## 安装前准备
 
@@ -14,11 +14,11 @@
 
 ## 下载与解压
 
-下载完整的 [OnboardMimic v0.1.1 安装包](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1)。运行包、模型包和引擎包共同组成一次安装，需要一起解压。
+下载完整的 [OnboardMimic v0.2.0 安装包](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.2.0)。运行包、模型包和引擎包共同组成一次安装，需要一起解压。
 
-- `OnboardMimic-v0.1.1-runtime.tar.gz`：源码、操作脚本、ARM64 控制程序、ONNX Runtime / CycloneDDS 运行库与许可证。
-- `OnboardMimic-v0.1.1-models.tar.gz`：三个原始 ONNX、TensorRT 8.5 兼容 planner ONNX。
-- `OnboardMimic-v0.1.1-engines.tar.gz`：三个 FP32 TensorRT 引擎。
+- `OnboardMimic-v0.2.0-runtime.tar.gz`：源码、操作脚本、ARM64 控制程序、ONNX Runtime / CycloneDDS 运行库与许可证。
+- `OnboardMimic-v0.2.0-models.tar.gz`：三个原始 ONNX、TensorRT 8.5 兼容 planner ONNX。
+- `OnboardMimic-v0.2.0-engines.tar.gz`：三个 FP32 TensorRT 引擎。
 - `prebuilt_manifest.json`：环境要求、来源、逐文件 SHA-256。
 - `SHA256SUMS`：下载文件校验值。
 
@@ -29,16 +29,16 @@
 ```bash
 mkdir onboardmimic-download
 cd onboardmimic-download
-gh release download v0.1.1 --repo LambdaHumanoid/OnboardMimic --pattern 'OnboardMimic-v0.1.1-*.tar.gz' --pattern prebuilt_manifest.json --pattern SHA256SUMS
-sha256sum -c SHA256SUMS
+gh release download v0.2.0 --repo LambdaHumanoid/OnboardMimic --pattern OnboardMimic-v0.2.0-runtime.tar.gz --pattern OnboardMimic-v0.2.0-models.tar.gz --pattern OnboardMimic-v0.2.0-engines.tar.gz --pattern prebuilt_manifest.json --pattern SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
 ```
 
 在一个新目录中解压三个包，它们共同组成 `OnboardMimic/`。不要覆盖已有运行中的部署：
 
 ```bash
-tar -xzf OnboardMimic-v0.1.1-runtime.tar.gz
-tar -xzf OnboardMimic-v0.1.1-models.tar.gz
-tar -xzf OnboardMimic-v0.1.1-engines.tar.gz
+tar -xzf OnboardMimic-v0.2.0-runtime.tar.gz
+tar -xzf OnboardMimic-v0.2.0-models.tar.gz
+tar -xzf OnboardMimic-v0.2.0-engines.tar.gz
 cd OnboardMimic
 python3 scripts/setup.py
 ```
@@ -89,7 +89,7 @@ python3 scripts/setup.py
 
 ARM64 程序从当前原生源码重新交叉编译，使用 GCC 10.5 和 JP5 / L4T 35.3.1 的头文件与系统库。打包时再修改 ELF 库搜索路径。源码哈希、编译信息和原始二进制哈希记录在 `native_build_report.json`，打包后哈希记录在 `prebuilt_manifest.json`。
 
-模型和引擎身份根据发布清单核验。打包不代表通过目标机推理或真实运动验收，详见[验证范围](VALIDATION.md)；安装时会重新执行无电机输出的推理检查。
+模型和引擎身份根据发布清单核验。安装时执行无电机输出的推理检查，现场调试按[目标机验收流程](VALIDATION.md)进行。
 
 运行库、模型与源码的许可证随包提供。CUDA、TensorRT、ROS2、宇树机器人消息包和 Python SDK 仍使用目标机器现有环境，不随包重分发系统镜像。
 
@@ -108,3 +108,5 @@ ARM64 程序从当前原生源码重新交叉编译，使用 GCC 10.5 和 JP5 / 
 ```
 
 添加 `--check` 可只检查缺失组件；源码编译用户添加 `--development` 补齐头文件与 `trtexec`。该工具只补齐 TensorRT，不刷机、不切换 JetPack、不启动运动控制。CUDA 本身缺失时仍需安装当前 JetPack 对应的 CUDA 组件。
+
+安装向导默认同时安装 OM 与 Lab，自动配置独立环境、数采、回放及网页嵌入。新安装仅需 OM 时加 `--no-lab`。多网卡机器用 `--origin http://ROBOT_IP:8769` 指定访问地址；SSH 模式同时转发 8769 和 8773。详见 [Lab 安装](../lab/README.md#v020-部署配置准备)。

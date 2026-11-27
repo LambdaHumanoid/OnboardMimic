@@ -1,17 +1,19 @@
 """Systemd connection presentation, independent of robot protocols."""
 import json
+from pathlib import Path
 
 class ServiceConnection:
-    def __init__(self, connect_unit, bridge_unit, status_path):
+    def __init__(self, connect_unit, bridge_unit, status_path, relative_status=None):
         self.connect_unit, self.bridge_unit = connect_unit, bridge_unit
         self.connect_status = status_path
+        self.relative_status = relative_status
 
     def systemctl(self, runner, *args):
         return runner(['systemctl','--user',*args],capture_output=True,text=True,timeout=4)
 
     def status(self, base, runner):
         s = dict(base)
-        result = self.systemctl(runner, 'show', self.connect_unit, '--property=ActiveState,Result', '--no-pager')
+        result = self.systemctl(runner, 'show', self.connect_unit, '--property=ActiveState,Result,WorkingDirectory', '--no-pager')
         props = dict(line.split('=',1) for line in result.stdout.splitlines() if '=' in line)
         setup = props.get('ActiveState','unknown')
         bridge = self.systemctl(runner, 'show', self.bridge_unit, '--property=ActiveState,MainPID', '--no-pager')
@@ -23,7 +25,12 @@ class ServiceConnection:
         s['setup_available'] = s.get('state') in ('stopped','error') and not s.get('pids') and setup != 'activating'
         s['setup_error'], s['setup_message'] = '', ''
         try:
-            progress = json.loads(self.connect_status.read_text())
+            # The producer may still use an earlier, code-equivalent release.
+            # Read its live record, never copy a ready flag into the web release.
+            directory = props.get('WorkingDirectory')
+            status_path = (Path(directory)/self.relative_status
+                           if self.relative_status and directory else self.connect_status)
+            progress = json.loads(status_path.read_text())
             if not isinstance(progress, dict): progress = {}
         except (OSError, ValueError):
             progress = {}

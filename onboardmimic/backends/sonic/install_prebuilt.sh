@@ -30,7 +30,8 @@ export LD_LIBRARY_PATH="$root/onboardmimic/backends/sonic/deploy/target/lib:/usr
 test_mode=--core
 if [[ "$with_pico" == 1 ]]; then
  .venv/bin/python -m pip install -r onboardmimic/backends/sonic/pico/requirements.txt
- test_mode=--all
+ # Lab has its own environment and capture dependencies.
+ test_mode=--controller
 fi
 PYTHON=.venv/bin/python bash scripts/test.sh "$test_mode"
 cd onboardmimic/backends/sonic/deploy/onboard

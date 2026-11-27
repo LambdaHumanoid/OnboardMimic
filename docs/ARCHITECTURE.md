@@ -39,9 +39,25 @@ selection. Installations use `onboardmimic*` services. The console rejects a run
 with a different pair; emergency stop remains available.
 
 The setup entrypoint dispatches to `backend.installer(robot)`. Today, the install
-recipe supports G1/SONIC on the specified Orin NX/JP5 platform only. Installing an
+recipe supports G1/SONIC on the documented Orin NX configurations: JP5 packages
+and the separate [JP6 source installation](JETPACK6.md). Installing an
 adapter is not permission to start it. Boot runs the idle API/UI; connection,
 posture preparation and policy start remain separate manual actions.
+
+## Lab and execution ownership
+
+`lab/` shares the repository and root VERSION, but installs and runs independently.
+Its console and Collector use HTTP/telemetry contracts without importing OM internals.
+OM embeds the Lab UI with language sync, readiness confirmation and a retry placeholder.
+
+Lab records actual token/state evidence with video, exports LeRobot v2.1 and prepares
+reference-plan v2. OM owns replay timing, live feedback/history, exclusive control
+and protected output. Recording, processing and replay do not require browser renewal;
+Planner movement and Pose tracking retain their input freshness checks.
+Normal replay completion or user stop returns to Planner; execution faults use the
+protected exit. A new WBC must explicitly integrate the protected writer and owned
+process lifecycle. See [Lab](../lab/README.md), [replay](SONIC_REFERENCE_REPLAY.md)
+and [protection](WBC_PROTECTION.rst).
 
 ## Console robot / WBC selection
 
@@ -94,7 +110,7 @@ and `running_admission_recovered` on recovery in `var/logs/runtime-events.log`.
 Process diagnostics include bounded PID/program/error details, never full command
 arguments. The shared bridge lock still refuses later owners; transport watchdogs,
 measured-feedback limits and emergency stop remain active. This inventory check is
-not a guarantee of isolation from external DDS writers.
+scoped to local processes; configure external DDS access in the deployment network.
 
 ## S0 backend contract
 
@@ -180,5 +196,5 @@ python3 onboardmimic/robots/unitree_g1/native_bridge/differential_test.py \
   --binary /tmp/onboardmimic-bridge-test/core_test
 ```
 
-These checks do not replace installation, inference, boot and physical acceptance
-on the target robot. See [validation scope](VALIDATION.md) for the released G1 profile.
+After software checks, follow the target installation, inference, boot and motion
+workflow in [validation scope](VALIDATION.md) for the released G1 profile.

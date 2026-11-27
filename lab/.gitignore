@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv*/
+data/
+build/
+dist/
+artifacts/
+*.engine
+*.onnx
+configs/*.local.json
+core
+core.*
+
+configs/*.local/

@@ -25,6 +25,7 @@
 #define POLICY_ENGINE_HPP
 
 #include <memory>
+#include <chrono>
 #include <string>
 #include <array>
 #include <vector>
@@ -45,6 +46,8 @@
  */
 class PolicyEngine {
 public:
+  std::string validated_onnx_sha256_, validated_cache_sha256_;
+  std::string LoadedEngineSHA256() const { return inference_engine_ ? inference_engine_->LoadedEngineSHA256() : std::string(); }
   PolicyEngine() = default;
   ~PolicyEngine() { Destroy(); }
 
@@ -78,13 +81,13 @@ public:
       }
 
       std::string cached_trt_file;
-      if (!ConvertONNXToTRT(options, model_path, cached_trt_file, prefix, false)) {
+      if (!ConvertONNXToTRT(options, model_path, cached_trt_file, prefix, false, &validated_onnx_sha256_, &validated_cache_sha256_)) {
         std::cerr << "✗ Failed to convert policy ONNX to TRT: " << model_path << std::endl;
         inference_engine_.reset();
         return false;
       }
 
-      if (!inference_engine_->Initialize(cached_trt_file, options.deviceID, options.dynamic_axes_names)) {
+      if (!inference_engine_->Initialize(cached_trt_file, options.deviceID, options.dynamic_axes_names, validated_cache_sha256_)) {
         std::cerr << "✗ Failed to initialize policy TensorRT model: " << cached_trt_file << std::endl;
         inference_engine_.reset();
         return false;
@@ -237,7 +240,7 @@ public:
    * @param stream CUDA stream for inference (uses internal stream if nullptr)
    * @return true if inference successful, false otherwise
    */
-  bool Infer(cudaStream_t stream = nullptr) {
+  bool Infer(cudaStream_t stream = nullptr, std::array<uint64_t,5>* timing = nullptr) {
     if (!initialized_) { 
       std::cerr << "✗ PolicyEngine::Infer - Not initialized" << std::endl; 
       return false; 
@@ -249,9 +252,12 @@ public:
 
     cudaStream_t infer_stream = (stream != nullptr) ? stream : cuda_stream_;
 
+    const auto timing_start = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Transfer input data from CPU to GPU
-    inference_engine_->SetInputData(input_tensor_name_, policy_input_buffer_);
+    // Keep pinned input, inference and output on the same explicit stream.
+    inference_engine_->SetInputDataAsync(input_tensor_name_, policy_input_buffer_, infer_stream);
 
+    const auto timing_input = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (graph_captured_ && cuda_graph_exec_ != nullptr) {
       cudaError_t status = cudaGraphLaunch(cuda_graph_exec_, infer_stream);
       if (status != cudaSuccess) {
@@ -265,9 +271,18 @@ public:
       }
     }
     
+    const auto timing_launch = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Automatically populate internal action buffer after inference (GPU to CPU)
     inference_engine_->GetOutputDataAsync(output_tensor_name_, action_buffer_, infer_stream);
-    cudaStreamSynchronize(infer_stream);
+    const auto timing_enqueued = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (cudaStreamSynchronize(infer_stream) != cudaSuccess) return false;
+    if(timing){
+      (*timing)[2]=std::chrono::duration_cast<std::chrono::nanoseconds>(timing_input-timing_start).count();
+      (*timing)[3]=std::chrono::duration_cast<std::chrono::nanoseconds>(timing_launch-timing_input).count();
+      (*timing)[4]=std::chrono::duration_cast<std::chrono::nanoseconds>(timing_enqueued-timing_launch).count();
+      (*timing)[0]=std::chrono::duration_cast<std::chrono::nanoseconds>(timing_enqueued-timing_start).count();
+      (*timing)[1]=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-timing_enqueued).count();
+    }
     
     return true;
   }
@@ -296,7 +311,7 @@ public:
     cudaStreamEndCapture(cuda_stream_, &cuda_graph_);
     cudaStreamSynchronize(cuda_stream_);
     
-    cudaGraphInstantiate(&cuda_graph_exec_, cuda_graph_, NULL, NULL, 0);
+    cudaGraphInstantiateWithFlags(&cuda_graph_exec_, cuda_graph_, 0);
     
     graph_captured_ = true;
     std::cout << "✓ Control policy CUDA graph captured successfully!" << std::endl;

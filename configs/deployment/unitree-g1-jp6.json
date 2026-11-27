@@ -1,0 +1,64 @@
+{
+  "compiler": "/usr/bin/g++-10",
+  "jobs": 2,
+  "dependency_dirs": [
+    "onboardmimic/backends/sonic/deploy/thirdparty",
+    "onboardmimic/backends/sonic/deploy/onboard/deps"
+  ],
+  "system_files": [
+    "/usr/include/zmq.h",
+    "/usr/include/nlohmann/json.hpp"
+  ],
+  "components": {
+    "sonic": {
+      "source": "onboardmimic/backends/sonic/deploy",
+      "configure": [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_EXAMPLES=OFF",
+        "-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST={source}/onboardmimic/backends/sonic/deploy/onboard/deps/googletest-cached",
+        "-DCMAKE_CXX_FLAGS=-I{source}/onboardmimic/backends/sonic/deploy/onboard/deps/cppzmq",
+        "-Donnxruntime_INCLUDE_DIR={source}/onboardmimic/backends/sonic/deploy/onboard/deps/onnxruntime-linux-aarch64-1.16.3/include",
+        "-Donnxruntime_LIBRARY={source}/onboardmimic/backends/sonic/deploy/onboard/deps/onnxruntime-linux-aarch64-1.16.3/lib/libonnxruntime.so"
+      ],
+      "targets": [
+        "g1_deploy_onnx_ref"
+      ],
+      "tests": [],
+      "binaries": {
+        "onboardmimic/backends/sonic/deploy/target/release/g1_deploy_onnx_ref": "{source}/onboardmimic/backends/sonic/deploy/target/release/g1_deploy_onnx_ref"
+      }
+    },
+    "bridge": {
+      "source": "onboardmimic/robots/unitree_g1/native_bridge",
+      "configure": [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_ROS_BRIDGE=ON",
+        "-DCMAKE_CXX_FLAGS=-I{source}/onboardmimic/backends/sonic/deploy/onboard/deps/cppzmq"
+      ],
+      "targets": [
+        "sonic_command_bridge",
+        "sonic_state_reader",
+        "protection_voice_probe",
+        "core_test",
+        "authority_test",
+        "controlled_stop_test",
+        "protection_roll_test",
+        "protection_control_test",
+        "joint_fault_test",
+        "native_consumption_test",
+        "reference_replay_test"
+      ],
+      "tests": [
+        [
+          "ctest",
+          "--output-on-failure"
+        ]
+      ],
+      "binaries": {
+        "onboardmimic/robots/unitree_g1/native_bridge/build/sonic_command_bridge": "{build}/sonic_command_bridge",
+        "onboardmimic/robots/unitree_g1/native_bridge/build/sonic_state_reader": "{build}/sonic_state_reader",
+        "onboardmimic/robots/unitree_g1/native_bridge/build/protection_voice_probe": "{build}/protection_voice_probe"
+      }
+    }
+  }
+}

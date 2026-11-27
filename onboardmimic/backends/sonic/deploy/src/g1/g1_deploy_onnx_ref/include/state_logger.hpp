@@ -82,6 +82,7 @@ class StateLogger {
  public:
   struct Entry {
     uint64_t index = 0;
+    uint64_t low_state_received_ns = 0, torso_imu_received_ns = 0;
     std::chrono::system_clock::time_point timestamp; // wall-clock time (for CSV logging)
     std::chrono::steady_clock::time_point timestamp_monotonic; // monotonic time (for CSV logging)
     double ros_timestamp = 0.0;  // ROS time in seconds (for ROS message publishing)
@@ -250,7 +251,7 @@ class StateLogger {
                         bool brainco_left_feedback_online = true,
                         bool brainco_right_feedback_online = true,
                         bool brainco_vla_command_allowed = true,
-                        double ros_timestamp = 0.0);
+                        double ros_timestamp = 0.0, uint64_t low_state_received_ns = 0, uint64_t torso_imu_received_ns = 0);
 
   /**
    * Log post-state data (e.g., token state from encoder) to the most recent entry.

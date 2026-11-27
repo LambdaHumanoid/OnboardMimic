@@ -2,6 +2,10 @@
 
 English · [简体中文](RELEASE_BUILD_zh.md)
 
+The default profile builds JP5 packages; use `--platform jp6` for JP6. Pass
+`--version` from root VERSION explicitly. Publish only the current guides in `docs/` and `lab/docs/`;
+private test reports and development handoffs are not release documentation.
+
 Packaging never executes the ARM64 controller. Use a clean committed source tree,
 an ARM64 binary and build report matching its native sources, and the audited
 model/engine snapshot. Rebuild the binary when native sources change.
@@ -14,14 +18,14 @@ python3 scripts/build_prebuilt_release.py \
   --bridge-build /PATH/TO/ARM64_BRIDGE_BINARIES \
   --bridge-report /PATH/TO/bridge_build_report.json \
   --patchelf /PATH/TO/patchelf \
-  --version v0.1.1 --output /PATH/TO/EMPTY/OUTPUT
+  --version "v$(cat VERSION)" --output /PATH/TO/EMPTY/OUTPUT
 ```
 
 `native_build_report.json` records `architecture: aarch64`, `binary_sha256`,
 `native_source_hashes` (matching `onboardmimic/backends/sonic/native_source_manifest.json`), `method`, and
 `built_at_utc`, and `runtime_library_sha256` for the linked Unitree SDK/DDS and ONNX Runtime libraries. Include compiler, sysroot version and relevant validation details.
 The packager rejects source/hash mismatches and non-AArch64 binaries. The report describes
-how the maintainer built the artifact; it does not substitute for target-device validation.
+the toolchain, inputs and build checks. Record target-device results alongside it.
 
 Both build reports must record `validation.cxx_static_initialization: "passed"`.
 Build `tests/native_startup_smoke.cpp` with the same compiler, sysroot and link
@@ -42,7 +46,7 @@ the 24-case planner validation report, ONNX Runtime 1.16.3 and the pinned Unitre
 The native controller binary is supplied separately from the build output. Keep the snapshot SDK libraries identical
 to those used to link the new controller.
 
-Outputs use the `OnboardMimic-v0.1.1-{runtime,models,engines}.tar.gz` names and extract into
+Outputs use the `OnboardMimic-<version>-{runtime,models,engines}.tar.gz` names and extract into
 `OnboardMimic/`. They include file hashes, source commit, native build report and distinct
 provenance for rebuilt native code versus reused engines. Publish a matching
 source tag and validated package set
@@ -57,10 +61,35 @@ and verify the uploaded files. Retain native build provenance and model identiti
 Before delivery, extract all three archives into a clean directory, run
 `python3 scripts/check_prebuilt.py --files-only`, run core and optional PICO offline tests,
 and check the packaged ELF architecture, shared-library dependencies and ABI versions.
-These steps can run on a workstation. They are not GPU inference, reboot, head-tracking,
-or physical-robot validation.
+Run these checks on a workstation, then follow [target-device acceptance](VALIDATION.md)
+for inference, boot, head-tracking and motion checks.
 
 The release cross-build uses an x86-64 Ubuntu 22.04 container with GCC 10.5's AArch64 cross
 compiler and a read-only snapshot of the target JetPack 5 / L4T 35.3.1 headers/libraries.
 No controller or inference runs on the robot as part of this build. Full source compilation
 and linkage occur on the workstation, followed by package checksum verification.
+
+Release preparation: root VERSION is enforced by the packager. Regenerate and verify the native/bridge build reports against the release commit before packaging. The unified platform wizard installs OM and Lab by default; validate both environments and idle services. `python -m scripts.prepare_lab_install --help` remains the advanced configuration-only entry. See `lab/README.md`.
+
+For JP6, use the same command with `--platform jp6` and **JP6 ARM64** native and
+bridge build reports. The supported binary profile uses Ubuntu 22.04, CUDA 12.6,
+TensorRT 10.3 and ROS Humble. Compile and link against its ARM64 sysroot, including
+the target CRT. Reuse the pinned compiler and model identities and generate
+engines for the target JP6 environment.
+
+Without `--engine-dir`, JP6 produces `OnboardMimic-<version>-jp6-runtime.tar.gz`
+and `OnboardMimic-<version>-jp6-models.tar.gz`. Installation generates engines and
+runs numerical/timing validation on the target before service configuration.
+The runtime already contains the native controller and both bridge executables;
+the installer reuses those executables. Complete target inference and physical
+acceptance on the JP6 device using [the validation workflow](VALIDATION.md).
+
+Bundling JP6 engines requires `--engine-dir` and `--target-validation` from the
+matching Jetson environment.
+Before release, verify both JP6 archives in an empty directory and resolve their
+ELF dependencies against the JP6 sysroot. Keep platform build reports separate.
+When combining JP5 and JP6 assets, name the standalone JP6 manifest
+`jp6-prebuilt_manifest.json` (its archive-internal name stays
+`prebuilt_manifest.json`), and prefix standalone JP6 build reports with `jp6-`.
+Generate one final `SHA256SUMS` covering every published asset. The installation
+links in `docs/JETPACK6.md` become available only after publishing that asset set.

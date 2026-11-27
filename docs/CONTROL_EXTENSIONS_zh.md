@@ -23,7 +23,7 @@ systemctl --user start onboardmimic.service onboardmimic-console.service
 这里的 `install_services.py` 生成服务定义和 token，启用用户 linger，并将控制台和后台 API 设为开机自启（无需先 SSH 登录）。它仅安装和启用服务，上面的 start 命令负责本次启动；统一向导 `setup.py` 则会自动启动空闲后台。桥接仍由“连接服务”按钮启动，准备姿态和启动 SONIC 必须手动触发。若 linger 权限不足，请按提示执行 sudo 命令后重新安装。已有 unit 内容不同时，按[升级说明](UPGRADE_zh.md)停止旧部署后用 `--upgrade` 迁移；自定义 drop-in 保留。控制台默认只监听 `127.0.0.1:8769`。
 
 ```bash
-ssh -N -L 8769:127.0.0.1:8769 USER@ROBOT_HOST
+ssh -N -L 8769:127.0.0.1:8769 -L 8773:127.0.0.1:8773 USER@ROBOT_HOST
 # 浏览器：http://127.0.0.1:8769/
 ```
 
@@ -38,7 +38,7 @@ ssh -N -L 8769:127.0.0.1:8769 USER@ROBOT_HOST
 3. **启动 SONIC**：独立执行，等待控制器确认接管，接管过渡时间为 1 秒。
 4. 启动后显示 **Planner / PICO Pose** 两个标签。切换标签只切换页面，不会自动改变机器人的控制模式。
 
-急停始终可见，会终止本会话控制器；它不是断电操作，也不保证机器人保持站立。打开页面或恢复网络不会自动准备或启动。
+急停始终可见，会终止本会话控制器；机器人保持供电，停止控制时请提供可靠支撑。打开页面或恢复网络不会自动准备或启动。
 
 如果连接失败，页面会显示失败原因；请检查是否重复启动了其他控制程序。宇树模式释放失败或桥接未就绪时，准备按钮保持禁用。重复连接不会自动替换正在运行的其他控制程序。技术细节见[控制权说明](CONTROL_AUTHORITY.md)。
 
@@ -88,7 +88,7 @@ hostname -I
 
 支持前后左右行走和左右转向，按住移动、松开停止。WASD / 方向键行走，Q/E 转向，空格/Esc 停止运动。电脑方向按钮支持鼠标左键按住操作；手机页使用双摇杆触控，按主要方向发送离散指令，摇杆幅度不会改变目标速度。
 
-只有一个**目标速度**设置，所有行走方向共用。默认 0.5 m/s，页面或 HTTP `speed` 可设置 0..5 m/s；这个输入范围是应用的校验范围，不是稳定行走保证。需要调整默认值时，为网关 `onboardmimic.core.runtime` 添加 `--default-speed`，或在每条行走请求里显式传入 `speed`。
+只有一个**目标速度**设置，所有行走方向共用。默认 0.5 m/s，页面或 HTTP `speed` 可设置 0..5 m/s；实际运行速度按控制器、地形和现场检查结果选择。需要调整默认值时，为网关 `onboardmimic.core.runtime` 添加 `--default-speed`，或在每条行走请求里显式传入 `speed`。
 
 ```bash
 .venv/bin/python scripts/control.py forward --speed 0.4 --duration 1
@@ -113,9 +113,9 @@ hostname -I
 
 头显和机器人须处于可互通的网络，在 XRoboToolkit 中填写**机器人的实际 IP**；接收端口为 TCP `63901`，不是网页端口 `8769`。热点地址由本机网络配置决定，不假设每台机器都是 `10.42.0.1`。接收状态位于 `onboardmimic/inputs/pico/runs/live/status.json`，可用 `sudo journalctl -u onboardmimic-pico-receiver.service -n 50` 检查连接。接收服务只接收人体追踪，开机不会自动进入 Pose 或启动 SONIC。
 
-完成准备姿态并启动 SONIC 后，先停止行走并站稳、让操作者姿态与机器人对齐，再打开 PICO Pose 标签，点击 **进入 PICO Pose** 按钮。切换标签本身不接管控制。也支持 `scripts/control.py pose` / `planner`。模式状态以 `g1_debug` 的 encoder_mode/play 确认为准，切换期间不接受 Planner 指令。数据过期请求零速 Planner，重连不自动进入 Pose；模式确认超时回退，Planner 回退再次超时则终止本会话控制器。软件回退不保证机器人不会跌倒。
+完成准备姿态并启动 SONIC 后，先停止行走并站稳、让操作者姿态与机器人对齐，再打开 PICO Pose 标签，点击 **进入 PICO Pose** 按钮。切换标签本身不接管控制。也支持 `scripts/control.py pose` / `planner`。模式状态以 `g1_debug` 的 encoder_mode/play 确认为准，切换期间不接受 Planner 指令。数据过期请求零速 Planner，重连不自动进入 Pose；模式确认超时回退，Planner 回退再次超时则终止本会话控制器。现场调试时提供可靠支撑，并核对部署的[保护配置](WBC_PROTECTION.rst)。
 
-人体预览只读接收文件；不代表策略已接管。自定义接收目录时，可给控制台加 `--pico-runs /ABSOLUTE/RUNS_PARENT`。
+人体预览读取接收文件，策略接管状态以运行时反馈为准。自定义接收目录时，可给控制台加 `--pico-runs /ABSOLUTE/RUNS_PARENT`。
 
 <details>
 <summary>源码或手动安装：构建并配置 PICO 接收器</summary>
@@ -155,7 +155,7 @@ bash onboardmimic/inputs/pico/prepare_container.sh
 docker image inspect onboardmimic-pico-receiver:20261020 --format '{{.Architecture}}'
 ```
 
-最后应显示 `arm64`。构建须在机器人 ARM64 上完成，需要网络；x86 电脑上脚本只下载依赖，不会生成 ARM64 镜像。角色序列号填写自己的追踪器，不随仓库发布；`cp -n` 保留已有设备配置。独立追踪器数量不等于 Body 数据就绪。
+最后应显示 `arm64`。构建须在机器人 ARM64 上完成，需要网络；x86 电脑上脚本只下载依赖，不会生成 ARM64 镜像。角色序列号填写自己的追踪器，不随仓库发布；`cp -n` 保留已有设备配置。通过 Body 数据状态确认就绪。
 
 ### 3. 配置并启动只接收数据的服务
 
@@ -179,6 +179,14 @@ systemctl is-active onboardmimic-pico-receiver.service
 
 最后应显示 `active`。配置脚本安装接收服务、设置容器读写权限，并为 API 添加 `--pose-status`；脚本本身不启停服务。API 从空闲 Planner 状态启动，页面应有 PICO 接收状态，没有头显连接时提示等待数据是正常的。
 
-已有自定义 API unit 或不同的 `60-pico.conf` 时，安装器会拒绝覆盖，请按预览内容人工合并。容器使用 CPU、host 网络，没有设备或运动控制凭据挂载，默认不录制数据；接收服务运行不等于 SONIC 已接管。
+已有自定义 API unit 或不同的 `60-pico.conf` 时，安装器会拒绝覆盖，请按预览内容人工合并。容器使用 CPU、host 网络，没有设备或运动控制凭据挂载，默认不录制数据；SONIC 接管状态以运行时反馈为准。
 
 </details>
+
+### SMPL 预览与 Pose 进入检查
+
+骨架预览直接使用 SONIC Pose 包中的 `smpl_joints`，以骨盆居中显示。Pose 模式显示最近发送包的末帧，其他状态显示待发送输入。网页以 10 Hz 抽帧显示 50 Hz 输入；策略实际执行以运行时反馈为准。断流后清除旧骨架。
+
+进入 Pose 前，将 PICO 手臂位置转换到 SMPL 根坐标系，比较左右上臂、前臂的归一化方向，不受整体位置和身材尺寸影响。需连续 0.3 秒新鲜数据保持一致才能进入。任一方向偏差超过 60°，或手臂位置缺失、骨段退化时，暂不允许进入；持续 0.3 秒后提示追踪或映射异常。修正输入后需持续一致 0.3 秒，再手动重试。这项进入检查不改变运行中的 Pose 动作，也不替代已有停止保护。阈值采用经过软件测试的默认值，现场按实际追踪数据校准；位置与旋转的一致性、追踪精度分别检查。
+
+进入 PICO Pose 后，先固定操作者当前参考姿态，用 2 秒将机器人当前指令平滑过渡到该参考对应的策略目标。页面显示“姿态过渡中”；控制器确认完成后才释放实时人体跟随。期间请保持姿态。断流、停止或 5 秒内未确认完成会取消切入；不会自动重试。该过渡不修正错误追踪输入，已有过速和故障保护仍有效。

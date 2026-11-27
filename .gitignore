@@ -35,3 +35,13 @@ onboardmimic/inputs/pico/devices.json
 onboardmimic/backends/sonic/deploy/onboard/runtime/
 
 /var/
+
+# Integrated Lab packaging outputs
+/dist/
+*.egg-info/
+
+# Local development evidence and generated previews
+/experiments/controlled_kneel/web/
+/lab/import-provenance.json
+/docs/architecture/snapshot.json
+/docs/assets/*.prompt.txt

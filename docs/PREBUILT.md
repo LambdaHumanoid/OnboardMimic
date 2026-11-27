@@ -2,9 +2,9 @@
 
 English · [简体中文](PREBUILT_zh.md)
 
-The prebuilt package targets **G1 29-DOF body / Jetson Orin NX 16 GB / Ubuntu 20.04 / L4T 35.3.1 / CUDA 11.4 / TensorRT 8.5.2**. Hand actuators are not controlled. Other GPUs, 8 GB Orin NX, JetPack 6 and TensorRT 10 require source adaptation, building and validation on the target device.
+The prebuilt package targets **G1 29-DOF body / Jetson Orin NX 16 GB / Ubuntu 20.04 / L4T 35.3.1 / CUDA 11.4 / TensorRT 8.5.2**. For JP6 / TensorRT 10, use the [JP6 runtime package](JETPACK6.md). For other hardware, follow the [source adaptation guide](SOURCE_BUILD.md).
 
-The baseline above remains the hardware-tested configuration. The v0.1.1 installer also admits **L4T35.x, CUDA11.4–11.x and custom carrier-board names** on Ubuntu20.04 / ARM64 Orin with 16GB-class memory. TensorRT8.5.2 is retained for the bundled engines. Accepted variants must still pass native library loading and model numerical checks; a broader version check does not qualify every device.
+The baseline above remains the hardware-tested configuration. The installer also admits **L4T35.x, CUDA11.4–11.x and custom carrier-board names** on Ubuntu20.04 / ARM64 Orin with 16GB-class memory. TensorRT8.5.2 is retained for the bundled engines. Installation checks native library loading and model numerical outputs on each device.
 
 ## Before installing
 
@@ -14,11 +14,11 @@ The baseline above remains the hardware-tested configuration. The v0.1.1 install
 
 ## Download and extract
 
-Download the complete [OnboardMimic v0.1.1 package set](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.1.1). The runtime, models and engines form one installation and must be extracted together.
+Download the complete [OnboardMimic v0.2.0 package set](https://github.com/LambdaHumanoid/OnboardMimic/releases/tag/v0.2.0). The runtime, models and engines form one installation and must be extracted together.
 
-- `OnboardMimic-v0.1.1-runtime.tar.gz`: source, scripts, ARM64 controller, ONNX Runtime / CycloneDDS libraries and licenses.
-- `OnboardMimic-v0.1.1-models.tar.gz`: three original ONNX models and the TensorRT 8.5-compatible planner ONNX.
-- `OnboardMimic-v0.1.1-engines.tar.gz`: three FP32 TensorRT engines.
+- `OnboardMimic-v0.2.0-runtime.tar.gz`: source, scripts, ARM64 controller, ONNX Runtime / CycloneDDS libraries and licenses.
+- `OnboardMimic-v0.2.0-models.tar.gz`: three original ONNX models and the TensorRT 8.5-compatible planner ONNX.
+- `OnboardMimic-v0.2.0-engines.tar.gz`: three FP32 TensorRT engines.
 - `prebuilt_manifest.json`: platform requirements, provenance and per-file SHA-256 hashes.
 - `SHA256SUMS`: checksums for the downloaded files.
 
@@ -29,16 +29,16 @@ Private repositories require read access. Authenticated GitHub CLI users can dow
 ```bash
 mkdir onboardmimic-download
 cd onboardmimic-download
-gh release download v0.1.1 --repo LambdaHumanoid/OnboardMimic --pattern 'OnboardMimic-v0.1.1-*.tar.gz' --pattern prebuilt_manifest.json --pattern SHA256SUMS
-sha256sum -c SHA256SUMS
+gh release download v0.2.0 --repo LambdaHumanoid/OnboardMimic --pattern OnboardMimic-v0.2.0-runtime.tar.gz --pattern OnboardMimic-v0.2.0-models.tar.gz --pattern OnboardMimic-v0.2.0-engines.tar.gz --pattern prebuilt_manifest.json --pattern SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
 ```
 
 Extract all three archives in a new directory. Together they form `OnboardMimic/`. Do not overwrite a running deployment:
 
 ```bash
-tar -xzf OnboardMimic-v0.1.1-runtime.tar.gz
-tar -xzf OnboardMimic-v0.1.1-models.tar.gz
-tar -xzf OnboardMimic-v0.1.1-engines.tar.gz
+tar -xzf OnboardMimic-v0.2.0-runtime.tar.gz
+tar -xzf OnboardMimic-v0.2.0-models.tar.gz
+tar -xzf OnboardMimic-v0.2.0-engines.tar.gz
 cd OnboardMimic
 python3 scripts/setup.py
 ```
@@ -82,13 +82,13 @@ The script installs apt dependencies using the [official ROS Foxy instructions](
 
 Resolve apt repository errors first; the script does not bypass signature checks. Dependency repair targets the Ubuntu 20.04 ARM64 configuration above, not arbitrary systems.
 
-Do not bypass failed checks and launch the controller. The machine may need a source build. Matching versions does not replace initial physical commissioning.
+Do not bypass failed checks and launch the controller. The machine may need a source build. Complete [initial physical commissioning](VALIDATION.md) after installation checks pass.
 
 ## Provenance and scope
 
 ARM64 programs are cross-compiled from the current native source using GCC 10.5 and JP5 / L4T 35.3.1 headers and libraries. Packaging adjusts ELF library search paths. Source hashes, build details and original binary hashes are in `native_build_report.json`; packaged hashes are in `prebuilt_manifest.json`.
 
-Model and engine identities are checked against the release manifest. Packaging does not certify target-device inference or physical operation. See the [validation scope](VALIDATION.md); installation repeats inference checks without motor output.
+Model and engine identities are checked against the release manifest. Installation checks inference without motor output; follow [target-device acceptance](VALIDATION.md) for commissioning.
 
 Library, model and source licenses are included. CUDA, TensorRT, ROS2, Unitree message packages and the Python SDK use the target environment; no system image is redistributed.
 
@@ -105,3 +105,5 @@ TensorRT dependency installation is included in the standard setup wizard. To in
 ```
 
 Add `--check` for inspection only, or `--development` to include headers and `trtexec` for source builds. This tool installs TensorRT only: it does not flash the device, switch JetPack or start motor control. If CUDA itself is missing, install the CUDA components matching the existing JetPack first.
+
+The wizard installs OM and Lab together by default, including separate environments, recording/replay and the embedded page. Use `--no-lab` for a new OM-only installation. Set `--origin http://ROBOT_IP:8769` on multi-interface hosts; SSH access forwards both 8769 and 8773. See [Lab installation](../lab/README.md#v020-部署配置准备).

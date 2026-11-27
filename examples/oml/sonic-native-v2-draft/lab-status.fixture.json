@@ -1,0 +1,9 @@
+{
+  "lab": {
+    "record_ready": false,
+    "contract_sha256": "a36e8242165f4697a009d6f70be27bd15769c7b7065a98eca6a88231c4c6747a",
+    "session_id": "0fc361a261055841c49017d2d8ec89239d4d61dd0ec968e95b4f014ab219dd11",
+    "native_consumption_fresh": true,
+    "reason": "fixture_not_recordable"
+  }
+}

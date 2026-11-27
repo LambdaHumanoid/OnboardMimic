@@ -28,8 +28,10 @@ with open(os.environ['CHECK_LOG'], 'a') as log:
 '''
             for stage, folder in (
                 ('core', 'tests/runtime'), ('release', 'tests'),
-                ('console', 'tests/console'),
+                ('console', 'tests/console'), ('protection', 'tests/protection'),
+                ('deployment', 'tests/deployment'),
                 ('pico', 'tests/pico'), ('sonic', 'tests/sonic'),
+                ('lab', 'lab/tests'),
             ):
                 path = root/folder
                 path.mkdir(parents=True, exist_ok=True)
@@ -42,6 +44,7 @@ with open(os.environ['CHECK_LOG'], 'a') as log:
             (root/'onboardmimic/backends/sonic/deploy/onboard').mkdir(parents=True)
             (root/'onboardmimic/backends/sonic/deploy/onboard/validate_safety_source.py').write_text(
                 "STAGE = 'safety'\n"+recorder)
+            (root/'scripts/check_oml_execution.py').write_text("STAGE = 'execution'\n"+recorder)
             log = root/'checks.jsonl'
             env = dict(os.environ, EXPECTED_VENV=str(venv), CHECK_LOG=str(log),
                        PATH=str(venv/'bin')+os.pathsep+os.environ['PATH'])
@@ -53,5 +56,5 @@ with open(os.environ['CHECK_LOG'], 'a') as log:
                                             env=dict(env, PYTHON=python), capture_output=True, text=True)
                     self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
                     stages = [json.loads(line) for line in log.read_text().splitlines()]
-                    self.assertEqual(stages, ['core', 'safety', 'release', 'console']+
-                                     (['pico', 'sonic'] if mode == '--all' else []))
+                    self.assertEqual(stages, ['core', 'safety', 'release', 'console', 'protection', 'deployment']+
+                                     (['pico', 'sonic', 'lab', 'execution'] if mode == '--all' else []))

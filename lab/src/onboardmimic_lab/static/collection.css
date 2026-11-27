@@ -1,0 +1,66 @@
+:is(#collection-panel,#replay-view){margin-top:20px;padding:24px;border:1px solid #2a3a4d;border-radius:16px;background:#121e2e;color:#e6edf5;font:14px/1.7 system-ui,-apple-system,sans-serif}
+:is(#collection-panel,#replay-view) *{box-sizing:border-box}
+:is(#collection-panel,#replay-view) .collection-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+:is(#collection-panel,#replay-view) .collection-brand{margin:0 0 5px;color:#8297ad;font-size:11px;font-weight:500;line-height:1.5;letter-spacing:.5px}
+:is(#collection-panel,#replay-view) :is(#collection-title,#replay-title){margin:0;font-size:24px;font-weight:650;line-height:1.4;letter-spacing:0}
+:is(#collection-panel,#replay-view) .collection-intro{margin:8px 0 0;color:#b3c2d2}
+:is(#collection-panel,#replay-view) .collection-translation{display:block;font-size:12px;color:#8297ad;line-height:1.7;margin-top:2px}
+:is(#collection-panel,#replay-view) label{display:block;margin:20px 0 8px;font-weight:600;color:#cbd8e5}
+:is(#collection-panel,#replay-view) :is(input,select){display:block;width:100%;min-width:0;height:44px;min-height:44px;padding:10px 12px;background:#0c1725;color:#e6edf5;border:1px solid #3b5067;border-radius:10px;font:400 14px/1.6 system-ui,-apple-system,sans-serif;text-overflow:ellipsis}
+:is(#collection-panel,#replay-view) input::placeholder{color:#7e93a9}
+:is(#collection-panel,#replay-view) :is(input,select):disabled{color:#8ea3b8;background:#101b29;cursor:default}
+:is(#collection-panel,#replay-view) .episode-actions{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 20px}
+:is(#collection-panel,#replay-view) button{font:600 13px/1.5 system-ui,sans-serif;padding:10px 16px;min-height:42px;background:#203145;color:#e6edf5;border:1px solid #40566d;border-radius:9px;cursor:pointer;transition:background .15s}
+:is(#collection-panel,#replay-view) button:hover:enabled{background:#2a455d}
+:is(#collection-panel,#replay-view) button:disabled{opacity:.4;cursor:default}
+:is(#collection-panel,#replay-view) :is(#episode-start,#replay-real){background:#165d57;border-color:#368d7d;color:#e5fff7}
+:is(#collection-panel,#replay-view) :is(#episode-start,#replay-real):hover:enabled{background:#1c756b}
+:is(#collection-panel,#replay-view) #episode-discard{background:transparent;color:#c5a2ab}
+:is(#collection-panel,#replay-view) :is(button,input,select):focus-visible{outline:2px solid #5ee1c5;outline-offset:3px}
+#collection-state{flex-shrink:0;padding:5px 11px;border:1px solid #365064;border-radius:20px;background:#1a2c3c;color:#b9d8e4;font-size:12px;line-height:1.6}
+#collection-state[data-state=recording]{background:#3b242d;color:#ffb5bb;border-color:#83505c}
+:is(#collection-panel,#replay-view) .collection-summary{display:flex;align-items:center;justify-content:space-between;gap:8px 20px;flex-wrap:wrap;padding:12px 14px;background:#0e1927;border:1px solid #23364a;border-radius:10px}
+#collection-counts{margin:0;color:#bcd5e7;font-size:13px;font-variant-numeric:tabular-nums}
+:is(#collection-panel,#replay-view) .collection-detail{margin:0;font-size:12px;overflow-wrap:anywhere;color:#8ea3b8}
+:is(#collection-panel,#replay-view) .collection-help{margin:16px 0 0;color:#a4b7c9;font-size:13px;line-height:1.8}
+:is(#collection-error,#replay-error){color:#ffacb2;margin:14px 0 0;padding:10px 12px;background:#38212b;border-radius:8px;overflow-wrap:anywhere}
+:is(#collection-error,#replay-error):empty,#episode-recovered:empty{display:none}
+#episode-recovered{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+#episode-recovered button{text-align:left;overflow-wrap:anywhere}
+#episode-start-reason{color:#f0d49b;background:#322c20;border:1px solid #665337;border-radius:8px;padding:10px 12px;margin:0 0 16px;font-size:13px;line-height:1.7;overflow-wrap:anywhere}
+#episode-start-reason:empty{display:none}
+.collection-sources{display:flex;align-items:baseline;flex-wrap:wrap;gap:6px 20px;padding:8px 12px;border:1px solid #40566d;border-radius:8px;margin:10px 0;font-size:13px}
+.collection-sources p{margin:0;min-width:0;overflow-wrap:anywhere}
+.collection-sources p:empty{display:none}
+.collection-sources [data-ready="true"]{color:#8ee0c5}
+.collection-sources [data-ready="false"]{color:#f0d49b}
+@media(max-width:540px){:is(#collection-panel,#replay-view){padding:18px}:is(#collection-panel,#replay-view) .collection-heading{gap:10px}:is(#collection-panel,#replay-view) h2{font-size:18px}:is(#collection-panel,#replay-view) .episode-actions{display:grid;grid-template-columns:1fr 1fr}:is(#collection-panel,#replay-view) button{padding:10px}}
+
+/* Put the reason an operation cannot advance next to its controls. */
+:is(#collection-panel,#replay-view) .operation-notice:empty{display:none}
+:is(#collection-panel,#replay-view) .operation-notice[data-attention="busy"],
+:is(#collection-panel,#replay-view) .operation-notice[data-attention="blocked"],
+#episode-start-reason:not(:empty){
+ margin:12px 0;padding:12px 16px;border:1px solid #8b6c32;border-left:4px solid #ffc466;
+ border-radius:9px;background:#342b1b;color:#ffe1a6;font-size:16px;font-weight:700;line-height:1.6;
+ overflow-wrap:anywhere
+}
+:is(#collection-panel,#replay-view) .operation-notice[data-attention="busy"]{
+ background:#16334a;border-color:#3d7ba1;border-left-color:#79ceff;color:#d5f0ff
+}
+#replay-physical .operation-notice[data-attention]{flex-basis:100%}
+#collection-panel .task-fields{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr) minmax(0,2.4fr) minmax(0,1fr);gap:12px;align-items:end;margin:14px 0}
+#collection-panel .task-fields label{min-width:0;margin:0}
+#collection-panel .task-fields label>span{display:block;margin-bottom:6px}
+#collection-panel .task-picker{min-width:0}
+#collection-panel .task-picker-heading{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:6px}
+#collection-panel .episode-actions{align-items:center}
+#collection-panel .task-action-divider{width:1px;height:28px;background:#40566d;margin:0 4px;flex:none}
+@media(max-width:540px){#collection-panel .episode-actions{display:flex;flex-wrap:wrap}#collection-panel .episode-actions button{white-space:nowrap}}
+@media(max-width:700px){#collection-panel .task-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:420px){#collection-panel .task-fields{grid-template-columns:minmax(0,1fr)}}
+#collection-state:is([data-state="arming"],[data-state="stopping"],[data-state="saving"]){
+ background:#16334a;border-color:#3d7ba1;color:#d5f0ff;font-size:14px;font-weight:700
+}
+
+#collection-discontinuities{color:#ffe2a8;background:#493513;border:1px solid #bd852b;border-radius:8px;padding:12px;font-weight:600;margin:8px 0}

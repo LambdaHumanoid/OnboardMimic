@@ -93,7 +93,8 @@ class GuardTest(unittest.TestCase):
         pid, terminal = pty.fork()
         if pid == 0:
             try:
-                support.run([sys.executable, '-c', 'import os; os.close(os.open("/dev/tty", os.O_RDWR))'])
+                with patch.object(support, 'active_controllers', return_value=[]):
+                    support.run([sys.executable, '-c', 'import os; os.close(os.open("/dev/tty", os.O_RDWR))'])
                 os._exit(0)
             except BaseException:
                 os._exit(1)
@@ -154,11 +155,12 @@ class GuardTest(unittest.TestCase):
             root = Path(tmp)
             (root/'prebuilt_manifest.json').write_text('{}')
             with patch.object(wizard, 'ROOT', root), patch.object(Path, 'home', return_value=root), \
+                 patch.object(support, 'active_controllers', return_value=[]), \
                  patch.object(wizard.os, 'geteuid', return_value=1000), \
                  patch.object(wizard, 'find_ros', return_value=(Path('/ROS'), Path('/WS'))), \
                  patch.object(wizard.network, 'detect', return_value='eth1'), \
                  patch.object(wizard, 'run') as run, patch.object(wizard, 'install') as install:
-                wizard.main(['--yes', '--install-only', '--pico'])
+                wizard.main(['--yes', '--install-only', '--pico', '--no-lab'])
                 install.assert_not_called()
                 self.assertEqual(run.call_count, 1)
                 self.assertIn('--with-pico', run.call_args.args[0])

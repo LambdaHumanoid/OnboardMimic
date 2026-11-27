@@ -1,0 +1,10 @@
+*.so
+model_kernel.cpp
+__pycache__/
+status.json
+
+bridge_build_source/
+bridge_build/
+*.sock
+logs/
+command-dds.xml

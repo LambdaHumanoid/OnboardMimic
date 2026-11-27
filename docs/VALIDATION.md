@@ -1,49 +1,64 @@
 # Validation scope / 验证范围
 
-OnboardMimic v0.1.0 has completed the full deployment workflow on a physical G1 with the supported configuration: installation, GPU numerical checks, console access, reboot readiness, posture preparation, emergency stop and operator motion acceptance. The package records its source commit and per-file hashes. Installation repeats software and inference checks on the target device.
+Validation applies to a specific source, model, build and platform combination.
+Record the source commit or complete source-manifest identity, native build reports,
+model/engine hashes, platform versions and operator observations together.
 
-> OnboardMimic v0.1.0 已在支持配置的 G1 真机上完成全流程部署验证，涵盖安装、GPU 数值检查、控制台访问、开机就绪、准备姿态、急停和现场运动验收。安装包记录源码提交和逐文件哈希；安装时在目标设备上重新执行软件与推理检查。
+验证结论绑定具体源码、模型、构建和平台。每次发布应同时记录提交或完整源码快照标识、
+原生构建报告、模型/引擎哈希、平台版本及本次现场结果。
 
-## Offline checks / 离线检查
+## Validated platforms and installation paths / 已验证平台与安装路径
 
-- Core lifecycle, command leases, feedback, failover and adapter contracts.
-- Strict startup admission, advisory runtime inspection failures, bounded diagnostics,
-  and preserved emergency-stop, feedback and joint-fault protections under injected inspection errors.
-- Installation and upgrade in isolated directories, preserving credentials and devices; rollback on failure and rejection of active or custom installations.
-- Canonical service definitions, shared control ownership and read-only PICO setup.
-- Desktop/mobile controls and translations using mock backends.
-- Package/source hashes, ARM64 build provenance, and consistent documentation links.
+**JP5 v0.2.0 and JP6 v0.1.1 have completed real-robot testing on Unitree G1.**
 
-> 离线验证覆盖核心生命周期、指令租约、反馈、故障切换与适配器契约；隔离目录安装升级、凭据和设备配置保留、失败回滚、拒绝运行中或自定义安装；标准服务定义、共享控制权与只读 PICO 配置；模拟后端下的电脑/手机控制与翻译；安装包/源码哈希、ARM64 构建来源和文档链接一致性。
+**JP5 v0.2.0 与 JP6 v0.1.1 均已完成 Unitree G1 真机测试。**
 
-> 同时覆盖严格的启动准入、运行中检查异常只告警、诊断信息限量，以及注入检查异常后急停、反馈与关节故障保护仍然有效。
+The v0.2.0 JP6 runtime has completed ARM64 compilation, linking, QEMU startup
+probes, library resolution and archive checks. Installation generates and validates
+engines on the target. Commission the device using the acceptance workflow below.
 
-Run the [source-guide checks](SOURCE_BUILD.md). No robot is required for them.
+v0.2.0 JP6 运行包已完成 ARM64 编译、链接、QEMU 启动探针、动态库和归档检查。
+安装器在目标机生成并校验引擎，现场调试按下方目标机验收流程进行。
 
-> 按[源码指南](SOURCE_BUILD_zh.md)运行检查，不需要连接机器人。
+- G1 29-DOF body, Orin NX 16 GB, JP5 / L4T 35.3.1, CUDA 11.4 and TensorRT 8.5.2:
+  v0.2.0 completed target installation, 522 controller tests, 115 Lab tests and
+  Encoder/Decoder/Planner inference checks. The onsite operator reported successful robot testing.
+- G1, Orin NX 16 GB, Ubuntu 22.04, JP6 / **L4T 36.4.7**, **CUDA 12.6**:
+  v0.1.1 passed real-robot acceptance on this configuration and uses the
+  [JP6 installation path](JETPACK6.md). The historical record identifies the
+  platform fields listed here. The v0.2.0 binary profile uses TensorRT 10.3.
+- Record workstation tests, Jetson inference and onsite motion checks separately.
+  Generate TensorRT engines for the target Jetson environment.
+
+JP5 v0.2.0 已通过目标机安装、522 项控制端测试、115 项 Lab 测试及三套模型推理检查，现场用户确认真机测试正常。
+JP6 v0.1.1 真机验收配置为 G1、Orin NX 16 GB、Ubuntu 22.04、**L4T 36.4.7、CUDA 12.6**。
+历史记录标识上述平台字段；v0.2.0 预编译包使用 TensorRT 10.3。
+JP6 使用独立依赖与构建路径，引擎在目标 Jetson 环境生成。
+
+## Software checks / 软件检查
+
+[Source-build checks](SOURCE_BUILD.md) cover lifecycle and control ownership,
+feedback freshness, command expiry, protection, installer behavior, source identity
+and UI behavior. Lab checks cover recording eligibility, camera/state requirements,
+LeRobot export, replay contracts and independent service lifetimes.
+
+[源码检查](SOURCE_BUILD_zh.md)覆盖控制生命周期、反馈与权限、保护、安装和界面；
+Lab 检查覆盖录制就绪、相机和 state、数据处理、保存格式、回放契约及独立服务。
+模拟控制器、软件关节后端和离线测试用于软件逻辑验证，物理动作按下方现场流程检查。
 
 ## Target-device acceptance / 目标机验收
 
-Validate the exact package with **G1 29-DOF body, Orin NX 16 GB, L4T 35.3.1, CUDA 11.4 and TensorRT 8.5.2**:
+1. Check exact platform dependencies, source/binary identity, models and inference outputs.
+2. Check service installation, desktop/mobile access and optional receive-only PICO setup.
+3. Verify boot opens idle services without starting robot motion.
+4. With onsite support, verify preparation, operator stop and emergency stop.
+5. Validate the release's enabled Planner/Pose, recording/video, data processing and
+   replay paths. Replay includes first-frame entry and return to Planner.
+6. Validate enabled protective actions on supported hardware. Record trajectory
+   completion, observed ground contact and measured impact separately.
 
-1. Clean installation, dependency checks and model/engine numerical validation.
-2. Service migration, desktop/mobile access and receive-only PICO setup.
-3. Reboot: console/API and optional receiver become ready; no automatic motion.
-4. With onsite support: posture preparation and emergency stop.
-5. Operator acceptance of Planner walking and PICO Pose teleoperation.
+现场验收按安装、空闲启动、控制、数采、数据处理与回放逐项记录。保护动作单独验证；
+分别记录服务状态、接口结果、仿真结果和现场运动观察。
 
-> 使用 **G1 29 自由度本体、Orin NX 16 GB、L4T 35.3.1、CUDA 11.4、TensorRT 8.5.2** 核验完整安装、依赖与模型/引擎数值；服务升级、电脑/手机页面和 PICO 接收；开机只就绪不运动；现场支撑下的准备姿态和急停；Planner 行走与 PICO Pose 遥操。
-
-Record source commit, asset hashes, build reports, platform versions and operator results together. Model/backend attribution and licenses are preserved independently of product naming.
-
-> 将源码提交、制品哈希、构建报告、系统版本和现场验收结果一起记录。项目名称变化不影响模型、后端及第三方许可证的归属。
-
-[Deployment](DEPLOYMENT.md) · [Controls](CONTROL_EXTENSIONS.md) · [Upgrade](UPGRADE.md)
-
-[首次部署](DEPLOYMENT_zh.md) · [控制说明](CONTROL_EXTENSIONS_zh.md) · [升级](UPGRADE_zh.md)
-
-## v0.1.1 installation update / 安装更新
-
-v0.1.1 retains the controller binaries, models and engines from v0.1.0. Its updated installer passed isolated installation, 212 offline tests and 30 model numerical checks on a physical G1.
-
-> v0.1.1 沿用 v0.1.0 的控制程序、模型和引擎。更新后的安装器已在 G1 真机通过独立安装、212 项离线测试和 30 组模型数值检查。
+[Deployment / 部署](DEPLOYMENT.md) · [Controls / 控制](CONTROL_EXTENSIONS.md) ·
+[Protection / 保护](WBC_PROTECTION.rst) · [Deployment updates / 更新](INCREMENTAL_DEPLOYMENT.md)

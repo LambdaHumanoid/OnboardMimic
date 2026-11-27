@@ -1,4 +1,9 @@
+#include "../../../backends/sonic/deploy/src/g1/g1_deploy_onnx_ref/include/native_consumption.hpp"
 #include "core.hpp"
+#include "protection_control.hpp"
+#include "protection_feedback.hpp"
+#include "protection_voice.hpp"
+#include <memory>
 #include "authority.hpp"
 #include "owner_lock.hpp"
 #include "compat_owner_lock.hpp"
@@ -19,18 +24,25 @@
 using J=nlohmann::json;
 struct Sample {
  uint64_t at=0,seq=0,stream=0,send_ns=0,wall=0,cpu=0,lock=0,gap=0,valid=0;
- int kind=0,state=0,result=0,queued=0; // kind: 0 receive, 1 DDS write
+ int kind=0,state=0,result=0,queued=0,protection_phase=0; // kind: 0 receive, 1 DDS write
+ double ankle_bias=0,selected_pitch_rate=0,entry_max_speed=0,foot_height_difference=0;
+ const char* strategy="not_started";const char* protection_reason="";
+ bool adaptive_ankle_used=false;
 };
-J json(const Sample& x){return {{"at_ns",x.at},{"kind",x.kind},{"stream",x.stream},{"seq",x.seq},{"send_ns",x.send_ns},{"wall_ns",x.wall},{"cpu_ns",x.cpu},{"lock_ns",x.lock},{"gap_ns",x.gap},{"valid_ns",x.valid},{"state",sonic_bridge::name(sonic_bridge::State(x.state))},{"result",x.result},{"queued_bytes",x.queued}};}
+J json(const Sample& x){return {{"at_ns",x.at},{"kind",x.kind},{"stream",x.stream},{"seq",x.seq},{"send_ns",x.send_ns},{"wall_ns",x.wall},{"cpu_ns",x.cpu},{"lock_ns",x.lock},{"gap_ns",x.gap},{"valid_ns",x.valid},{"state",sonic_bridge::name(sonic_bridge::State(x.state))},{"result",x.result},{"queued_bytes",x.queued},{"protection_phase",x.protection_phase},{"ankle_bias_rad",x.ankle_bias},{"selected_pitch_rate_rad_s",x.selected_pitch_rate},{"adaptive_ankle_used",x.adaptive_ankle_used},{"strategy",x.strategy},{"protection_reason",x.protection_reason},{"entry_max_speed",x.entry_max_speed},{"foot_height_difference",x.foot_height_difference}};}
 struct Shared {
- std::mutex mutex;sonic_bridge::Controller controller;
+ std::mutex mutex;sonic_bridge::ProtectedWriter protection;
+ sonic_bridge::Controller& controller=protection.wbc;
+ sonic_bridge::RollFeedback feedback;
  std::array<float,sonic_bridge::motors> q{};double q_at=-1;
 };
-struct Options {int udp=16663,cmd=16661,primary=16665,standby=16666;bool physical=false;std::string logs;};
+struct Options {int udp=16663,cmd=16661,primary=16665,standby=16666;bool physical=false,protection_voice=false;std::string logs,protection_socket;};
 int main(int argc,char** argv){try{
  Options o;
  for(int i=1;i<argc;++i){std::string a=argv[i];
   if(a=="--physical")o.physical=true;
+  else if(a=="--protection-voice")o.protection_voice=true;
+  else if(i+1<argc&&a=="--experimental-protection-socket")o.protection_socket=argv[++i];
   else if(i+1<argc&&a=="--udp-port")o.udp=std::stoi(argv[++i]);
   else if(i+1<argc&&a=="--cmd-port")o.cmd=std::stoi(argv[++i]);
   else if(i+1<argc&&a=="--primary-port")o.primary=std::stoi(argv[++i]);
@@ -39,6 +51,7 @@ int main(int argc,char** argv){try{
  }
  for(int port:{o.udp,o.cmd,o.primary,o.standby})sonic_bridge::endpoint(port);
  if(o.logs.empty())throw std::runtime_error("--logs required");
+ if(o.protection_voice&&o.protection_socket.empty())throw std::runtime_error("voice requires protection executor");
  if(!o.physical){
   std::string domain=getenv("ROS_DOMAIN_ID")?getenv("ROS_DOMAIN_ID"):"";
   std::string xml=getenv("CYCLONEDDS_URI")?getenv("CYCLONEDDS_URI"):"";
@@ -59,7 +72,7 @@ int main(int argc,char** argv){try{
  if(!publisher_gid.implementation_identifier||std::string(publisher_gid.implementation_identifier)!="rmw_cyclonedds_cpp")
   throw std::runtime_error("Authority monitor requires RMW_IMPLEMENTATION=rmw_cyclonedds_cpp");
  std::mutex authority_mutex;Authority authority(own,sonic_bridge::ns()/1e9);
- std::atomic<bool> observer_fault{false};
+ std::atomic<bool> observer_fault{false},authority_conflict{false};
  // Observe the serialized envelope and sender ID without parsing motors.
  // Cyclone DDS is required above: other ROS backends have failed to observe
  // SDK vendor traffic on the actual robot even while ROS-only tests passed.
@@ -73,7 +86,7 @@ int main(int argc,char** argv){try{
    Authority::Gid sender{};const auto& gid=info.get_rmw_message_info().publisher_gid;
    std::copy(std::begin(gid.data),std::end(gid.data),sender.begin());
    std::lock_guard<std::mutex> lock(authority_mutex);authority.observe(sender);
-   if(authority.conflict)return;
+   if(authority.conflict){authority_conflict=true;return;}
   }
   // Before admission, incomplete observation rejects startup. After admission,
   // monitoring is advisory and never interrupts the incumbent writer.
@@ -96,7 +109,16 @@ int main(int argc,char** argv){try{
  int size=65536;setsockopt(udp,SOL_SOCKET,SO_RCVBUF,&size,sizeof(size));
  sockaddr_in address{};address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);address.sin_port=htons(o.udp);
  if(bind(udp,reinterpret_cast<sockaddr*>(&address),sizeof(address)))throw std::runtime_error("UDP bind failed");
- sonic_bridge::Context ctx;Shared shared;sonic_bridge::Ring<Sample> rx_ring,tx_ring;
+ sonic_bridge::Context ctx;Shared shared;
+ std::unique_ptr<sonic_bridge::ProtectionControl> protection;
+ if(!o.protection_socket.empty())protection=std::make_unique<sonic_bridge::ProtectionControl>(o.protection_socket);
+ std::unique_ptr<sonic_bridge::ProtectionVoice> voice;
+ if(o.protection_voice){try{voice=std::make_unique<sonic_bridge::ProtectionVoice>(o.physical);}catch(...){events<<J({{"event","protection_voice_unavailable"}}).dump()<<std::endl;}}
+ std::unique_ptr<sonic_consumption::Publisher> consumption;
+ if(const char* port=std::getenv("OM_SONIC_BRIDGE_TELEMETRY_PORT"))consumption=std::make_unique<sonic_consumption::Publisher>(std::stoi(port),J{
+  {"schema","onboardmimic.sonic.bridge-manifest"},{"schema_version",2},{"physical",o.physical},
+  {"protected_writer",bool(protection)},{"artifacts",{{"bridge_executable",sonic_consumption::file_digest("/proc/self/exe")}}}});
+ sonic_bridge::Ring<Sample> rx_ring,tx_ring;
  std::atomic<bool> ready{false};std::atomic<uint64_t> received{0},accepted{0},writes{0},invalid{0},stale{0},crc_bad{0},ignored{0},q_errors{0},zmq_ignored{0};
  std::atomic<int> rx_tid{0},tx_tid{0};std::exception_ptr rx_error,tx_error,feedback_error;
  std::thread receiver([&]{try{
@@ -116,7 +138,7 @@ int main(int argc,char** argv){try{
     auto wait=sonic_bridge::ns();std::lock_guard<std::mutex> lock(shared.mutex);auto now=sonic_bridge::ns();x.lock=now-wait;
     // Freshness includes validation/lock delay; queued packets cannot refresh a watchdog.
     if(now-packet.send_ns>100000000){++invalid;++stale;x.result=int(sonic_bridge::Parse::stale);}
-    else if(shared.controller.observe(packet,now/1e9,(now/1e9-shared.q_at>=0&&now/1e9-shared.q_at<=.05)?&shared.q:nullptr)) ++accepted;
+    else if(protection?shared.protection.observe(packet,now/1e9,shared.feedback):shared.controller.observe(packet,now/1e9,(now/1e9-shared.q_at>=0&&now/1e9-shared.q_at<=.05)?&shared.q:nullptr)) ++accepted;
     else {++ignored;x.result=11;}
     x.state=int(shared.controller.state);x.valid=shared.controller.last_valid<0?0:uint64_t(shared.controller.last_valid*1e9);
    }
@@ -145,14 +167,13 @@ int main(int argc,char** argv){try{
       auto tick=sonic_bridge::field(e,"tick").as<uint32_t>();
       if(std::isfinite(captured)&&now-captured>=0&&now-captured<=.05&&(!have_tick||(uint32_t(tick-last_tick)>0&&uint32_t(tick-last_tick)<0x80000000u))){
        auto& bytes=sonic_bridge::field(e,"payload");if(bytes.type!=msgpack::type::BIN)throw std::runtime_error("payload");
-       auto payload=msgpack::unpack(bytes.via.bin.ptr,bytes.via.bin.size);auto& motors=sonic_bridge::field(payload.get(),"motor_state");
-       if(motors.type!=msgpack::type::ARRAY||motors.via.array.size!=35)throw std::runtime_error("motor count");
-       std::array<float,sonic_bridge::motors> q;
-       for(size_t m=0;m<q.size();++m){q[m]=sonic_bridge::field(motors.via.array.ptr[m],"q").as<float>();if(!std::isfinite(q[m]))throw std::runtime_error("nonfinite q");}
-       std::lock_guard<std::mutex> lock(shared.mutex);if(captured>shared.q_at){shared.q=q;shared.q_at=captured;last_tick=tick;have_tick=true;}
+       auto payload=msgpack::unpack(bytes.via.bin.ptr,bytes.via.bin.size);
+       auto measured=sonic_bridge::decode_protection_feedback(payload.get(),captured,now,bool(protection));
+       const auto& q=measured.q;
+       std::lock_guard<std::mutex> lock(shared.mutex);if(captured>shared.q_at){shared.q=q;shared.q_at=captured;shared.feedback=measured;last_tick=tick;have_tick=true;}
       }
      }
-    }catch(const std::exception&){++q_errors;}
+    }catch(const std::exception&){++q_errors;if(protection){std::lock_guard<std::mutex> lock(shared.mutex);shared.feedback.valid=false;}}
     zmq_msg_close(&raw);
    }
   }
@@ -163,18 +184,35 @@ int main(int argc,char** argv){try{
    deadline+=std::chrono::milliseconds(2);std::this_thread::sleep_until(deadline);
    auto now_clock=std::chrono::steady_clock::now();if(now_clock-deadline>std::chrono::milliseconds(2))deadline=now_clock; // never catch up in bursts
    auto begin=sonic_bridge::ns(),cpu=sonic_bridge::cpu_ns();sonic_bridge::Command command;Sample x;x.kind=1;x.at=begin;bool send=false;
+   std::unique_lock<std::mutex> motor_lock(shared.mutex);
    {
-    std::lock_guard<std::mutex> lock(shared.mutex);auto now=sonic_bridge::ns();x.lock=now-begin;shared.controller.advance(now/1e9);
+    auto now=sonic_bridge::ns();x.lock=now-begin;
+    if(protection)shared.protection.advance(shared.feedback,now/1e9,protection->exited());else shared.controller.advance(now/1e9);
+    x.protection_phase=int(shared.protection.roll.phase);
+    x.strategy=shared.protection.roll.strategy;x.protection_reason=shared.protection.roll.reason;x.entry_max_speed=shared.protection.roll.entry_max_speed;x.foot_height_difference=shared.protection.roll.foot_height_difference;
+    if(voice)voice->signal.notify(shared.protection.generation,shared.protection.takeover_requested&&!shared.protection.estopped);
+    x.ankle_bias=shared.protection.roll.ankle_bias;x.selected_pitch_rate=shared.protection.roll.selected_pitch_rate;x.adaptive_ankle_used=shared.protection.roll.adaptive_bias_used;
     const auto& c=shared.controller;x.state=int(c.state);x.seq=c.seq;x.stream=c.stream;x.send_ns=c.send_ns;x.valid=c.last_valid<0?0:uint64_t(c.last_valid*1e9);
-    if(c.state!=sonic_bridge::State::idle&&ready.load()){command=c.output;send=true;}
+    if(c.state!=sonic_bridge::State::idle&&ready.load()){command=protection?shared.protection.output():c.output;send=true;}
    }
+   if(!protection)motor_lock.unlock();
    if(send){
     msg.mode_pr=command.mode_pr;msg.mode_machine=command.mode_machine;msg.reserve=command.reserve;msg.crc=command.crc;
     for(size_t i=0;i<35;++i){const auto& m=command.motor[i];auto& d=msg.motor_cmd[i];d.mode=m.mode;d.q=m.q;d.dq=m.dq;d.tau=m.tau;d.kp=m.kp;d.kd=m.kd;d.reserve=m.reserve;}
     // The incumbent keeps its lock for this process lifetime. Observations of
     // later DDS writers do not gate this path or interrupt policy output.
     pub->publish(msg);++writes;x.result=1;x.gap=previous?begin-previous:0;previous=begin;
+    if(consumption){
+      sonic_consumption::Record committed;committed.kind=2;committed.stream=x.stream;committed.seq=x.seq;committed.send_ns=x.send_ns;
+      committed.at=sonic_consumption::mono();committed.realtime=sonic_consumption::wall();
+      committed.authority=bool(protection)&&!authority_conflict.load()&&!observer_fault.load()&&sonic_bridge::ProtectionRoll::fresh(shared.feedback,committed.at/1e9)&&shared.protection.armed&&!shared.protection.fenced&&!shared.protection.estopped&&shared.controller.state==sonic_bridge::State::active;
+      committed.generation=shared.protection.generation;
+      for(size_t i=0;i<29;++i){auto& m=command.motor[i];committed.q[i]=m.q;committed.dq[i]=m.dq;committed.kp[i]=m.kp;committed.kd[i]=m.kd;committed.tau[i]=m.tau;}
+      consumption->writer.push(committed);
+    }
+
    }
+   if(motor_lock.owns_lock())motor_lock.unlock();
    x.wall=sonic_bridge::ns()-begin;x.cpu=sonic_bridge::cpu_ns()-cpu;tx_ring.push(x);
   }
  }catch(...){tx_error=std::current_exception();rclcpp::shutdown();}});
@@ -190,12 +228,17 @@ int main(int argc,char** argv){try{
  std::string boot_id;std::ifstream("/proc/sys/kernel/random/boot_id")>>boot_id;
  J start={{"boot_id",boot_id},{"unix_s",time(nullptr)},{"monotonic_ns",sonic_bridge::ns()},{"event","native_bridge_start"},{"pid",getpid()},{"physical",o.physical},{"watchdog_ms",100},{"failsafe_ramp_ms",150},{"recovery_ramp_ms",500},{"udp_port",o.udp},{"log_dir",run}};
  events<<start.dump()<<'\n';std::cout<<start.dump()<<std::endl;
- std::deque<Sample> history;uint64_t last_log=0,window_until=0,last_trigger=0;std::array<uint64_t,2> max_gap{},max_wall{},max_lock{},max_valid_age{};int last_state=-1;bool intrusion_reported=false,observer_error_reported=false;
+ std::deque<Sample> history;uint64_t last_log=0,window_until=0,last_trigger=0;std::array<uint64_t,2> max_gap{},max_wall{},max_lock{},max_valid_age{};int last_state=-1,last_protection_phase=0;bool intrusion_reported=false,observer_error_reported=false;
  while(rclcpp::ok()){
+  if(protection)protection->serve_once([&](const J& request,const ucred& peer){
+   std::lock_guard<std::mutex> lock(shared.mutex);
+   return protection->handle(request,peer,shared.protection,shared.feedback,sonic_bridge::ns()/1e9);
+  });
   uint64_t now=sonic_bridge::ns();Sample x;
   for(auto* ring:{&rx_ring,&tx_ring})while(ring->pop(x)){
    size_t k=x.kind;max_gap[k]=std::max(max_gap[k],x.gap);max_wall[k]=std::max(max_wall[k],x.wall);max_lock[k]=std::max(max_lock[k],x.lock);
    if(x.valid&&x.at>x.valid)max_valid_age[k]=std::max(max_valid_age[k],x.at-x.valid);
+   if(x.kind==1&&last_protection_phase!=x.protection_phase){events<<J({{"event","protection_transition"},{"sample",json(x)}}).dump()<<std::endl;last_protection_phase=x.protection_phase;}
    bool change=x.kind==1&&last_state!=x.state;
    if(change){events<<J({{"event","watchdog_transition"},{"sample",json(x)}}).dump()<<'\n';last_state=x.state;}
    bool anomaly=x.gap>20000000||x.wall>20000000||x.lock>20000000;
@@ -222,6 +265,9 @@ int main(int argc,char** argv){try{
     events<<J({{"event","authority_observer_error"},{"action","keep_current_owner"}}).dump()<<'\n';observer_error_reported=true;
    }
    J j={{"event","native_bridge_stats"},{"at_ns",now},{"foreign_lowcmd_count",foreign_count},{"authority_observer_error",observer_fault.load()},{"received",received.load()},{"accepted",accepted.load()},{"dds_writes",writes.load()},{"invalid",invalid.load()},{"crc_errors",crc_bad.load()},{"stale_packets",stale.load()},{"ignored",ignored.load()},{"feedback_errors",q_errors.load()},{"zmq_ignored",zmq_ignored.load()},{"rx_log_drops",rx_ring.dropped.load()},{"tx_log_drops",tx_ring.dropped.load()},{"max_gap_ns",max_gap},{"max_wall_ns",max_wall},{"max_lock_ns",max_lock},{"max_valid_age_ns",max_valid_age},{"state",last_state<0?"idle":sonic_bridge::name(sonic_bridge::State(last_state))}};
+   if(protection){std::lock_guard<std::mutex> lock(shared.mutex);j["protection"]=protection->snapshot(shared.protection);}
+   if(protection)j["control_queries"]=protection->query_diagnostics();
+   if(voice)j["protection_voice"]={{"requested_generation",voice->signal.pending.load()},{"published_generation",voice->published_generation.load()},{"response_code",voice->response_code.load()},{"failed",voice->failed.load()},{"repetitions",2},{"single_duration_s",sonic_bridge::protection_voice_pcm.size()/32000.0}};
    events<<j.dump()<<'\n';events.flush();windows.flush();std::cout<<j.dump()<<std::endl;last_log=now;
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(10));

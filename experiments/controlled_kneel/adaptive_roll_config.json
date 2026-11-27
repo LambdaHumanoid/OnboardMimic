@@ -1,0 +1,39 @@
+{
+  "backward_roll": true,
+  "takeover_delay_s": 0.05,
+  "failure_mode": "zero_torque",
+  "initial_vx_m_s": 0.1,
+  "times": [
+    0,
+    1.4,
+    2.1,
+    2.7
+  ],
+  "duration": 7,
+  "hip1": -1.95,
+  "knee1": 2.65,
+  "ankle1": -0.75,
+  "waist1": 0.4,
+  "hip2": -1.95,
+  "knee2": 2.65,
+  "ankle2": -0.75,
+  "waist2": 0.4,
+  "hip3": -1.95,
+  "knee3": 2.65,
+  "ankle3": -0.75,
+  "waist3": 0.4,
+  "balance_until": 1.0,
+  "blend_s": 0.05,
+  "target_rate_rad_s": 5.0,
+  "ankle_start_s": 0,
+  "upper_fold_fraction": 1,
+  "ankle_feedback": {
+    "base": 0.25,
+    "rate_gain": 1.4,
+    "pitch_gain": 0,
+    "maximum": 0.5
+  },
+  "dynamic_transfer_s": 0.12,
+  "dynamic_crouch_s": 0.8,
+  "dynamic_swing_extension": 0.12
+}

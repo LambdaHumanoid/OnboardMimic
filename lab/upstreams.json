@@ -1,0 +1,15 @@
+{
+  "onboardmimic": {
+    "url": "https://github.com/LambdaHumanoid/OnboardMimic",
+    "relationship": "containing repository; shared root VERSION",
+    "required_contract": "Independent collector, iframe handshake and verified native consumption",
+    "intended_release": "root VERSION",
+    "historical_snapshot_commit": "6593e726e6af16d0f13a41fb876aa4a21257167b"
+  },
+  "openlambda": {
+    "url": "https://github.com/LambdaHumanoid/openlambda",
+    "commit": "b1de3941553bb76a99dcbd65f81eecd751ecfc49",
+    "path": "third_party/openlambda",
+    "scope": "Selected robot collector source/tests/docs, standalone GoPro relay, and replay/interface references; not a full checkout"
+  }
+}

@@ -38,6 +38,8 @@ const int G1_NUM_MOTOR = 29;
  * index (see G1JointIndex).
  */
 struct MotorCommand {
+    uint64_t inference_generation = 0;
+    uint64_t inference_sequence = 0; // local telemetry only, never sent as motor data
     std::array<float, G1_NUM_MOTOR> q_target = {};   ///< Target position (rad).
     std::array<float, G1_NUM_MOTOR> dq_target = {};  ///< Target velocity (rad/s).
     std::array<float, G1_NUM_MOTOR> kp = {};          ///< Position gain (Nm/rad).

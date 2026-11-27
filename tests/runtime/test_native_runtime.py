@@ -127,7 +127,7 @@ class RuntimeTest(unittest.TestCase):
             # The real transport sends streamed poses only after an explicit mode request.
             with g.lock:
                 g.pose_reader = Mock()
-                g.pose_reader.snapshot.return_value = {'ready': True, 'packet': b'pose-test-frame'}
+                g.pose_reader.snapshot.return_value = {'pose_admission_ready': True, 'ready': True, 'packet': b'pose-test-frame'}
                 g.begin_mode('pose')
             until = time.monotonic()+1
             pose_seen = False

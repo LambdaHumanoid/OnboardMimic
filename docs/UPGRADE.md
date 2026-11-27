@@ -1,10 +1,28 @@
 # Upgrade and rollback
 
+The unified wizard includes Lab by default. For an existing Lab deployment, preserve its data path and service configuration and use the [deployment-by-change workflow](INCREMENTAL_DEPLOYMENT.md) when moving to a new release directory. The wizard checks configuration conflicts before installation; `--no-lab` selects a new OM-only installation rather than removing an existing Lab.
+
 English · [简体中文](UPGRADE_zh.md)
 
 An **existing deployment** means an OnboardMimic installation directory and service configuration. Keep that directory for rollback; do not run two controllers together. First-time users do not need this guide. Services from other projects are not migrated by `--upgrade`.
 
 **Back up → Stop → Install in a new directory → Update paths → Migrate services → Open console.** Configuration and tokens are retained; posture preparation and SONIC startup remain manual.
+
+The package installation commands below target JP5. For JP6, use the [v0.2.0 JP6 installation path](JETPACK6.md) with `--upgrade` after completing the backup and stop steps; keep the old directory for rollback.
+
+## Choose the update path
+
+This page covers a full installation/service migration. For deployments already
+using source manifests and the asset registry, follow
+[deployment by change scope](INCREMENTAL_DEPLOYMENT.md): static assets can switch
+without restarting services, Python changes restart only affected services, and
+native changes rebuild affected targets. All updates preserve complete source identity.
+
+Before a full migration, finish recording/replay and pending data processing. Lab
+services and environments are independent; the seven OM services below do not
+include them. Preserve Lab configuration, data and credentials, then migrate its
+services through the same snapshot deployment plan. Do not treat the OM installer
+alone as an upgrade of an independently installed Lab.
 
 ## 1. Back up configuration
 
@@ -70,7 +88,7 @@ To remove PICO from this deployment, after backup and stop run `sudo systemctl d
 
 ## 3. Install in a new directory
 
-For the supported G1 / JP5 configuration, download and extract the complete [v0.1.1 package set](PREBUILT.md) in the new directory, then install without changing services:
+For the supported G1 / JP5 configuration, download and extract the complete [v0.2.0 package set](PREBUILT.md) in the new directory, then install without changing services:
 
 ```bash
 python3 scripts/setup.py --yes --install-only --pico

@@ -1,0 +1,69 @@
+:root{color-scheme:dark}body{margin:0;background:#0c1420;color:#e6edf5;font:14px/1.7 system-ui,-apple-system,sans-serif}main{max-width:1200px;margin:32px auto;padding:0 24px}a{color:#8ecbff}button,input{max-width:100%}#runtime-state{margin:0 0 12px;padding:9px 14px;border:1px solid #283d50;border-radius:10px;background:#102031;color:#b8c7da;font-size:13px;line-height:1.7;overflow-wrap:anywhere}main>p:last-child{margin:12px 2px 0;color:#7f95ab;font-size:12px;line-height:1.7}
+.embedded main{max-width:none;margin:0;padding:4px 0}.embedded :is(#collection-panel,#replay-view){margin-top:0;padding:20px}.embedded h2{font-size:20px}
+@media(max-width:540px){main{padding:0 16px}.embedded :is(#collection-panel,#replay-view){padding:16px}}
+[hidden]{display:none!important}.lab-tabs{display:flex;gap:6px;align-items:center;margin:0 0 12px;border-bottom:1px solid #293c50;padding-bottom:9px}.lab-tabs button{font:600 14px/1.5 system-ui;padding:8px 22px;color:#98aec4;background:transparent;border:1px solid transparent;border-radius:8px;cursor:pointer}.lab-tabs button[aria-selected=true]{color:#a4eedc;background:#183c3b;border-color:#2d645c}#tab-recording{margin-left:auto;color:#ffb5bb;font-size:12px}#collection-view>p{font-size:12px;color:#8297ad;margin:10px 2px}
+/* Replay reuses the collection panel's typography, controls and spacing. */
+#replay-episode{display:block}
+#replay-empty{color:#a4b7c9;margin:12px 0 0;font-size:13px;line-height:1.8}
+#replay-empty:empty{display:none}
+.replay-meta{margin-top:16px;color:#bcd5e7;font-size:13px;font-variant-numeric:tabular-nums}
+.replay-muted{font-size:12px;color:#8ea3b8;margin:8px 0;overflow-wrap:anywhere}
+.replay-validation{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px}
+#replay-view .replay-validation label{margin:0}
+#replay-segment{width:130px}
+#replay-validation-state{font-size:13px;color:#bcd5e7}
+#replay-view .replay-availability{align-items:flex-start}
+.replay-availability>div{flex:1 1 240px}
+.replay-availability strong{font-size:13px;font-weight:600;color:#cbd8e5}
+.replay-availability p{margin:6px 0 0;font-size:13px;line-height:1.8;color:#a4b7c9}
+#replay-error{white-space:pre-wrap}
+.lab-tabs button:focus-visible{outline:2px solid #5ee1c5;outline-offset:3px}
+@media(max-width:540px){.lab-tabs button{padding:8px 18px}}
+
+#replay-physical{margin-top:16px}.replay-physical-summary p{margin:0;font-size:13px;overflow-wrap:anywhere}#replay-real-bar{width:100%;height:6px;accent-color:#58c8ad;border:0;border-radius:8px;overflow:hidden;background:#24384a}#replay-real-bar::-webkit-progress-bar{background:#24384a;border-radius:8px}#replay-real-bar::-webkit-progress-value{background:#58c8ad;border-radius:8px}#replay-real-bar::-moz-progress-bar{background:#58c8ad;border-radius:8px}#replay-real-reason{color:#ffacb2}
+#replay-recorded-video{display:block;width:100%;max-height:280px;margin:12px 0;background:#0e1927;border-radius:10px}
+#replay-view details{margin:8px 0;font-size:12px;color:#8ea3b8}
+#replay-view summary{cursor:pointer}
+#replay-view #replay-segment{width:auto;max-width:100%}
+#replay-validation-state:empty,#replay-real-hint:empty{display:none}
+
+/* Keep replay controls and the recorded video visible together in the OM frame. */
+#replay-view .replay-workspace{display:grid;grid-template-columns:minmax(300px,1fr) minmax(0,1.2fr);gap:20px;align-items:start;margin-top:12px}
+#replay-view .replay-controls,#replay-view .replay-media{min-width:0}
+#replay-view .replay-controls label{margin:0 0 6px}
+#replay-view .replay-validation{margin-top:10px}
+#replay-view .episode-actions{margin:12px 0;gap:8px}
+#replay-view :is(#replay-task,#replay-episode,#replay-segment){padding:8px 10px}
+#replay-view .replay-picker+.replay-picker{margin-top:12px}
+#replay-task-person{margin:6px 0 0;font-size:12px;color:#a4b7c9;overflow-wrap:anywhere}
+#replay-task-person:empty{display:none}
+#replay-view .replay-meta{margin-top:8px;padding:8px 10px}
+#replay-view #replay-physical{margin-top:10px;padding-top:0}
+#replay-view .replay-physical-summary{display:grid;grid-template-columns:minmax(0,1fr);gap:10px;margin-top:0;padding:16px;background:#101f2e;border:1px solid #30485c;border-left:3px solid #6f96b4;border-radius:12px;box-shadow:0 4px 14px #00000012}
+#replay-view .operation-notice[data-attention]{margin:8px 0;padding:8px 12px;font-size:14px;line-height:1.5}
+#replay-view .replay-media{padding:12px;border:1px solid #293d50;border-radius:12px;background:#0e1927}
+#replay-view .replay-media-title{margin:0 0 8px;font-size:13px;color:#bcd5e7;font-weight:600}
+#replay-view #replay-recorded-video{margin:0;aspect-ratio:16/9;max-height:280px;object-fit:contain;background:#080f18}
+#replay-video-placeholder{margin:0;min-height:180px;display:grid;place-items:center;text-align:center;color:#8297ad}
+@media(max-width:700px){#replay-view .replay-workspace{grid-template-columns:minmax(0,1fr);gap:12px}#replay-view #replay-recorded-video{max-height:240px}}
+
+#replay-view .collection-heading{align-items:flex-start}
+#replay-view .collection-heading>div{display:block}
+#replay-view .collection-brand{margin:0 0 5px}
+#replay-view #replay-real-state.operation-notice{margin:0;padding:0;border:0;border-radius:0;background:transparent;color:#d8e8f4;font-size:15px;font-weight:650;line-height:1.5}
+#replay-real-progress{color:#a7bed0;font-size:12px;font-variant-numeric:tabular-nums}
+#replay-real-ack:not(:empty){padding-top:10px;border-top:1px solid #2b4050;color:#b0c9d7;line-height:1.6}
+#replay-real-reason:not(:empty){padding:9px 11px;background:#38212b;border-radius:7px;line-height:1.6}
+#replay-physical[data-state="completed"] .replay-physical-summary{border-left-color:#6cd3b4;background:#112824}
+#replay-physical[data-state="completed"] #replay-real-state,#replay-physical[data-state="completed"] #replay-real-ack{color:#a2e7d0}
+#replay-physical:is([data-state="running"],[data-state="starting"]) .replay-physical-summary{border-left-color:#7bc5ed}
+#replay-physical:is([data-state="failed"],[data-state="unconfirmed"]) .replay-physical-summary{border-left-color:#e3a3a3}
+#replay-physical>details{padding:2px 4px}
+#replay-view .replay-physical-summary p:empty{display:none}
+#replay-view .replay-media #replay-preview-error{margin-bottom:0}
+
+.embedded #replay-view{padding:16px}
+
+#replay-view .replay-right-column{min-width:0;display:grid;gap:12px}
+#replay-view #replay-execution-details{margin:0;padding:12px;border:1px solid #304254;border-radius:12px;background:#142231;overflow-wrap:anywhere}
+#replay-execution-details p{margin:8px 0 0;line-height:1.6}

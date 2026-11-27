@@ -45,7 +45,9 @@ bool ConvertONNXToTRT(
     const std::string& onnxModelPath,
     std::string& generatedTRTFile,
     const std::string prefix = "",
-    bool forceConvert = false
+    bool forceConvert = false,
+    std::string* observedOnnxHash = nullptr,
+    std::string* observedCacheHash = nullptr
 );
 
 // Forward declaration
@@ -58,7 +60,8 @@ public:
     ~TRTInferenceEngine();
 
     using AxisSizes = std::map<std::string, int >;
-    bool Initialize(const std::string& trtPath, int deviceID, const Options::AxisNames& axisNames = {});
+    bool Initialize(const std::string& trtPath, int deviceID, const Options::AxisNames& axisNames = {}, const std::string& expectedCacheHash = "");
+    std::string LoadedEngineSHA256() const;
     bool InitInputs(const AxisSizes& axisSizes = {});
     void Destroy();
 
